@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./use-cache": {
+      "import": "./dist/use-cache/index.js",
+      "types": "./dist/use-cache/index.d.ts"
     }
   },
   "files": [

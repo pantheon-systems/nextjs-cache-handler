@@ -105,3 +105,24 @@ export type {
   SerializableValue,
   SerializedCacheData,
 } from './types.js';
+
+// ============================================================================
+// Next.js 16 'use cache' Handler Exports
+// ============================================================================
+
+export {
+  createUseCacheHandler,
+  UseCacheFileHandler,
+  UseCacheGcsHandler,
+  streamToBytes,
+  bytesToStream,
+  serializeUseCacheEntry,
+  deserializeUseCacheEntry,
+} from './use-cache/index.js';
+
+export type {
+  UseCacheEntry,
+  UseCacheHandler,
+  UseCacheHandlerConfig,
+  SerializedUseCacheEntry,
+} from './use-cache/index.js';
