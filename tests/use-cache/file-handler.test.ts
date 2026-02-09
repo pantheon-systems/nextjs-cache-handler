@@ -292,4 +292,71 @@ describe('UseCacheFileHandler', () => {
       expect(result).not.toBeUndefined();
     });
   });
+
+  describe('getStats', () => {
+    it('should return empty stats for empty cache', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      const stats = await handler.getStats();
+
+      expect(stats).toEqual({
+        size: 0,
+        entries: [],
+        keys: [],
+      });
+    });
+
+    it('should return stats for cached entries', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      // Add some entries
+      const entry1 = createTestEntry({ tags: ['posts', 'blog'] });
+      const entry2 = createTestEntry({ tags: ['users'] });
+
+      await handler.set('key-1', Promise.resolve(entry1));
+      await handler.set('key-2', Promise.resolve(entry2));
+
+      const stats = await handler.getStats();
+
+      expect(stats.size).toBe(2);
+      expect(stats.keys).toContain('key-1');
+      expect(stats.keys).toContain('key-2');
+      expect(stats.entries).toHaveLength(2);
+    });
+
+    it('should include tag information in entries', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      const entry = createTestEntry({ tags: ['api-posts', 'external-data'] });
+      await handler.set('tagged-key', Promise.resolve(entry));
+
+      const stats = await handler.getStats();
+
+      expect(stats.entries).toHaveLength(1);
+      expect(stats.entries[0].key).toBe('tagged-key');
+      expect(stats.entries[0].tags).toEqual(['api-posts', 'external-data']);
+      expect(stats.entries[0].type).toBe('use-cache');
+    });
+
+    it('should not include expired entries in stats', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      // Add expired entry
+      const expiredEntry = createTestEntry({
+        tags: ['expired'],
+        timestamp: Date.now() - 10000,
+        revalidate: 5,
+      });
+      await handler.set('expired-key', Promise.resolve(expiredEntry));
+
+      // Add valid entry
+      const validEntry = createTestEntry({ tags: ['valid'] });
+      await handler.set('valid-key', Promise.resolve(validEntry));
+
+      const stats = await handler.getStats();
+
+      expect(stats.size).toBe(1);
+      expect(stats.keys).toContain('valid-key');
+      expect(stats.keys).not.toContain('expired-key');
+    });
+  });
 });

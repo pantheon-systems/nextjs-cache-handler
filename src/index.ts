@@ -118,6 +118,7 @@ export {
   bytesToStream,
   serializeUseCacheEntry,
   deserializeUseCacheEntry,
+  getUseCacheStats,
 } from './use-cache/index.js';
 
 export type {
@@ -125,4 +126,6 @@ export type {
   UseCacheHandler,
   UseCacheHandlerConfig,
   SerializedUseCacheEntry,
+  UseCacheStats,
+  UseCacheEntryInfo,
 } from './use-cache/index.js';

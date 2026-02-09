@@ -1,5 +1,5 @@
 import { Bucket, Storage } from '@google-cloud/storage';
-import type { UseCacheEntry, UseCacheHandler } from './types.js';
+import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
 import {
   serializeUseCacheEntry,
   deserializeUseCacheEntry,
@@ -243,6 +243,81 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     if (this.edgeCacheClearer) {
       this.edgeCacheClearer.clearKeysInBackground(tags, `use-cache tag invalidation: ${tags.join(', ')}`);
     }
+  }
+
+  /**
+   * Get cache statistics for the use-cache entries in GCS.
+   * Returns information about all valid (non-expired) cache entries.
+   */
+  async getStats(): Promise<UseCacheStats> {
+    log.debug('GET STATS');
+
+    const entries: UseCacheEntryInfo[] = [];
+    const keys: string[] = [];
+
+    try {
+      await this.ensureInitialized();
+
+      // List all files in the use-cache prefix
+      const [files] = await this.bucket.getFiles({ prefix: this.cachePrefix });
+
+      for (const file of files) {
+        // Skip tags file
+        if (file.name === this.tagsKey) {
+          continue;
+        }
+
+        // Only process .json files
+        if (!file.name.endsWith('.json')) {
+          continue;
+        }
+
+        try {
+          const [data] = await file.download();
+          const stored = JSON.parse(data.toString());
+
+          // Extract key from filename (remove prefix and .json suffix)
+          const key = file.name.replace(this.cachePrefix, '').replace('.json', '');
+
+          // Deserialize to check expiration
+          const entry = deserializeUseCacheEntry(stored);
+
+          // Skip expired entries
+          if (this.isExpired(entry)) {
+            continue;
+          }
+
+          // Get file metadata for size
+          const [metadata] = await file.getMetadata();
+
+          const entryInfo: UseCacheEntryInfo = {
+            key,
+            tags: stored.tags || [],
+            type: 'use-cache',
+            lastModified: new Date(entry.timestamp).toISOString(),
+            size: Number(metadata.size) || 0,
+            revalidate: entry.revalidate,
+            stale: entry.stale,
+            expire: entry.expire,
+          };
+
+          entries.push(entryInfo);
+          keys.push(key);
+        } catch (error) {
+          log.warn(`Error reading cache file ${file.name}:`, error);
+        }
+      }
+    } catch (error) {
+      log.error('Error getting cache stats:', error);
+    }
+
+    log.debug(`Found ${entries.length} valid cache entries`);
+
+    return {
+      size: entries.length,
+      entries,
+      keys,
+    };
   }
 }
 

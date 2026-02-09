@@ -169,3 +169,73 @@ export interface UseCacheHandlerConfig {
    */
   type?: 'auto' | 'file' | 'gcs';
 }
+
+// ============================================================================
+// Stats Types
+// ============================================================================
+
+/**
+ * Information about a single use-cache entry for stats reporting.
+ */
+export interface UseCacheEntryInfo {
+  /**
+   * The cache key.
+   */
+  key: string;
+
+  /**
+   * Cache tags associated with this entry.
+   */
+  tags: string[];
+
+  /**
+   * Type identifier for stats reporting.
+   * Always 'use-cache' for entries from cacheHandlers (plural).
+   */
+  type: 'use-cache';
+
+  /**
+   * When the entry was created (ISO timestamp).
+   */
+  lastModified?: string;
+
+  /**
+   * Approximate size in bytes (if available).
+   */
+  size?: number;
+
+  /**
+   * Revalidation time in seconds.
+   */
+  revalidate?: number;
+
+  /**
+   * Stale time in seconds.
+   */
+  stale?: number;
+
+  /**
+   * Expire time in seconds.
+   */
+  expire?: number;
+}
+
+/**
+ * Cache statistics for use-cache entries.
+ */
+export interface UseCacheStats {
+  /**
+   * Number of cache entries.
+   */
+  size: number;
+
+  /**
+   * Detailed information about each entry.
+   */
+  entries: UseCacheEntryInfo[];
+
+  /**
+   * List of cache keys.
+   */
+  keys: string[];
+}

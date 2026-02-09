@@ -87,7 +87,26 @@ export type {
   UseCacheHandler,
   UseCacheHandlerConfig,
   SerializedUseCacheEntry,
+  UseCacheStats,
+  UseCacheEntryInfo,
 } from './types.js';
+
+// ============================================================================
+// Stats function
+// ============================================================================
+
+/**
+ * Get cache statistics for use-cache entries.
+ * Automatically detects whether to use file-based or GCS cache stats.
+ */
+export async function getUseCacheStats(): Promise<import('./types.js').UseCacheStats> {
+  if (process.env.CACHE_BUCKET) {
+    const handler = new UseCacheGcsHandler();
+    return handler.getStats();
+  }
+  const handler = new UseCacheFileHandler();
+  return handler.getStats();
+}
 
 // ============================================================================
 // Utility exports

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { UseCacheEntry, UseCacheHandler } from './types.js';
+import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
 import {
   serializeUseCacheEntry,
   deserializeUseCacheEntry,
@@ -209,6 +209,78 @@ export class UseCacheFileHandler implements UseCacheHandler {
     }
 
     this.saveTagTimestamps();
+  }
+
+  /**
+   * Get cache statistics for the use-cache entries.
+   * Returns information about all valid (non-expired) cache entries.
+   */
+  async getStats(): Promise<UseCacheStats> {
+    log.debug('GET STATS');
+
+    const entries: UseCacheEntryInfo[] = [];
+    const keys: string[] = [];
+
+    try {
+      if (!fs.existsSync(this.cacheDir)) {
+        return { size: 0, entries: [], keys: [] };
+      }
+
+      const files = fs.readdirSync(this.cacheDir);
+
+      for (const file of files) {
+        // Skip tags file and non-JSON files
+        if (file === '_tags.json' || !file.endsWith('.json')) {
+          continue;
+        }
+
+        try {
+          const filePath = path.join(this.cacheDir, file);
+          const data = fs.readFileSync(filePath, 'utf-8');
+          const stored = JSON.parse(data);
+
+          // Reconstruct the key from the filename (reverse of sanitization)
+          const key = file.replace('.json', '');
+
+          // Deserialize to check expiration
+          const entry = deserializeUseCacheEntry(stored);
+
+          // Skip expired entries
+          if (this.isExpired(entry)) {
+            continue;
+          }
+
+          // Get file stats for size
+          const fileStat = fs.statSync(filePath);
+
+          const entryInfo: UseCacheEntryInfo = {
+            key,
+            tags: stored.tags || [],
+            type: 'use-cache',
+            lastModified: new Date(entry.timestamp).toISOString(),
+            size: fileStat.size,
+            revalidate: entry.revalidate,
+            stale: entry.stale,
+            expire: entry.expire,
+          };
+
+          entries.push(entryInfo);
+          keys.push(key);
+        } catch (error) {
+          log.warn(`Error reading cache file ${file}:`, error);
+        }
+      }
+    } catch (error) {
+      log.error('Error getting cache stats:', error);
+    }
+
+    log.debug(`Found ${entries.length} valid cache entries`);
+
+    return {
+      size: entries.length,
+      entries,
+      keys,
+    };
   }
 }
 
