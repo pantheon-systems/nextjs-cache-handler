@@ -83,6 +83,23 @@ export { FileCacheHandler } from './handlers/file.js';
 export { GcsCacheHandler } from './handlers/gcs.js';
 
 // ============================================================================
+// Request context for tag tracking
+// ============================================================================
+
+export { RequestContext } from './utils/request-context.js';
+
+// ============================================================================
+// Middleware for Surrogate-Key header propagation
+// ============================================================================
+
+export {
+  createSurrogateKeyMiddleware,
+  middleware as surrogateKeyMiddleware,
+  config as surrogateKeyMiddlewareConfig,
+  type SurrogateKeyMiddlewareConfig,
+} from './middleware/index.js';
+
+// ============================================================================
 // Type exports
 // ============================================================================
 
