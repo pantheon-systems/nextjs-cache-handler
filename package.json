@@ -28,6 +28,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "clean": "rm -rf dist",
     "test": "vitest run",
