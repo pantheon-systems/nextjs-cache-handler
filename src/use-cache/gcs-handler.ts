@@ -5,6 +5,7 @@ import {
   deserializeUseCacheEntry,
 } from './stream-serialization.js';
 import { createLogger } from '../utils/logger.js';
+import { RequestContext } from '../utils/request-context.js';
 import { createEdgeCacheClearer, type EdgeCacheClear } from '../edge/edge-cache-clear.js';
 
 const log = createLogger('UseCacheGcsHandler');
@@ -163,6 +164,13 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       }
 
       log.debug(`HIT: ${cacheKey}`);
+
+      // Capture tags for Surrogate-Key header propagation
+      if (entry.tags && entry.tags.length > 0 && RequestContext.isActive()) {
+        RequestContext.addTags(entry.tags);
+        log.debug(`Captured ${entry.tags.length} tags for Surrogate-Key: ${entry.tags.join(', ')}`);
+      }
+
       return entry;
     } catch (error) {
       log.error(`Error reading cache for key ${cacheKey}:`, error);

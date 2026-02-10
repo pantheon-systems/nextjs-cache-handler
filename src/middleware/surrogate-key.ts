@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server.js';
 import { RequestContext } from '../utils/request-context.js';
 import { createLogger } from '../utils/logger.js';
 

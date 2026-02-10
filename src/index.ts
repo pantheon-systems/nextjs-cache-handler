@@ -89,9 +89,13 @@ export { GcsCacheHandler } from './handlers/gcs.js';
 export { RequestContext } from './utils/request-context.js';
 
 // ============================================================================
-// Middleware for Surrogate-Key header propagation
+// Surrogate-Key header propagation utilities
 // ============================================================================
 
+// Route handler wrapper (recommended approach)
+export { withSurrogateKey, type SurrogateKeyOptions } from './utils/with-surrogate-key.js';
+
+// Legacy middleware exports (Note: middleware runs before route, so tags may not be captured)
 export {
   createSurrogateKeyMiddleware,
   middleware as surrogateKeyMiddleware,
