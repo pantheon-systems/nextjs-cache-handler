@@ -13,6 +13,14 @@
     "./use-cache": {
       "import": "./dist/use-cache/index.js",
       "types": "./dist/use-cache/index.d.ts"
+    },
+    "./utils": {
+      "import": "./dist/utils/index.js",
+      "types": "./dist/utils/index.d.ts"
+    },
+    "./middleware": {
+      "import": "./dist/middleware/index.js",
+      "types": "./dist/middleware/index.d.ts"
     }
   },
   "files": [
