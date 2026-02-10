@@ -140,9 +140,24 @@ export class UseCacheFileHandler implements UseCacheHandler {
       log.debug(`HIT: ${cacheKey}`);
 
       // Capture tags for Surrogate-Key header propagation
-      if (entry.tags && entry.tags.length > 0 && RequestContext.isActive()) {
+      const storedTagsLength = entry.tags?.length ?? 0;
+      const contextActive = RequestContext.isActive();
+
+      if (storedTagsLength > 0 && contextActive) {
         RequestContext.addTags(entry.tags);
-        log.debug(`Captured ${entry.tags.length} tags for Surrogate-Key: ${entry.tags.join(', ')}`);
+        log.debug(`Captured ${storedTagsLength} tags for Surrogate-Key: ${entry.tags.join(', ')}`);
+      } else {
+        // TODO: Remove this diagnostic logging once Next.js fixes the empty tags bug
+        // See: https://github.com/vercel/next.js/issues/78864
+        // Log why tags weren't propagated
+        log.info(`GET ${cacheKey} - Tag propagation status:`, {
+          storedTags: entry.tags,
+          storedTagsLength,
+          requestContextActive: contextActive,
+          reason: storedTagsLength === 0
+            ? 'No tags stored (Next.js empty tags bug)'
+            : 'RequestContext not active'
+        });
       }
 
       return entry;
@@ -163,12 +178,21 @@ export class UseCacheFileHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
-      // TODO: Remove this debug logging once we've isolated root cause of empty tags issue
-      // See: https://github.com/pantheon-systems/nextjs-cache-handler/issues/XXX
+      // TODO: Remove this diagnostic logging once Next.js fixes the empty tags bug
+      // Diagnostic logging for empty tags issue
+      // See: https://github.com/vercel/next.js/issues/78864
+      // See: docs/known-issues-nextjs16.md
+      const tagsLength = entry.tags?.length ?? 0;
+      if (tagsLength === 0) {
+        // Use warn level so this is always visible - it's a Next.js bug indicator
+        log.warn(`[EMPTY_TAGS_BUG] SET ${cacheKey}: Next.js passed empty tags array. ` +
+          `This is a known Next.js bug - cacheTag() values are not propagated to cacheHandlers.set(). ` +
+          `See: https://github.com/vercel/next.js/issues/78864`);
+      }
       log.info(`SET entry structure for ${cacheKey}:`, {
         hasTags: !!entry.tags,
         tags: entry.tags,
-        tagsLength: entry.tags?.length ?? 0,
+        tagsLength,
         stale: entry.stale,
         revalidate: entry.revalidate,
         expire: entry.expire,
