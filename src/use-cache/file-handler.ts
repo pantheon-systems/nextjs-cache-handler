@@ -184,8 +184,8 @@ export class UseCacheFileHandler implements UseCacheHandler {
       // See: docs/known-issues-nextjs16.md
       const tagsLength = entry.tags?.length ?? 0;
       if (tagsLength === 0) {
-        // Use warn level so this is always visible - it's a Next.js bug indicator
-        log.warn(`[EMPTY_TAGS_BUG] SET ${cacheKey}: Next.js passed empty tags array. ` +
+        // Use info level so this is gated behind CACHE_DEBUG
+        log.info(`[EMPTY_TAGS_BUG] SET ${cacheKey}: Next.js passed empty tags array. ` +
           `This is a known Next.js bug - cacheTag() values are not propagated to cacheHandlers.set(). ` +
           `See: https://github.com/vercel/next.js/issues/78864`);
       }
