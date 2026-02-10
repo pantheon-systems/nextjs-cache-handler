@@ -163,6 +163,20 @@ export class UseCacheFileHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
+      // TODO: Remove this debug logging once we've isolated root cause of empty tags issue
+      // See: https://github.com/pantheon-systems/nextjs-cache-handler/issues/XXX
+      log.info(`SET entry structure for ${cacheKey}:`, {
+        hasTags: !!entry.tags,
+        tags: entry.tags,
+        tagsLength: entry.tags?.length ?? 0,
+        stale: entry.stale,
+        revalidate: entry.revalidate,
+        expire: entry.expire,
+        timestamp: entry.timestamp,
+        hasValue: !!entry.value,
+        entryKeys: Object.keys(entry),
+      });
+
       const serialized = await serializeUseCacheEntry(entry);
       const filePath = this.getCacheFilePath(cacheKey);
 
