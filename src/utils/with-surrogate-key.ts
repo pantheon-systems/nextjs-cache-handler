@@ -104,14 +104,20 @@ export function withSurrogateKey(
 
         if (debug) {
           log.debug(`Set Surrogate-Key: ${surrogateKey}`);
+          // TODO: Remove these debug headers before production release
+          // These are temporary headers to validate tag capture while Surrogate-Key
+          // is being stripped by the proxy layer. Remove once proxy issue is resolved.
           newResponse.headers.set('x-cache-tags-count', String(capturedTags.length));
           newResponse.headers.set('x-cache-tags-source', tagSource);
+          newResponse.headers.set('x-surrogate-key-debug', surrogateKey);
         }
       } else if (fallbackKey) {
         newResponse.headers.set('Surrogate-Key', fallbackKey);
 
         if (debug) {
           log.debug(`No tags captured, using fallback: ${fallbackKey}`);
+          // TODO: Remove this debug header before production release
+          newResponse.headers.set('x-surrogate-key-debug', fallbackKey);
         }
       }
 
