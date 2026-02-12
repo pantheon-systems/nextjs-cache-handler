@@ -262,6 +262,102 @@ Automated tests cannot easily use the `Pantheon-Debug:1` header since Playwright
 
 These debug headers are enabled with `withSurrogateKey(handler, { debug: true })` and should be removed before production release.
 
+## Edge Cache Invalidation
+
+### Current Status: Blocked on Infrastructure
+
+**TL;DR**: Tag-based CDN cache invalidation is implemented in the cache handler but blocked by missing infrastructure work. The outbound proxy needs Surrogate-Key hashing support before purges will work.
+
+### What Works
+
+1. **Surrogate-Key headers are correctly set** - When content is served from cache, the `Surrogate-Key` response header contains the correct tags (e.g., `api-posts-remote external-data-remote`)
+
+2. **Server-side cache invalidation works** - When `revalidateTag()` is called, the cache handler's `updateTags()` method is invoked
+
+3. **Edge cache clear requests are sent** - The `EdgeCacheClear` class successfully calls the outbound proxy:
+   ```
+   DELETE http://{OUTBOUND_PROXY_ENDPOINT}/rest/v0alpha1/cache/keys/api-posts-remote
+   ```
+
+4. **Outbound proxy receives and forwards requests** - Logs show:
+   ```
+   [outbound-proxy] proxying cache key delete request
+   [EdgeCacheClear] Cleared 1/1 keys in 849ms
+   ```
+
+### What Doesn't Work
+
+**CDN cache is NOT actually purged.** After calling `revalidateTag()`:
+- Pre-revalidation CDN Age: 25s
+- Post-revalidation CDN Age: 30s (continues incrementing, not reset)
+
+### Root Cause
+
+The outbound proxy (Cloud Run glue proxy) is missing **Surrogate-Key hashing logic**.
+
+From the infrastructure ticket:
+> "The hashing for Styx in Surrogate-Key needs is ported into our Cloud Run glue proxy (the one Fastly uses to connect to tenants). Hashing behavior should be identical for site + env to the behavior Styx uses."
+
+**Translation:**
+- Styx (HTTP proxy) uses a hashing mechanism: `hash(site + env + tag)` → CDN cache key
+- The Cloud Run outbound proxy doesn't have this hashing yet
+- So when we purge `api-posts-remote`, it doesn't translate to the actual CDN cache key
+- The CDN never receives a valid purge request
+
+### Validation Steps
+
+To reproduce this issue:
+
+```bash
+# 1. Clear CDN completely (via Pantheon API)
+terminus env:clear-cache <site>.<env>
+
+# 2. Warm server cache
+curl https://<site>.pantheonsite.io/api/posts/with-tags-remote
+
+# 3. Clear CDN again (so it caches with correct Surrogate-Key)
+terminus env:clear-cache <site>.<env>
+
+# 4. Verify Surrogate-Key is correct
+curl -IH "Pantheon-Debug:1" https://<site>.pantheonsite.io/api/posts/with-tags-remote
+# Should show: surrogate-key-raw: api-posts-remote external-data-remote
+
+# 5. Wait 15 seconds, record CDN Age
+curl -IH "Pantheon-Debug:1" ... | grep age
+# age: 15
+
+# 6. Trigger revalidation
+curl https://<site>.pantheonsite.io/api/revalidate?tag=api-posts-remote
+
+# 7. Check logs - should show EdgeCacheClear success
+
+# 8. Check CDN Age again
+curl -IH "Pantheon-Debug:1" ... | grep age
+# EXPECTED (if working): age: 0-5
+# ACTUAL (broken): age: 20+ (continues from step 5)
+```
+
+### Dependency
+
+This feature is blocked until the infrastructure team completes:
+- **Ticket**: "Forklift hashing from styx to Cloud Run proxy"
+- **Requirement**: Port Surrogate-Key hashing logic from Styx to the Cloud Run glue proxy
+
+### Temporary Workaround
+
+For now, use the Pantheon Public API to clear the entire CDN cache:
+
+```typescript
+// Full cache clear (nuclear option)
+await fetch(`https://api.pantheon.io/v0/sites/${siteId}/environments/${envId}/cache/clear`, {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${session}` },
+  body: JSON.stringify({ framework_cache: true })
+});
+```
+
+This clears ALL cached content, not just the specific tag. Use sparingly.
+
 ## Future Improvements
 
 1. **Request ID-based tracking** - Replace simple global array with a Map keyed by unique request IDs
@@ -269,3 +365,4 @@ These debug headers are enabled with `withSurrogateKey(handler, { debug: true })
 3. **Middleware support** - Extend to work with Next.js middleware for page routes
 4. **Build-time manifest** - Extract tags from build output for `'use cache'` routes
 5. **Remove debug headers** - Once E2E test infrastructure can use `Pantheon-Debug:1` to read `Surrogate-Key-Raw`, remove the temporary `x-surrogate-key-debug` and related headers
+6. **Tag-based CDN purge** - Enable granular CDN invalidation once infrastructure hashing work is complete
