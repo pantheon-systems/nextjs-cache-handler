@@ -62,7 +62,40 @@ if (capturedTags.length === 0 && globalTags.length > 0) {
 }
 ```
 
-**Result**: Works correctly for single-request scenarios.
+**Result**: Works correctly for single-request scenarios but has theoretical concurrency issues.
+
+### Attempt 3: CacheTagContext with Symbol.for Pattern (Current Solution)
+
+**Approach**: Use `Symbol.for()` to register an AsyncLocalStorage-based context on `globalThis`, similar to Next.js's internal `@next/request-context` pattern used by `after()`.
+
+```typescript
+// src/utils/cache-tag-context.ts
+const CACHE_TAG_CONTEXT_SYMBOL = Symbol.for('@nextjs-cache-handler/tag-context');
+
+const cacheTagContextStorage = new AsyncLocalStorage<CacheTagContextData>();
+
+const cacheTagContextAccessor = {
+  get() {
+    return cacheTagContextStorage.getStore();
+  },
+};
+
+// Register on globalThis for cross-module access
+globalThis[CACHE_TAG_CONTEXT_SYMBOL] = cacheTagContextAccessor;
+```
+
+```typescript
+// Cache handler accesses via Symbol.for (no direct import needed)
+const accessor = globalThis[Symbol.for('@nextjs-cache-handler/tag-context')];
+const context = accessor?.get();
+if (context) {
+  context.tags.push(...entry.tags);
+}
+```
+
+**Result**: Successfully propagates tags through Next.js cache handler async boundaries with request-scoped isolation.
+
+**Why it works**: The `Symbol.for()` pattern ensures the same symbol is used across module boundaries, and registering the AsyncLocalStorage accessor on `globalThis` allows the cache handler to access the request context without direct module imports.
 
 ## Final Design
 
@@ -71,31 +104,39 @@ if (capturedTags.length === 0 && globalTags.length > 0) {
 ```
 Request
   ↓
-withSurrogateKey() ─── clears globalThis.__pantheonSurrogateKeyTags
-  ↓
+withSurrogateKey() ─── CacheTagContext.run() creates request-scoped context
+  ↓                    (also clears globalThis fallback)
 handler()
   ↓
 'use cache: remote' function
   ↓
 Next.js calls cache handler get()
   ↓
-Cache HIT with tags → push to globalThis store
+Cache HIT with tags → captureTags():
+  │  1. Try CacheTagContext via Symbol.for (primary)
+  │  2. Fall back to globalThis store (backup)
   ↓
-withSurrogateKey() ─── reads globalThis, sets Surrogate-Key header
+withSurrogateKey() ─── CacheTagContext.getTags(), sets Surrogate-Key header
   ↓
 Response with Surrogate-Key: tag1 tag2 tag3
 ```
 
 ### Components
 
-1. **use-cache-handler.mjs** (user's project)
-   - Wraps cache handler's `get()` method
-   - On cache HIT with tags, pushes to `globalThis.__pantheonSurrogateKeyTags`
-   - Tries `RequestContext.addTags()` first (for future compatibility)
+1. **CacheTagContext** (`src/utils/cache-tag-context.ts`)
+   - Uses `Symbol.for('@nextjs-cache-handler/tag-context')` for cross-module access
+   - Wraps `AsyncLocalStorage` for request-scoped tag tracking
+   - Registered on `globalThis` so cache handlers can access without direct imports
 
-2. **withSurrogateKey()** (library)
-   - Clears global tag store before each request
-   - Reads from `RequestContext` first (AsyncLocalStorage)
+2. **Cache Handlers** (`src/use-cache/file-handler.ts`, `gcs-handler.ts`)
+   - Access `CacheTagContext` via `Symbol.for` pattern in `captureTags()`
+   - Fall back to `globalThis.__pantheonSurrogateKeyTags` if context not active
+   - Tags captured on cache HIT in `get()` method
+
+3. **withSurrogateKey()** (`src/utils/with-surrogate-key.ts`)
+   - Wraps handler in `CacheTagContext.run()` to establish request scope
+   - Clears global tag store before each request (fallback cleanup)
+   - Reads from `CacheTagContext.getTags()` first
    - Falls back to global store if no tags captured
    - Sets `Surrogate-Key` response header
 
@@ -173,9 +214,58 @@ Response headers on cache HIT:
 Surrogate-Key: posts api-data
 ```
 
+## Debugging Surrogate-Key Headers on Pantheon
+
+### Why Surrogate-Key Isn't Visible in Normal Responses
+
+By design, Pantheon's infrastructure strips the `Surrogate-Key` response header before responses are served to clients. This is intentional behavior - the CDN consumes this header internally for cache management and invalidation.
+
+### Viewing Surrogate-Key-Raw
+
+To inspect the `Surrogate-Key` value, add the `Pantheon-Debug:1` request header. Pantheon will then include the original value as `Surrogate-Key-Raw`:
+
+```bash
+# View all headers with debug info
+curl -IH "Pantheon-Debug:1" https://your-site.pantheonsite.io/api/posts
+
+# Filter to just Surrogate-Key-Raw
+curl -IH "Pantheon-Debug:1" https://your-site.pantheonsite.io/api/posts | grep -i surrogate-key-raw
+```
+
+**Example output on cache HIT:**
+
+```
+surrogate-key-raw: api-posts-remote external-data-remote
+```
+
+### Validation Results
+
+We confirmed this behavior works correctly with the cache handler:
+
+```bash
+# First request (cache MISS) - returns fallback key
+$ curl -IH "Pantheon-Debug:1" .../api/posts/with-tags-remote | grep surrogate-key-raw
+surrogate-key-raw: page-content
+
+# Second request (cache HIT) - returns actual tags
+$ curl -IH "Pantheon-Debug:1" .../api/posts/with-tags-remote | grep surrogate-key-raw
+surrogate-key-raw: api-posts-remote external-data-remote
+```
+
+### E2E Test Considerations
+
+Automated tests cannot easily use the `Pantheon-Debug:1` header since Playwright's `request.get()` doesn't expose the ability to see `Surrogate-Key-Raw`. For E2E testing, we use temporary debug headers:
+
+- `x-cache-tags-count` - Number of tags captured
+- `x-cache-tags-source` - Where tags came from (`CacheTagContext` or `globalStore`)
+- `x-surrogate-key-debug` - Mirror of the `Surrogate-Key` value
+
+These debug headers are enabled with `withSurrogateKey(handler, { debug: true })` and should be removed before production release.
+
 ## Future Improvements
 
 1. **Request ID-based tracking** - Replace simple global array with a Map keyed by unique request IDs
 2. **Next.js integration** - Work with Vercel to expose cache tags through official APIs
 3. **Middleware support** - Extend to work with Next.js middleware for page routes
 4. **Build-time manifest** - Extract tags from build output for `'use cache'` routes
+5. **Remove debug headers** - Once E2E test infrastructure can use `Pantheon-Debug:1` to read `Surrogate-Key-Raw`, remove the temporary `x-surrogate-key-debug` and related headers

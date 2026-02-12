@@ -6,6 +6,7 @@ import {
   deserializeUseCacheEntry,
 } from './stream-serialization.js';
 import { createLogger } from '../utils/logger.js';
+import { createEdgeCacheClearer, type EdgeCacheClear } from '../edge/edge-cache-clear.js';
 
 const log = createLogger('UseCacheFileHandler');
 
@@ -90,6 +91,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
   private tagTimestamps: Map<string, number> = new Map();
+  private readonly edgeCacheClearer: EdgeCacheClear | null;
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
     this.cacheDir = config.cacheDir ?? path.join(process.cwd(), '.next', 'cache', 'use-cache');
@@ -97,6 +99,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
     this.ensureCacheDir();
     this.loadTagTimestamps();
+
+    // Initialize edge cache clearer if OUTBOUND_PROXY_ENDPOINT is configured
+    this.edgeCacheClearer = createEdgeCacheClearer();
+    if (this.edgeCacheClearer) {
+      log.debug('Edge cache clearing enabled');
+    }
 
     log.debug('Initialized with cache dir:', this.cacheDir);
   }
@@ -288,6 +296,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
   /**
    * Invalidate cache entries with matching tags.
+   * Also triggers CDN edge cache clearing via Surrogate-Key if configured.
    */
   async updateTags(tags: string[], durations: number[]): Promise<void> {
     log.debug(`UPDATE TAGS: [${tags.join(', ')}]`);
@@ -303,6 +312,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
     }
 
     this.saveTagTimestamps();
+
+    // Clear edge cache if configured
+    // This purges CDN cache entries with matching Surrogate-Key tags
+    if (this.edgeCacheClearer) {
+      this.edgeCacheClearer.clearKeysInBackground(tags, `use-cache tag invalidation: ${tags.join(', ')}`);
+    }
   }
 
   /**

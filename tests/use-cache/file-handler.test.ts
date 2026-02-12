@@ -270,6 +270,77 @@ describe('UseCacheFileHandler', () => {
       expect(exp2).toBeGreaterThan(0);
       expect(exp3).toBeGreaterThan(0);
     });
+
+    it('should trigger edge cache clearing when OUTBOUND_PROXY_ENDPOINT is configured', async () => {
+      // Set up environment for edge cache clearing
+      const originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'localhost:8080';
+
+      // Mock fetch to capture edge cache clear calls
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(null, { status: 200 })
+      );
+
+      try {
+        const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+        // Call updateTags which should trigger edge cache clearing
+        await handler.updateTags(['test-tag-1', 'test-tag-2'], [0, 0]);
+
+        // Wait a bit for background clearing to be initiated
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // Verify fetch was called for edge cache clearing
+        // The EdgeCacheClear calls DELETE on /rest/v0alpha1/cache/keys/{key}
+        expect(fetchSpy).toHaveBeenCalled();
+
+        const calls = fetchSpy.mock.calls;
+        const edgeCacheCalls = calls.filter(call =>
+          typeof call[0] === 'string' && call[0].includes('/cache/keys/')
+        );
+
+        expect(edgeCacheCalls.length).toBeGreaterThanOrEqual(1);
+      } finally {
+        // Restore environment
+        if (originalEnv === undefined) {
+          delete process.env.OUTBOUND_PROXY_ENDPOINT;
+        } else {
+          process.env.OUTBOUND_PROXY_ENDPOINT = originalEnv;
+        }
+        fetchSpy.mockRestore();
+      }
+    });
+
+    it('should not trigger edge cache clearing when OUTBOUND_PROXY_ENDPOINT is not set', async () => {
+      // Ensure environment variable is not set
+      const originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
+      delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      try {
+        const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+        await handler.updateTags(['test-tag'], [0]);
+
+        // Wait a bit
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // Verify no edge cache clear calls were made
+        const calls = fetchSpy.mock.calls;
+        const edgeCacheCalls = calls.filter(call =>
+          typeof call[0] === 'string' && call[0].includes('/cache/keys/')
+        );
+
+        expect(edgeCacheCalls.length).toBe(0);
+      } finally {
+        // Restore environment
+        if (originalEnv !== undefined) {
+          process.env.OUTBOUND_PROXY_ENDPOINT = originalEnv;
+        }
+        fetchSpy.mockRestore();
+      }
+    });
   });
 
   describe('cache key sanitization', () => {
