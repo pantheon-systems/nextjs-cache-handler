@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server.js';
-import { RequestContext } from './request-context.js';
+import { CacheTagContext } from './cache-tag-context.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('withSurrogateKey');
@@ -43,7 +43,7 @@ export function withSurrogateKey(
 
   return async (request: NextRequest, context?: { params?: Promise<Record<string, string>> }) => {
     // Clear any stale global tags before starting request
-    // This is a fallback for when AsyncLocalStorage doesn't propagate through Next.js cache mechanism
+    // This is kept as a last-resort fallback for environments where Symbol.for doesn't propagate
     const globalTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as
       | string[]
       | undefined;
@@ -51,30 +51,43 @@ export function withSurrogateKey(
       globalTags.length = 0;
     }
 
-    // Run handler within request context to capture tags
-    return RequestContext.run(async () => {
+    // Run handler within CacheTagContext (uses Symbol.for pattern for cross-context propagation)
+    return CacheTagContext.run(async () => {
+      const requestId = CacheTagContext.getRequestId();
+      if (debug) {
+        log.debug(`Starting request ${requestId}`);
+      }
+
       // Execute the original handler
       const response = await handler(request, context);
 
-      // Get captured tags from cache hits (primary: AsyncLocalStorage)
-      let capturedTags = RequestContext.getTags();
+      // Primary: Get captured tags from CacheTagContext (Symbol.for pattern)
+      let capturedTags = CacheTagContext.getTags();
+      let tagSource = 'CacheTagContext';
+
+      if (debug && capturedTags.length > 0) {
+        log.debug(`CacheTagContext captured ${capturedTags.length} tags: ${capturedTags.join(', ')}`);
+      }
 
       // Fallback: check global store for cross-context tag propagation
-      // This handles cases where Next.js cache mechanism runs outside our AsyncLocalStorage context
-      const globalStoreTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as
-        | string[]
-        | undefined;
-      if (capturedTags.length === 0 && globalStoreTags && globalStoreTags.length > 0) {
-        capturedTags = [...new Set(globalStoreTags)];
-        if (debug) {
-          log.debug(`Using global store fallback: ${capturedTags.length} tags`);
+      // This handles cases where even the Symbol.for pattern doesn't propagate
+      if (capturedTags.length === 0) {
+        const globalStoreTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as
+          | string[]
+          | undefined;
+        if (globalStoreTags && globalStoreTags.length > 0) {
+          capturedTags = [...new Set(globalStoreTags)];
+          tagSource = 'globalStore';
+          if (debug) {
+            log.debug(`Using global store fallback: ${capturedTags.length} tags`);
+          }
+          // Clear global tags after reading
+          globalStoreTags.length = 0;
         }
-        // Clear global tags after reading
-        globalStoreTags.length = 0;
       }
 
       if (debug) {
-        log.debug(`Captured ${capturedTags.length} tags: ${capturedTags.join(', ')}`);
+        log.debug(`Captured ${capturedTags.length} tags from ${tagSource}: ${capturedTags.join(', ')}`);
       }
 
       // Clone response to modify headers
@@ -92,6 +105,7 @@ export function withSurrogateKey(
         if (debug) {
           log.debug(`Set Surrogate-Key: ${surrogateKey}`);
           newResponse.headers.set('x-cache-tags-count', String(capturedTags.length));
+          newResponse.headers.set('x-cache-tags-source', tagSource);
         }
       } else if (fallbackKey) {
         newResponse.headers.set('Surrogate-Key', fallbackKey);

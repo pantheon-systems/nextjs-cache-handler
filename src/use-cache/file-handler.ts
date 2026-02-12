@@ -6,9 +6,65 @@ import {
   deserializeUseCacheEntry,
 } from './stream-serialization.js';
 import { createLogger } from '../utils/logger.js';
-import { RequestContext } from '../utils/request-context.js';
 
 const log = createLogger('UseCacheFileHandler');
+
+/**
+ * Symbol used to access CacheTagContext from globalThis.
+ * This matches the Symbol.for pattern used by Next.js for @next/request-context.
+ */
+const CACHE_TAG_CONTEXT_SYMBOL = Symbol.for('@nextjs-cache-handler/tag-context');
+
+interface CacheTagContextData {
+  tags: string[];
+  requestId: string;
+  startTime: number;
+}
+
+interface CacheTagContextAccessor {
+  get(): CacheTagContextData | undefined;
+}
+
+/**
+ * Access the CacheTagContext via globalThis using Symbol.for.
+ * This allows cross-context access without direct module imports.
+ */
+function getCacheTagContext(): CacheTagContextData | undefined {
+  const accessor = (globalThis as Record<symbol, unknown>)[CACHE_TAG_CONTEXT_SYMBOL] as
+    | CacheTagContextAccessor
+    | undefined;
+  return accessor?.get();
+}
+
+/**
+ * Add tags to the CacheTagContext if available.
+ * Falls back to global store if CacheTagContext is not active.
+ */
+function captureTags(tags: string[]): { captured: boolean; source: string } {
+  if (tags.length === 0) {
+    return { captured: false, source: 'none' };
+  }
+
+  // Primary: Try CacheTagContext (Symbol.for pattern)
+  const context = getCacheTagContext();
+  if (context) {
+    context.tags.push(...tags);
+    log.debug(`Captured ${tags.length} tags via CacheTagContext: ${tags.join(', ')}`);
+    return { captured: true, source: 'CacheTagContext' };
+  }
+
+  // Fallback: Use global store (for environments where Symbol.for doesn't propagate)
+  let globalTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as
+    | string[]
+    | undefined;
+  if (!globalTags) {
+    globalTags = [];
+    (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags = globalTags;
+  }
+  globalTags.push(...tags);
+  log.debug(`Captured ${tags.length} tags via globalStore fallback: ${tags.join(', ')}`);
+  return { captured: true, source: 'globalStore' };
+}
 
 /**
  * Configuration for UseCacheFileHandler.
@@ -140,24 +196,16 @@ export class UseCacheFileHandler implements UseCacheHandler {
       log.debug(`HIT: ${cacheKey}`);
 
       // Capture tags for Surrogate-Key header propagation
-      const storedTagsLength = entry.tags?.length ?? 0;
-      const contextActive = RequestContext.isActive();
+      // Uses Symbol.for pattern to access PantheonContext across async boundaries
+      const storedTags = entry.tags ?? [];
+      const { captured, source } = captureTags(storedTags);
 
-      if (storedTagsLength > 0 && contextActive) {
-        RequestContext.addTags(entry.tags);
-        log.debug(`Captured ${storedTagsLength} tags for Surrogate-Key: ${entry.tags.join(', ')}`);
-      } else {
+      if (captured) {
+        log.debug(`HIT ${cacheKey}: Captured ${storedTags.length} tags via ${source}`);
+      } else if (storedTags.length === 0) {
         // TODO: Remove this diagnostic logging once Next.js fixes the empty tags bug
         // See: https://github.com/vercel/next.js/issues/78864
-        // Log why tags weren't propagated
-        log.info(`GET ${cacheKey} - Tag propagation status:`, {
-          storedTags: entry.tags,
-          storedTagsLength,
-          requestContextActive: contextActive,
-          reason: storedTagsLength === 0
-            ? 'No tags stored (Next.js empty tags bug)'
-            : 'RequestContext not active'
-        });
+        log.info(`HIT ${cacheKey}: No tags to capture (Next.js empty tags bug)`);
       }
 
       return entry;
