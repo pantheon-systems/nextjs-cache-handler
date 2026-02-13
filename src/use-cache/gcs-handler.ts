@@ -10,10 +10,24 @@ import { createEdgeCacheClearer, type EdgeCacheClear } from '../edge/edge-cache-
 const log = createLogger('UseCacheGcsHandler');
 
 /**
+ * Next.js internal prefix for path-based cache tags.
+ * When revalidatePath('/api/foo') is called, Next.js internally calls
+ * revalidateTag('_N_T_/api/foo'). This prefix identifies path tags.
+ */
+const NEXTJS_PATH_TAG_PREFIX = '_N_T_';
+
+/**
  * Symbol used to access CacheTagContext from globalThis.
  * This matches the Symbol.for pattern used by Next.js for @next/request-context.
  */
 const CACHE_TAG_CONTEXT_SYMBOL = Symbol.for('@nextjs-cache-handler/tag-context');
+
+/**
+ * Symbol used to expose registerPathTags on globalThis.
+ * This allows withSurrogateKey (which knows the request path and captured tags)
+ * to register path→surrogate-key mappings without a direct module import.
+ */
+const PATH_TAGS_REGISTRY_SYMBOL = Symbol.for('@nextjs-cache-handler/path-tags-registry');
 
 interface CacheTagContextData {
   tags: string[];
@@ -80,6 +94,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private readonly tagsKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
   private tagTimestamps: Map<string, number> = new Map();
+  private pathToSurrogateKeys: Map<string, string[]> = new Map();
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
 
@@ -96,6 +111,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     this.tagsKey = `${this.cachePrefix}_tags.json`;
 
     this.edgeCacheClearer = createEdgeCacheClearer();
+
+    // Expose registerPathTags on globalThis so withSurrogateKey can register
+    // path→surrogate-key mappings without direct module coupling
+    (globalThis as Record<symbol, unknown>)[PATH_TAGS_REGISTRY_SYMBOL] =
+      (path: string, tags: string[]) => this.registerPathTags(path, tags);
 
     // Initialize asynchronously but track the promise
     this.initPromise = this.initialize().catch(() => {});
@@ -316,6 +336,16 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
+   * Register the surrogate keys (explicit cacheTag values) associated with a path.
+   * Called by withSurrogateKey when tags are captured during a cache HIT,
+   * enabling revalidatePath to resolve the correct CDN surrogate keys.
+   */
+  registerPathTags(path: string, surrogateKeys: string[]): void {
+    this.pathToSurrogateKeys.set(path, surrogateKeys);
+    log.debug(`Registered path tags: ${path} → [${surrogateKeys.join(', ')}]`);
+  }
+
+  /**
    * Invalidate cache entries with matching tags.
    */
   async updateTags(tags: string[], durations: number[]): Promise<void> {
@@ -335,7 +365,51 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     // Clear edge cache if configured
     if (this.edgeCacheClearer) {
-      this.edgeCacheClearer.clearKeysInBackground(tags, `use-cache tag invalidation: ${tags.join(', ')}`);
+      // Separate explicit tags from _N_T_ path tags
+      const explicitTags: string[] = [];
+      const pathTags: string[] = [];
+
+      for (const tag of tags) {
+        if (tag.startsWith(NEXTJS_PATH_TAG_PREFIX)) {
+          pathTags.push(tag);
+        } else {
+          explicitTags.push(tag);
+        }
+      }
+
+      // Purge explicit tags as surrogate keys (these match CDN Surrogate-Key headers directly)
+      if (explicitTags.length > 0) {
+        this.edgeCacheClearer.clearKeysInBackground(explicitTags, `use-cache tag invalidation: ${explicitTags.join(', ')}`);
+      }
+
+      // Resolve _N_T_ path tags to surrogate keys via the registered mapping
+      if (pathTags.length > 0) {
+        const resolvedKeys: string[] = [];
+        const unresolvedPaths: string[] = [];
+
+        for (const pathTag of pathTags) {
+          const path = pathTag.substring(NEXTJS_PATH_TAG_PREFIX.length);
+          const surrogateKeys = this.pathToSurrogateKeys.get(path);
+
+          if (surrogateKeys && surrogateKeys.length > 0) {
+            resolvedKeys.push(...surrogateKeys);
+            log.debug(`Resolved path tag ${pathTag} → surrogate keys: [${surrogateKeys.join(', ')}]`);
+          } else {
+            unresolvedPaths.push(path);
+            log.debug(`No surrogate key mapping for path tag ${pathTag}, falling back to path purge`);
+          }
+        }
+
+        // Purge resolved surrogate keys
+        if (resolvedKeys.length > 0) {
+          this.edgeCacheClearer.clearKeysInBackground(resolvedKeys, `path revalidation (resolved): ${resolvedKeys.join(', ')}`);
+        }
+
+        // Fallback: attempt path-based purge for unmapped paths
+        if (unresolvedPaths.length > 0) {
+          this.edgeCacheClearer.clearPathsInBackground(unresolvedPaths, `path revalidation (fallback): ${unresolvedPaths.join(', ')}`);
+        }
+      }
     }
   }
 

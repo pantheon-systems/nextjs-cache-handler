@@ -11,6 +11,16 @@ import { createEdgeCacheClearer, type EdgeCacheClear } from '../edge/edge-cache-
 const log = createLogger('UseCacheFileHandler');
 
 /**
+ * Next.js internal prefix for path-based cache tags.
+ */
+const NEXTJS_PATH_TAG_PREFIX = '_N_T_';
+
+/**
+ * Symbol for path→surrogate-key registry on globalThis.
+ */
+const PATH_TAGS_REGISTRY_SYMBOL = Symbol.for('@nextjs-cache-handler/path-tags-registry');
+
+/**
  * Symbol used to access CacheTagContext from globalThis.
  * This matches the Symbol.for pattern used by Next.js for @next/request-context.
  */
@@ -91,6 +101,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
   private tagTimestamps: Map<string, number> = new Map();
+  private pathToSurrogateKeys: Map<string, string[]> = new Map();
   private readonly edgeCacheClearer: EdgeCacheClear | null;
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
@@ -105,6 +116,10 @@ export class UseCacheFileHandler implements UseCacheHandler {
     if (this.edgeCacheClearer) {
       log.debug('Edge cache clearing enabled');
     }
+
+    // Expose registerPathTags on globalThis for withSurrogateKey integration
+    (globalThis as Record<symbol, unknown>)[PATH_TAGS_REGISTRY_SYMBOL] =
+      (p: string, t: string[]) => this.registerPathTags(p, t);
 
     log.debug('Initialized with cache dir:', this.cacheDir);
   }
@@ -295,6 +310,15 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   /**
+   * Register the surrogate keys associated with a path.
+   * Called by withSurrogateKey via globalThis Symbol.
+   */
+  registerPathTags(path: string, surrogateKeys: string[]): void {
+    this.pathToSurrogateKeys.set(path, surrogateKeys);
+    log.debug(`Registered path tags: ${path} → [${surrogateKeys.join(', ')}]`);
+  }
+
+  /**
    * Invalidate cache entries with matching tags.
    * Also triggers CDN edge cache clearing via Surrogate-Key if configured.
    */
@@ -314,9 +338,45 @@ export class UseCacheFileHandler implements UseCacheHandler {
     this.saveTagTimestamps();
 
     // Clear edge cache if configured
-    // This purges CDN cache entries with matching Surrogate-Key tags
     if (this.edgeCacheClearer) {
-      this.edgeCacheClearer.clearKeysInBackground(tags, `use-cache tag invalidation: ${tags.join(', ')}`);
+      const explicitTags: string[] = [];
+      const pathTags: string[] = [];
+
+      for (const tag of tags) {
+        if (tag.startsWith(NEXTJS_PATH_TAG_PREFIX)) {
+          pathTags.push(tag);
+        } else {
+          explicitTags.push(tag);
+        }
+      }
+
+      if (explicitTags.length > 0) {
+        this.edgeCacheClearer.clearKeysInBackground(explicitTags, `use-cache tag invalidation: ${explicitTags.join(', ')}`);
+      }
+
+      if (pathTags.length > 0) {
+        const resolvedKeys: string[] = [];
+        const unresolvedPaths: string[] = [];
+
+        for (const pathTag of pathTags) {
+          const p = pathTag.substring(NEXTJS_PATH_TAG_PREFIX.length);
+          const surrogateKeys = this.pathToSurrogateKeys.get(p);
+
+          if (surrogateKeys && surrogateKeys.length > 0) {
+            resolvedKeys.push(...surrogateKeys);
+          } else {
+            unresolvedPaths.push(p);
+          }
+        }
+
+        if (resolvedKeys.length > 0) {
+          this.edgeCacheClearer.clearKeysInBackground(resolvedKeys, `path revalidation (resolved): ${resolvedKeys.join(', ')}`);
+        }
+
+        if (unresolvedPaths.length > 0) {
+          this.edgeCacheClearer.clearPathsInBackground(unresolvedPaths, `path revalidation (fallback): ${unresolvedPaths.join(', ')}`);
+        }
+      }
     }
   }
 

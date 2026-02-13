@@ -4,6 +4,13 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('withSurrogateKey');
 
+/**
+ * Symbol for registering path→surrogate-key mappings with the use-cache handler.
+ * When withSurrogateKey captures tags, it registers them so revalidatePath
+ * can resolve _N_T_ path tags to the correct CDN surrogate keys.
+ */
+const PATH_TAGS_REGISTRY_SYMBOL = Symbol.for('@nextjs-cache-handler/path-tags-registry');
+
 export interface SurrogateKeyOptions {
   /** Fallback Surrogate-Key when no tags are captured */
   fallbackKey?: string;
@@ -88,6 +95,20 @@ export function withSurrogateKey(
 
       if (debug) {
         log.debug(`Captured ${capturedTags.length} tags from ${tagSource}: ${capturedTags.join(', ')}`);
+      }
+
+      // Register path→surrogate-key mapping for revalidatePath CDN clearing
+      if (capturedTags.length > 0) {
+        const requestPath = new URL(request.url).pathname;
+        const registerFn = (globalThis as Record<symbol, unknown>)[PATH_TAGS_REGISTRY_SYMBOL] as
+          | ((path: string, tags: string[]) => void)
+          | undefined;
+        if (registerFn) {
+          registerFn(requestPath, capturedTags);
+          if (debug) {
+            log.debug(`Registered path tags: ${requestPath} → [${capturedTags.join(', ')}]`);
+          }
+        }
       }
 
       // Clone response to modify headers

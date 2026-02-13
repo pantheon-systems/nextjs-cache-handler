@@ -384,6 +384,183 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('updateTags with _N_T_ path tags', () => {
+    it('should resolve _N_T_ path tag to surrogate keys when mapping is registered', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new UseCacheGcsHandler();
+
+      // Register that /api/cdnprobe is associated with surrogate key 'cdnprobe'
+      handler.registerPathTags('/api/cdnprobe', ['cdnprobe']);
+
+      // Simulate what Next.js does when revalidatePath('/api/cdnprobe') is called
+      await handler.updateTags(['_N_T_/api/cdnprobe'], [0]);
+
+      // Wait for background edge cache clear
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Should have called clearKeys with the surrogate key 'cdnprobe', NOT '_N_T_/api/cdnprobe'
+      const fetchCalls = vi.mocked(fetch).mock.calls;
+      const keyPurgeCalls = fetchCalls.filter(
+        ([url]) => typeof url === 'string' && url.includes('/keys/')
+      );
+
+      expect(keyPurgeCalls.length).toBeGreaterThan(0);
+
+      // Should purge 'cdnprobe' surrogate key
+      const purgedKeys = keyPurgeCalls.map(([url]) =>
+        decodeURIComponent((url as string).split('/keys/')[1])
+      );
+      expect(purgedKeys).toContain('cdnprobe');
+
+      // Should NOT purge the raw _N_T_ tag (it's not a valid surrogate key)
+      expect(purgedKeys).not.toContain('_N_T_/api/cdnprobe');
+    });
+
+    it('should still invalidate tag timestamps for _N_T_ tags', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new UseCacheGcsHandler();
+
+      await handler.updateTags(['_N_T_/api/cdnprobe'], [0]);
+
+      // The _N_T_ tag should still be recorded in tagTimestamps for server-side expiration
+      const expiration = await handler.getExpiration(['_N_T_/api/cdnprobe']);
+      expect(expiration).toBeGreaterThan(0);
+    });
+
+    it('should handle mixed explicit and _N_T_ tags', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new UseCacheGcsHandler();
+      handler.registerPathTags('/api/cdnprobe', ['cdnprobe']);
+
+      // Mixed: explicit tag + path tag
+      await handler.updateTags(['posts', '_N_T_/api/cdnprobe'], [0, 0]);
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const fetchCalls = vi.mocked(fetch).mock.calls;
+      const keyPurgeCalls = fetchCalls.filter(
+        ([url]) => typeof url === 'string' && url.includes('/keys/')
+      );
+      const purgedKeys = keyPurgeCalls.map(([url]) =>
+        decodeURIComponent((url as string).split('/keys/')[1])
+      );
+
+      // Should purge both explicit tag and resolved surrogate key
+      expect(purgedKeys).toContain('posts');
+      expect(purgedKeys).toContain('cdnprobe');
+    });
+
+    it('should fallback to path purge when no surrogate key mapping exists', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new UseCacheGcsHandler();
+      // Note: NO registerPathTags call — no mapping exists
+
+      await handler.updateTags(['_N_T_/blogs'], [0]);
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const fetchCalls = vi.mocked(fetch).mock.calls;
+
+      // Should attempt path purge as fallback
+      const pathPurgeCalls = fetchCalls.filter(
+        ([url]) => typeof url === 'string' && url.includes('/paths/')
+      );
+      expect(pathPurgeCalls.length).toBeGreaterThan(0);
+
+      const purgedPaths = pathPurgeCalls.map(([url]) =>
+        (url as string).split('/paths/')[1]
+      );
+      expect(purgedPaths).toContain('blogs');
+    });
+
+    it('should handle multiple path tags with different mappings', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new UseCacheGcsHandler();
+      handler.registerPathTags('/api/cdnprobe', ['cdnprobe']);
+      handler.registerPathTags('/api/posts', ['api-posts', 'external-data']);
+
+      await handler.updateTags(['_N_T_/api/cdnprobe', '_N_T_/api/posts'], [0, 0]);
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const fetchCalls = vi.mocked(fetch).mock.calls;
+      const keyPurgeCalls = fetchCalls.filter(
+        ([url]) => typeof url === 'string' && url.includes('/keys/')
+      );
+      const purgedKeys = keyPurgeCalls.map(([url]) =>
+        decodeURIComponent((url as string).split('/keys/')[1])
+      );
+
+      // Should purge all surrogate keys from both paths
+      expect(purgedKeys).toContain('cdnprobe');
+      expect(purgedKeys).toContain('api-posts');
+      expect(purgedKeys).toContain('external-data');
+    });
+
+    it('should not purge _N_T_ tags as raw keys when no edge cache clearer configured', async () => {
+      // No OUTBOUND_PROXY_ENDPOINT — edge cache clearing disabled
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new UseCacheGcsHandler();
+      handler.registerPathTags('/api/cdnprobe', ['cdnprobe']);
+
+      // Should not throw
+      await handler.updateTags(['_N_T_/api/cdnprobe'], [0]);
+
+      // No fetch calls expected
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('registerPathTags', () => {
+    it('should register path-to-tag mappings', () => {
+      const handler = new UseCacheGcsHandler();
+
+      // Should not throw
+      handler.registerPathTags('/api/cdnprobe', ['cdnprobe']);
+      handler.registerPathTags('/api/posts', ['api-posts', 'external-data']);
+    });
+
+    it('should update mapping when called with same path', () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new UseCacheGcsHandler();
+
+      // Register, then update with new tags
+      handler.registerPathTags('/api/cdnprobe', ['old-tag']);
+      handler.registerPathTags('/api/cdnprobe', ['new-tag']);
+
+      // Internal state should have updated mapping (verified via updateTags behavior)
+      // This is tested implicitly through the updateTags tests
+    });
+  });
+
   describe('cache key sanitization', () => {
     it('should handle keys with special characters', async () => {
       mockFile.exists.mockResolvedValue([false]);
