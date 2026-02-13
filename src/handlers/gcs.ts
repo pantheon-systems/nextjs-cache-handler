@@ -254,12 +254,28 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected override async onRevalidateComplete(tags: string[], deletedKeys: string[]): Promise<void> {
-    if (deletedKeys.length === 0 || !this.edgeCacheClearer) {
+    if (!this.edgeCacheClearer) {
       return;
     }
 
-    // Clear by tags/keys
-    this.edgeCacheClearer.clearKeysInBackground(tags, `tag revalidation: ${tags.join(', ')}`);
+    // Handle revalidatePath(): Next.js converts path to internal tag with _N_T_ prefix.
+    // Even if no cache entries were found in the tags mapping (deletedKeys is empty),
+    // we can extract the route path from the tag and clear the CDN by path.
+    const pathTags = tags.filter((tag) => tag.startsWith('_N_T_'));
+    if (pathTags.length > 0) {
+      const routePaths = pathTags.map((tag) => tag.replace(/^_N_T_/, ''));
+      this.edgeCacheClearer.clearPathsInBackground(routePaths, `path revalidation: ${routePaths.join(', ')}`);
+    }
+
+    if (deletedKeys.length === 0) {
+      return;
+    }
+
+    // Clear by tags/keys (for explicit revalidateTag calls)
+    const explicitTags = tags.filter((tag) => !tag.startsWith('_N_T_'));
+    if (explicitTags.length > 0) {
+      this.edgeCacheClearer.clearKeysInBackground(explicitTags, `tag revalidation: ${explicitTags.join(', ')}`);
+    }
 
     // Also clear by route paths for routes that may not have tags (e.g., ISR routes)
     const routePaths = this.extractRoutePaths(deletedKeys);
