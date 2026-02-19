@@ -184,15 +184,15 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
-   * Check if an entry is expired based on revalidate time.
+   * Check if an entry is expired based on expire time.
    */
   private isExpired(entry: UseCacheEntry): boolean {
     const now = Date.now();
     const age = now - entry.timestamp;
-    const revalidateMs = entry.revalidate * 1000;
+    const expireMs = entry.expire * 1000;
 
-    // Entry is expired if it's older than revalidate time
-    if (age > revalidateMs) {
+    // Entry is expired if it's older than expire time
+    if (age > expireMs) {
       return true;
     }
 
