@@ -12,6 +12,7 @@ import { serializeForStorage, deserializeFromStorage } from '../utils/serializat
 import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
 import { RequestContext } from '../utils/request-context.js';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Global singleton to track if build invalidation has been checked for this process
 let buildInvalidationChecked = false;
@@ -355,6 +356,14 @@ export abstract class BaseCacheHandler {
     if (deletedKeys.length > 0) {
       await this.updateTagsMappingBulkDelete(deletedKeys, tagsMapping);
       this.log.debug(`Updated tags mapping after deleting ${deletedKeys.length} entries`);
+    }
+
+    // Update Next.js internal tagsManifest so the route-level staleness
+    // checks (areTagsStale / areTagsExpired) recognise this tag as invalidated.
+    // Without this, the response cache serves stale HTML without re-rendering.
+    const now = Date.now();
+    for (const currentTag of tagArray) {
+      tagsManifest.set(currentTag, { stale: now, expired: now });
     }
 
     this.log.info(`Revalidated ${deletedKeys.length} entries for tags: ${tagArray.join(', ')}`);
