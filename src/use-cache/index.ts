@@ -7,15 +7,18 @@
  * @example
  * ```javascript
  * // next.config.mjs
- * import { createUseCacheHandler } from '@pantheon-systems/nextjs-cache-handler/use-cache';
+ * import path from "path";
+ * import { fileURLToPath } from "url";
+ *
+ * const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *
  * const nextConfig = {
  *   // Existing handler for ISR, routes, fetch cache
- *   cacheHandler: require.resolve('./cache-handler.mjs'),
+ *   cacheHandler: path.resolve(__dirname, "./cache-handler.mjs"),
  *
  *   // NEW handler for 'use cache' directive
  *   cacheHandlers: {
- *     default: require.resolve('./use-cache-handler.mjs'),
+ *     default: path.resolve(__dirname, "./use-cache-handler.mjs"),
  *   },
  *
  *   cacheComponents: true,

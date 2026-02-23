@@ -5,8 +5,9 @@ Custom cache handler for Next.js with support for Google Cloud Storage and file-
 ## Features
 
 - **Dual Cache Handlers**: Support for both GCS (production) and file-based (development) caching
+- **Next.js 16 `use cache` Support**: Handlers for the new `cacheHandlers` (plural) API
 - **Tag-Based Invalidation**: Efficient O(1) cache invalidation using tag mapping
-- **Buffer Serialization**: Handles Next.js 15 buffer compatibility issues
+- **Edge Cache Clearing**: Automatic CDN cache invalidation on Pantheon infrastructure
 - **Build-Aware Caching**: Automatically invalidates route cache on new builds
 - **Static Route Preservation**: Preserves SSG routes during cache clearing
 
@@ -135,6 +136,68 @@ import { FileCacheHandler, GcsCacheHandler } from '@pantheon-systems/nextjs-cach
 export default FileCacheHandler;
 ```
 
+## Next.js 16 `use cache` Handlers
+
+Next.js 16 introduces the `'use cache'` directive with a new `cacheHandlers` (plural) configuration. This package provides handlers for it.
+
+### 1. Create a use-cache handler file
+
+```typescript
+// use-cache-handler.mjs
+import { createUseCacheHandler } from '@pantheon-systems/nextjs-cache-handler/use-cache';
+
+const UseCacheHandler = createUseCacheHandler({
+  type: 'auto', // Auto-detect: GCS if CACHE_BUCKET exists, else file-based
+});
+
+export default UseCacheHandler;
+```
+
+### 2. Configure Next.js
+
+```javascript
+// next.config.mjs
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const nextConfig = {
+  // Existing handler for ISR, routes, fetch cache
+  cacheHandler: path.resolve(__dirname, "./cache-handler.mjs"),
+
+  // Handler for 'use cache' directive
+  cacheHandlers: {
+    default: path.resolve(__dirname, "./use-cache-handler.mjs"),
+  },
+
+  cacheMaxMemorySize: 0,
+  cacheComponents: true,
+};
+
+export default nextConfig;
+```
+
+### `createUseCacheHandler(config?)`
+
+Factory function that returns the appropriate use-cache handler. Accepts the same `type` option (`'auto'`, `'file'`, `'gcs'`).
+
+### `getUseCacheStats()`
+
+Returns statistics for `use cache` entries, similar to `getSharedCacheStats()`.
+
+```typescript
+import { getUseCacheStats } from '@pantheon-systems/nextjs-cache-handler';
+
+const stats = await getUseCacheStats();
+```
+
+### Direct Handler Access
+
+```typescript
+import { UseCacheFileHandler, UseCacheGcsHandler } from '@pantheon-systems/nextjs-cache-handler';
+```
+
 ## Cache Types
 
 The handler distinguishes between two cache types:
@@ -154,6 +217,15 @@ await cacheHandler.set('post-1', data, { tags: ['posts', 'blog'] });
 await cacheHandler.revalidateTag('posts');
 // All entries tagged with 'posts' are invalidated
 ```
+
+## Edge Cache Clearing
+
+When deployed on Pantheon, the cache handlers automatically clear the CDN edge cache when cache entries are invalidated. This is triggered by:
+
+- `revalidateTag()` calls (clears matching surrogate keys and paths)
+- `revalidatePath()` calls (clears the specific path from the CDN)
+
+Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). It runs in the background and does not block cache operations.
 
 ## Build Invalidation
 

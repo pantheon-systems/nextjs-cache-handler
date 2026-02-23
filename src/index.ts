@@ -23,8 +23,13 @@ import { GcsCacheHandler, getSharedCacheStats as getGcsCacheStats, clearSharedCa
  * @example
  * ```javascript
  * // In your next.config.mjs:
+ * import path from "path";
+ * import { fileURLToPath } from "url";
+ *
+ * const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ *
  * const nextConfig = {
- *   cacheHandler: require.resolve('./cacheHandler'),
+ *   cacheHandler: path.resolve(__dirname, "./cacheHandler.mjs"),
  *   cacheMaxMemorySize: 0,
  * };
  *
