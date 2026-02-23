@@ -11,7 +11,6 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
-import { RequestContext } from '../utils/request-context.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Global singleton to track if build invalidation has been checked for this process
@@ -242,41 +241,11 @@ export abstract class BaseCacheHandler {
         hasValue: entry && typeof entry === 'object' && 'value' in entry,
       });
 
-      // Capture tags for Surrogate-Key header propagation
-      if (entry.tags && entry.tags.length > 0) {
-        this.captureTagsForResponse(entry.tags, cacheKey, cacheType);
-      }
-
       return entry;
     } catch (error) {
       this.log.error(`Error reading cache for key ${cacheKey}:`, error);
       return null;
     }
-  }
-
-  /**
-   * Captures cache tags for propagation to response headers.
-   * Called during cache hits to track which tags apply to the current response.
-   *
-   * @param tags - Tags associated with the cache entry
-   * @param cacheKey - The cache key being accessed
-   * @param cacheType - Whether this is fetch or route cache
-   */
-  protected captureTagsForResponse(
-    tags: Readonly<string[]>,
-    cacheKey: string,
-    cacheType: 'fetch' | 'route'
-  ): void {
-    if (!RequestContext.isActive()) {
-      // Not in a request context (e.g., during build)
-      // This is normal and expected - skip silently
-      return;
-    }
-
-    RequestContext.addTags([...tags]);
-    this.log.debug(
-      `Captured ${tags.length} tags for Surrogate-Key (${cacheType}/${cacheKey}): ${tags.join(', ')}`
-    );
   }
 
   async set(

@@ -4,8 +4,6 @@ import * as path from 'path';
 import { UseCacheFileHandler } from '../../src/use-cache/file-handler.js';
 import type { UseCacheEntry } from '../../src/use-cache/types.js';
 import { streamToBytes } from '../../src/use-cache/stream-serialization.js';
-import { CacheTagContext } from '../../src/utils/cache-tag-context.js';
-
 // Helper to create a test stream
 function createTestStream(data: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -432,90 +430,4 @@ describe('UseCacheFileHandler', () => {
     });
   });
 
-  describe('tag capture for Surrogate-Key headers', () => {
-    it('should capture tags to CacheTagContext on cache hit', async () => {
-      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
-
-      // Set an entry with tags
-      const entry = createTestEntry({ tags: ['api-posts', 'external-data'] });
-      await handler.set('tagged-entry', Promise.resolve(entry));
-
-      // Get the entry within a CacheTagContext
-      let capturedTags: string[] = [];
-      await CacheTagContext.run(async () => {
-        await handler.get('tagged-entry', []);
-        capturedTags = CacheTagContext.getTags();
-      });
-
-      // Tags should be captured
-      expect(capturedTags).toContain('api-posts');
-      expect(capturedTags).toContain('external-data');
-      expect(capturedTags.length).toBe(2);
-    });
-
-    it('should fall back to global store when no CacheTagContext is active', async () => {
-      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
-
-      // Clear global store first
-      const globalTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as string[] | undefined;
-      if (globalTags) {
-        globalTags.length = 0;
-      }
-
-      // Set an entry with tags
-      const entry = createTestEntry({ tags: ['tag1'] });
-      await handler.set('tagged-entry-2', Promise.resolve(entry));
-
-      // Get the entry without CacheTagContext - should use global store fallback
-      const result = await handler.get('tagged-entry-2', []);
-      expect(result).not.toBeUndefined();
-      expect(result!.tags).toEqual(['tag1']);
-
-      // Check tags were captured to global store
-      const capturedGlobalTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as string[];
-      expect(capturedGlobalTags).toContain('tag1');
-    });
-
-    it('should not capture tags for entries without tags', async () => {
-      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
-
-      // Set an entry without tags
-      const entry = createTestEntry({ tags: [] });
-      await handler.set('untagged-entry', Promise.resolve(entry));
-
-      // Get the entry within a CacheTagContext
-      let capturedTags: string[] = [];
-      await CacheTagContext.run(async () => {
-        await handler.get('untagged-entry', []);
-        capturedTags = CacheTagContext.getTags();
-      });
-
-      // No tags should be captured
-      expect(capturedTags.length).toBe(0);
-    });
-
-    it('should accumulate tags from multiple cache hits', async () => {
-      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
-
-      // Set multiple entries with different tags
-      const entry1 = createTestEntry({ tags: ['posts'] });
-      const entry2 = createTestEntry({ tags: ['users', 'profiles'] });
-      await handler.set('entry-1', Promise.resolve(entry1));
-      await handler.set('entry-2', Promise.resolve(entry2));
-
-      // Get both entries within same CacheTagContext
-      let capturedTags: string[] = [];
-      await CacheTagContext.run(async () => {
-        await handler.get('entry-1', []);
-        await handler.get('entry-2', []);
-        capturedTags = CacheTagContext.getTags();
-      });
-
-      // All tags should be captured
-      expect(capturedTags).toContain('posts');
-      expect(capturedTags).toContain('users');
-      expect(capturedTags).toContain('profiles');
-      expect(capturedTags.length).toBe(3);
-    });
-  });
 });

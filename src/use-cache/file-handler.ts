@@ -16,68 +16,6 @@ const log = createLogger('UseCacheFileHandler');
 const NEXTJS_PATH_TAG_PREFIX = '_N_T_';
 
 /**
- * Symbol for path→surrogate-key registry on globalThis.
- */
-const PATH_TAGS_REGISTRY_SYMBOL = Symbol.for('@nextjs-cache-handler/path-tags-registry');
-
-/**
- * Symbol used to access CacheTagContext from globalThis.
- * This matches the Symbol.for pattern used by Next.js for @next/request-context.
- */
-const CACHE_TAG_CONTEXT_SYMBOL = Symbol.for('@nextjs-cache-handler/tag-context');
-
-interface CacheTagContextData {
-  tags: string[];
-  requestId: string;
-  startTime: number;
-}
-
-interface CacheTagContextAccessor {
-  get(): CacheTagContextData | undefined;
-}
-
-/**
- * Access the CacheTagContext via globalThis using Symbol.for.
- * This allows cross-context access without direct module imports.
- */
-function getCacheTagContext(): CacheTagContextData | undefined {
-  const accessor = (globalThis as Record<symbol, unknown>)[CACHE_TAG_CONTEXT_SYMBOL] as
-    | CacheTagContextAccessor
-    | undefined;
-  return accessor?.get();
-}
-
-/**
- * Add tags to the CacheTagContext if available.
- * Falls back to global store if CacheTagContext is not active.
- */
-function captureTags(tags: string[]): { captured: boolean; source: string } {
-  if (tags.length === 0) {
-    return { captured: false, source: 'none' };
-  }
-
-  // Primary: Try CacheTagContext (Symbol.for pattern)
-  const context = getCacheTagContext();
-  if (context) {
-    context.tags.push(...tags);
-    log.debug(`Captured ${tags.length} tags via CacheTagContext: ${tags.join(', ')}`);
-    return { captured: true, source: 'CacheTagContext' };
-  }
-
-  // Fallback: Use global store (for environments where Symbol.for doesn't propagate)
-  let globalTags = (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags as
-    | string[]
-    | undefined;
-  if (!globalTags) {
-    globalTags = [];
-    (globalThis as Record<string, unknown>).__pantheonSurrogateKeyTags = globalTags;
-  }
-  globalTags.push(...tags);
-  log.debug(`Captured ${tags.length} tags via globalStore fallback: ${tags.join(', ')}`);
-  return { captured: true, source: 'globalStore' };
-}
-
-/**
  * Configuration for UseCacheFileHandler.
  */
 export interface UseCacheFileHandlerConfig {
@@ -101,7 +39,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
   private tagTimestamps: Map<string, number> = new Map();
-  private pathToSurrogateKeys: Map<string, string[]> = new Map();
   private readonly edgeCacheClearer: EdgeCacheClear | null;
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
@@ -116,10 +53,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
     if (this.edgeCacheClearer) {
       log.debug('Edge cache clearing enabled');
     }
-
-    // Expose registerPathTags on globalThis for withSurrogateKey integration
-    (globalThis as Record<symbol, unknown>)[PATH_TAGS_REGISTRY_SYMBOL] =
-      (p: string, t: string[]) => this.registerPathTags(p, t);
 
     log.debug('Initialized with cache dir:', this.cacheDir);
   }
@@ -218,19 +151,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
       log.debug(`HIT: ${cacheKey}`);
 
-      // Capture tags for Surrogate-Key header propagation
-      // Uses Symbol.for pattern to access PantheonContext across async boundaries
-      const storedTags = entry.tags ?? [];
-      const { captured, source } = captureTags(storedTags);
-
-      if (captured) {
-        log.debug(`HIT ${cacheKey}: Captured ${storedTags.length} tags via ${source}`);
-      } else if (storedTags.length === 0) {
-        // TODO: Remove this diagnostic logging once Next.js fixes the empty tags bug
-        // See: https://github.com/vercel/next.js/issues/78864
-        log.info(`HIT ${cacheKey}: No tags to capture (Next.js empty tags bug)`);
-      }
-
       return entry;
     } catch (error) {
       log.error(`Error reading cache for key ${cacheKey}:`, error);
@@ -310,15 +230,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   /**
-   * Register the surrogate keys associated with a path.
-   * Called by withSurrogateKey via globalThis Symbol.
-   */
-  registerPathTags(path: string, surrogateKeys: string[]): void {
-    this.pathToSurrogateKeys.set(path, surrogateKeys);
-    log.debug(`Registered path tags: ${path} → [${surrogateKeys.join(', ')}]`);
-  }
-
-  /**
    * Invalidate cache entries with matching tags.
    * Also triggers CDN edge cache clearing via Surrogate-Key if configured.
    */
@@ -340,11 +251,11 @@ export class UseCacheFileHandler implements UseCacheHandler {
     // Clear edge cache if configured
     if (this.edgeCacheClearer) {
       const explicitTags: string[] = [];
-      const pathTags: string[] = [];
+      const paths: string[] = [];
 
       for (const tag of tags) {
         if (tag.startsWith(NEXTJS_PATH_TAG_PREFIX)) {
-          pathTags.push(tag);
+          paths.push(tag.substring(NEXTJS_PATH_TAG_PREFIX.length));
         } else {
           explicitTags.push(tag);
         }
@@ -354,28 +265,8 @@ export class UseCacheFileHandler implements UseCacheHandler {
         this.edgeCacheClearer.clearKeysInBackground(explicitTags, `use-cache tag invalidation: ${explicitTags.join(', ')}`);
       }
 
-      if (pathTags.length > 0) {
-        const resolvedKeys: string[] = [];
-        const unresolvedPaths: string[] = [];
-
-        for (const pathTag of pathTags) {
-          const p = pathTag.substring(NEXTJS_PATH_TAG_PREFIX.length);
-          const surrogateKeys = this.pathToSurrogateKeys.get(p);
-
-          if (surrogateKeys && surrogateKeys.length > 0) {
-            resolvedKeys.push(...surrogateKeys);
-          } else {
-            unresolvedPaths.push(p);
-          }
-        }
-
-        if (resolvedKeys.length > 0) {
-          this.edgeCacheClearer.clearKeysInBackground(resolvedKeys, `path revalidation (resolved): ${resolvedKeys.join(', ')}`);
-        }
-
-        if (unresolvedPaths.length > 0) {
-          this.edgeCacheClearer.clearPathsInBackground(unresolvedPaths, `path revalidation (fallback): ${unresolvedPaths.join(', ')}`);
-        }
+      if (paths.length > 0) {
+        this.edgeCacheClearer.clearPathsInBackground(paths, `path revalidation: ${paths.join(', ')}`);
       }
     }
   }
