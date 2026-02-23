@@ -115,6 +115,7 @@ export class EdgeCacheClear {
       // Double-encode because the edge-cache-clearer expects URL-encoded values.
       const encodedPathSegment = encodeURIComponent(encodeURIComponent(pathSegment));
       const url = `${this.baseUrl}/paths/${encodedPathSegment}`;
+      edgeLog.debug(`Clearing path from edge cache: ${routePath} (encoded: ${encodedPathSegment}, url: ${url})`);
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
