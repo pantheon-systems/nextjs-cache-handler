@@ -99,7 +99,6 @@ export type {
   CacheHandlerParametersRevalidateTag,
   FileSystemCacheContext,
   Revalidate,
-  LifespanParameters,
   SerializedBuffer,
   SerializedMap,
   SerializableValue,

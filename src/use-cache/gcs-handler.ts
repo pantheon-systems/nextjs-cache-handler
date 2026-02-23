@@ -189,28 +189,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
-      // TODO: Remove this diagnostic logging once Next.js fixes the empty tags bug
-      // Diagnostic logging for empty tags issue
+      // Known Next.js bug: cacheTag() values not propagated to cacheHandlers.set()
       // See: https://github.com/vercel/next.js/issues/78864
-      // See: docs/known-issues-nextjs16.md
-      const tagsLength = entry.tags?.length ?? 0;
-      if (tagsLength === 0) {
-        // Use info level so this is gated behind CACHE_DEBUG
-        log.info(`[EMPTY_TAGS_BUG] SET ${cacheKey}: Next.js passed empty tags array. ` +
-          `This is a known Next.js bug - cacheTag() values are not propagated to cacheHandlers.set(). ` +
-          `See: https://github.com/vercel/next.js/issues/78864`);
+      if ((entry.tags?.length ?? 0) === 0) {
+        log.warn(`SET ${cacheKey}: empty tags array (known Next.js bug)`);
       }
-      log.info(`SET entry structure for ${cacheKey}:`, {
-        hasTags: !!entry.tags,
-        tags: entry.tags,
-        tagsLength,
-        stale: entry.stale,
-        revalidate: entry.revalidate,
-        expire: entry.expire,
-        timestamp: entry.timestamp,
-        hasValue: !!entry.value,
-        entryKeys: Object.keys(entry),
-      });
 
       const serialized = await serializeUseCacheEntry(entry);
       const gcsKey = this.getCacheKey(cacheKey);

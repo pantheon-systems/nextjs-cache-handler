@@ -17,10 +17,6 @@
     "./utils": {
       "import": "./dist/utils/index.js",
       "types": "./dist/utils/index.d.ts"
-    },
-    "./middleware": {
-      "import": "./dist/middleware/index.js",
-      "types": "./dist/middleware/index.d.ts"
     }
   },
   "files": [

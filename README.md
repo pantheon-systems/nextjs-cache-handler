@@ -35,8 +35,13 @@ export default CacheHandler;
 
 ```javascript
 // next.config.mjs
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const nextConfig = {
-  cacheHandler: require.resolve('./cacheHandler'),
+  cacheHandler: path.resolve(__dirname, "./cacheHandler.mjs"),
   cacheMaxMemorySize: 0, // Disable in-memory caching to use custom handler
 };
 
@@ -68,7 +73,7 @@ interface CacheHandlerConfig {
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `CACHE_BUCKET` | GCS bucket name for storing cache | Required for GCS handler |
-| `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint | Optional (enables edge cache clearing) |
+| `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 
 ## API Reference

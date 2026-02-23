@@ -52,5 +52,3 @@ jest.log
 
 
 dist/
-
-.DS_Store

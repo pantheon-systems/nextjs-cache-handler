@@ -116,39 +116,6 @@ export type CacheHandlerValue = NextCacheHandlerValue & {
 
 export type Revalidate = false | number;
 
-/**
- * A set of time periods and timestamps for controlling cache behavior.
- */
-export type LifespanParameters = {
-  /**
-   * The Unix timestamp (in seconds) for when the cache entry was last modified.
-   */
-  readonly lastModifiedAt: number;
-  /**
-   * The Unix timestamp (in seconds) for when the cache entry entry becomes stale.
-   * After this time, the entry is considered staled and may be used.
-   */
-  readonly staleAt: number;
-  /**
-   * The Unix timestamp (in seconds) for when the cache entry must be removed from the cache.
-   * After this time, the entry is considered expired and should not be used.
-   */
-  readonly expireAt: number;
-  /**
-   * Time in seconds before the cache entry becomes stale.
-   */
-  readonly staleAge: number;
-  /**
-   * Time in seconds before the cache entry becomes expired.
-   */
-  readonly expireAge: number;
-  /**
-   * Value from Next.js revalidate option. May be false if the page has no revalidate option or the revalidate option is set to false.
-   */
-  readonly revalidate: Revalidate | undefined;
-};
-
-
 // ============================================================================
 // Cache Handler Abstract Interface
 // ============================================================================
