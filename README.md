@@ -49,26 +49,6 @@ const nextConfig = {
 export default nextConfig;
 ```
 
-## Configuration
-
-### `createCacheHandler(config?)`
-
-Creates a cache handler based on the provided configuration.
-
-```typescript
-interface CacheHandlerConfig {
-  /**
-   * Handler type selection:
-   * - 'auto': Automatically detect based on environment (GCS if CACHE_BUCKET is set, otherwise file)
-   * - 'file': Use file-based caching (local development)
-   * - 'gcs': Use Google Cloud Storage (production/Pantheon)
-   */
-  type?: 'auto' | 'file' | 'gcs';
-}
-```
-
-> **Note:** Debug logging is controlled via the `CACHE_DEBUG` environment variable. See the [Debugging](#debugging) section for details.
-
 ## Environment Variables
 
 | Variable | Description | Required |
@@ -205,25 +185,74 @@ The handler distinguishes between two cache types:
 - **Fetch Cache**: Stores data from `fetch()` calls with caching enabled
 - **Route Cache**: Stores rendered pages and route data
 
-## Tag-Based Invalidation
+## Revalidation
 
-The handler maintains a tag-to-keys mapping for efficient O(1) cache invalidation:
+### App Router
+
+For App Router applications, use the standard `revalidateTag` and `revalidatePath` functions from `next/cache`. The cache handler integrates automatically—no handler-specific functions are needed.
 
 ```typescript
-// When setting cache with tags
-await cacheHandler.set('post-1', data, { tags: ['posts', 'blog'] });
+import { revalidateTag, revalidatePath } from 'next/cache';
 
-// When invalidating by tag
-await cacheHandler.revalidateTag('posts');
-// All entries tagged with 'posts' are invalidated
+// Invalidate all cache entries tagged with 'posts'
+revalidateTag('posts');
+
+// Invalidate a specific path
+revalidatePath('/blog');
+```
+
+### Page Router
+
+For Page Router applications, only path-based revalidation is supported. As an example, you could create an API route to trigger revalidation.
+
+> **Important:** Since this API route allows cache invalidation, you should protect it with a secret token or other authentication mechanism to prevent unauthorized access.
+
+```typescript
+// pages/api/revalidate.ts
+import type { NextApiRequest, NextApiResponse } from 'next';
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // Validate a secret to prevent unauthorized revalidation
+  if (req.body.secret !== process.env.REVALIDATION_SECRET) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+
+  const path = req.body.path as string;
+
+  if (!path) {
+    return res.status(400).json({ error: 'path is required' });
+  }
+
+  try {
+    console.log(`[RevalidatePath] Revalidating: ${path}`);
+    await res.revalidate(path);
+
+    return res.json({
+      message: `Path '${path}' revalidated`,
+      revalidated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[RevalidatePath] Error:', error);
+    return res.status(500).json({ error: 'Failed to revalidate', message: String(error) });
+  }
+}
+```
+
+Then call the API route to revalidate a path:
+
+```bash
+curl -X POST /api/revalidate \
+  -H "Content-Type: application/json" \
+  -d '{"secret": "YOUR_SECRET", "path": "/blog"}'
 ```
 
 ## Edge Cache Clearing
 
-When deployed on Pantheon, the cache handlers automatically clear the CDN edge cache when cache entries are invalidated. This is triggered by:
-
-- `revalidateTag()` calls (clears matching surrogate keys and paths)
-- `revalidatePath()` calls (clears the specific path from the CDN)
+When deployed on Pantheon, the cache handlers automatically clear the CDN edge cache when cache entries are invalidated.
 
 Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). It runs in the background and does not block cache operations.
 
