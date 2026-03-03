@@ -135,8 +135,9 @@ describe('EdgeCacheClear', () => {
       const clearer = new EdgeCacheClear();
       await clearer.clearPaths(['blog/post']);
 
+      // Double-encoded: blog/post -> blog%2Fpost -> blog%252Fpost
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/blog/post`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent(encodeURIComponent('blog/post'))}`,
         expect.any(Object)
       );
     });
@@ -208,8 +209,9 @@ describe('EdgeCacheClear', () => {
       const clearer = new EdgeCacheClear();
       await clearer.clearKeys(['tag/with/slashes']);
 
+      // Double-encoded for edge cache clearer
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/keys/${encodeURIComponent('tag/with/slashes')}`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/keys/${encodeURIComponent(encodeURIComponent('tag/with/slashes'))}`,
         expect.any(Object)
       );
     });

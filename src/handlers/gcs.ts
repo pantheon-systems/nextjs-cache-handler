@@ -1,10 +1,5 @@
 import { Bucket, Storage } from '@google-cloud/storage';
-import type {
-  CacheStats,
-  CacheEntryInfo,
-  CacheHandlerValue,
-  FileSystemCacheContext,
-} from '../types.js';
+import type { CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
@@ -55,7 +50,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     });
 
     // Initialize asynchronously (don't await to avoid blocking constructor)
-    this.initialize().catch(() => { });
+    this.initialize().catch(() => {});
   }
 
   // ============================================================================
@@ -172,7 +167,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const [data] = await file.download();
       const parsedData = JSON.parse(data.toString());
 
-      return this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue || null;
+      return (this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue) || null;
     } catch {
       return null;
     }
@@ -337,8 +332,8 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
 
     gcsLog.debug(
       `Found ${keys.length} cache entries ` +
-      `(${keys.filter((k) => k.startsWith('fetch:')).length} fetch, ` +
-      `${keys.filter((k) => k.startsWith('route:')).length} route)`
+        `(${keys.filter((k) => k.startsWith('fetch:')).length} fetch, ` +
+        `${keys.filter((k) => k.startsWith('route:')).length} route)`
     );
 
     return { size: keys.length, keys, entries };

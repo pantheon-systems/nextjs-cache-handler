@@ -74,7 +74,11 @@ export abstract class BaseCacheHandler {
   protected abstract writeTagsMapping(tagsMapping: Record<string, string[]>): Promise<void>;
 
   protected abstract readCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<CacheHandlerValue | null>;
-  protected abstract writeCacheEntry(cacheKey: string, cacheValue: CacheHandlerValue, cacheType: 'fetch' | 'route'): Promise<void>;
+  protected abstract writeCacheEntry(
+    cacheKey: string,
+    cacheValue: CacheHandlerValue,
+    cacheType: 'fetch' | 'route'
+  ): Promise<void>;
   protected abstract deleteCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<void>;
 
   protected abstract readBuildMeta(): Promise<BuildMeta>;

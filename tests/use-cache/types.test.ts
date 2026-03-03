@@ -1,9 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type {
-  UseCacheEntry,
-  UseCacheHandler,
-  UseCacheHandlerConfig,
-} from '../../src/use-cache/types.js';
+import type { UseCacheEntry, UseCacheHandler, UseCacheHandlerConfig } from '../../src/handlers/use-cache/types.js';
 
 describe('UseCacheEntry type', () => {
   it('should have correct structure with ReadableStream value', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { UseCacheEntry } from '../../src/use-cache/types.js';
+import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 // Mock file and bucket stored for access
 const mockFile = {
@@ -27,8 +27,8 @@ vi.mock('@google-cloud/storage', () => {
 });
 
 // Import after mock is set up
-import { UseCacheGcsHandler } from '../../src/use-cache/gcs-handler.js';
-import { streamToBytes } from '../../src/use-cache/stream-serialization.js';
+import { UseCacheGcsHandler } from '../../src/handlers/use-cache/gcs.js';
+import { streamToBytes } from '../../src/utils/stream-serialization.js';
 
 // Mock fetch for edge cache
 vi.stubGlobal('fetch', vi.fn());
@@ -270,7 +270,7 @@ describe('UseCacheGcsHandler', () => {
     });
 
     it('should reload tag timestamps from GCS', async () => {
-      const tagsData = { 'tag1': 1234567890 };
+      const tagsData = { tag1: 1234567890 };
       mockFile.exists.mockResolvedValue([true]);
       mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(tagsData))]);
 
@@ -415,18 +415,12 @@ describe('UseCacheGcsHandler', () => {
       const fetchCalls = vi.mocked(fetch).mock.calls;
 
       // Explicit tags should be purged via keys
-      const keyPurgeCalls = fetchCalls.filter(
-        ([url]) => typeof url === 'string' && url.includes('/keys/')
-      );
-      const purgedKeys = keyPurgeCalls.map(([url]) =>
-        decodeURIComponent((url as string).split('/keys/')[1])
-      );
+      const keyPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/keys/'));
+      const purgedKeys = keyPurgeCalls.map(([url]) => decodeURIComponent((url as string).split('/keys/')[1]));
       expect(purgedKeys).toContain('posts');
 
       // Path tags should be purged via paths
-      const pathPurgeCalls = fetchCalls.filter(
-        ([url]) => typeof url === 'string' && url.includes('/paths/')
-      );
+      const pathPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/paths/'));
       expect(pathPurgeCalls.length).toBeGreaterThan(0);
     });
 
@@ -446,9 +440,7 @@ describe('UseCacheGcsHandler', () => {
       const fetchCalls = vi.mocked(fetch).mock.calls;
 
       // Should use path purge for _N_T_ tags (prefix stripped)
-      const pathPurgeCalls = fetchCalls.filter(
-        ([url]) => typeof url === 'string' && url.includes('/paths/')
-      );
+      const pathPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/paths/'));
       expect(pathPurgeCalls.length).toBeGreaterThan(0);
     });
 

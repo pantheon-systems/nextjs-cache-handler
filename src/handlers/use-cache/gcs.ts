@@ -1,98 +1,113 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import { Bucket, Storage } from '@google-cloud/storage';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
-import {
-  serializeUseCacheEntry,
-  deserializeUseCacheEntry,
-} from './stream-serialization.js';
-import { createLogger } from '../utils/logger.js';
-import { createEdgeCacheClearer, type EdgeCacheClear } from '../edge/edge-cache-clear.js';
+import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
+import { createLogger } from '../../utils/logger.js';
+import { createEdgeCacheClearer, type EdgeCacheClear } from '../../edge/edge-cache-clear.js';
 
-const log = createLogger('UseCacheFileHandler');
+const log = createLogger('UseCacheGcsHandler');
 
 /**
  * Next.js internal prefix for path-based cache tags.
+ * When revalidatePath('/api/foo') is called, Next.js internally calls
+ * revalidateTag('_N_T_/api/foo'). This prefix identifies path tags.
  */
 const NEXTJS_PATH_TAG_PREFIX = '_N_T_';
 
 /**
- * Configuration for UseCacheFileHandler.
- */
-export interface UseCacheFileHandlerConfig {
-  /**
-   * Directory to store cache files.
-   * Defaults to .next/cache/use-cache
-   */
-  cacheDir?: string;
-}
-
-/**
- * File-based cache handler for Next.js 16 'use cache' directive.
+ * Google Cloud Storage cache handler for Next.js 16 'use cache' directive.
  * Implements the cacheHandlers (plural) interface.
  *
  * Suitable for:
- * - Local development
- * - Single-instance deployments
- * - Testing
+ * - Production/Pantheon environments
+ * - Multi-instance deployments requiring shared cache
  */
-export class UseCacheFileHandler implements UseCacheHandler {
-  private readonly cacheDir: string;
-  private readonly tagsFile: string;
-  private tagTimestamps: Map<string, number> = new Map();
+export class UseCacheGcsHandler implements UseCacheHandler {
+  private readonly bucket: Bucket;
+  private readonly cachePrefix: string;
+  private readonly tagsKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
+  private tagTimestamps: Map<string, number> = new Map();
+  private initialized: boolean = false;
+  private initPromise: Promise<void> | null = null;
 
-  constructor(config: UseCacheFileHandlerConfig = {}) {
-    this.cacheDir = config.cacheDir ?? path.join(process.cwd(), '.next', 'cache', 'use-cache');
-    this.tagsFile = path.join(this.cacheDir, '_tags.json');
+  constructor() {
+    const bucketName = process.env.CACHE_BUCKET;
+    if (!bucketName) {
+      throw new Error('CACHE_BUCKET environment variable is required for GCS cache handler');
+    }
 
-    this.ensureCacheDir();
-    this.loadTagTimestamps();
+    const storage = new Storage();
+    this.bucket = storage.bucket(bucketName);
 
-    // Initialize edge cache clearer if OUTBOUND_PROXY_ENDPOINT is configured
+    this.cachePrefix = 'use-cache/';
+    this.tagsKey = `${this.cachePrefix}_tags.json`;
+
     this.edgeCacheClearer = createEdgeCacheClearer();
-    if (this.edgeCacheClearer) {
-      log.debug('Edge cache clearing enabled');
-    }
 
-    log.debug('Initialized with cache dir:', this.cacheDir);
+    // Initialize asynchronously but track the promise
+    this.initPromise = this.initialize().catch(() => {});
+
+    log.info('Initialized GCS use-cache handler');
   }
 
-  private ensureCacheDir(): void {
+  private async initialize(): Promise<void> {
+    if (this.initialized) return;
+    await this.loadTagTimestamps();
+    this.initialized = true;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.initPromise) {
+      await this.initPromise;
+      this.initPromise = null;
+    }
+  }
+
+  private async loadTagTimestamps(): Promise<void> {
     try {
-      fs.mkdirSync(this.cacheDir, { recursive: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        log.error('Error creating cache directory:', error);
+      const file = this.bucket.file(this.tagsKey);
+      const [exists] = await file.exists();
+
+      if (!exists) {
+        // Only reset if not already populated by local operations
+        if (this.tagTimestamps.size === 0) {
+          this.tagTimestamps = new Map();
+        }
+        return;
       }
-    }
-  }
 
-  private loadTagTimestamps(): void {
-    try {
-      if (fs.existsSync(this.tagsFile)) {
-        const data = fs.readFileSync(this.tagsFile, 'utf-8');
-        const parsed = JSON.parse(data);
-        this.tagTimestamps = new Map(Object.entries(parsed));
+      const [data] = await file.download();
+      const parsed = JSON.parse(data.toString());
+      // Merge with existing in-memory state (local updates take precedence)
+      const loadedTimestamps = new Map<string, number>(Object.entries(parsed));
+      for (const [tag, timestamp] of loadedTimestamps) {
+        const existing = this.tagTimestamps.get(tag);
+        if (!existing || timestamp > existing) {
+          this.tagTimestamps.set(tag, timestamp);
+        }
       }
     } catch (error) {
       log.warn('Error loading tag timestamps:', error);
-      this.tagTimestamps = new Map();
+      // Don't reset - keep existing in-memory state
     }
   }
 
-  private saveTagTimestamps(): void {
+  private async saveTagTimestamps(): Promise<void> {
     try {
       const obj = Object.fromEntries(this.tagTimestamps);
-      fs.writeFileSync(this.tagsFile, JSON.stringify(obj, null, 2), 'utf-8');
+      const file = this.bucket.file(this.tagsKey);
+      await file.save(JSON.stringify(obj, null, 2), {
+        metadata: { contentType: 'application/json' },
+      });
     } catch (error) {
       log.error('Error saving tag timestamps:', error);
     }
   }
 
-  private getCacheFilePath(cacheKey: string): string {
-    // Sanitize cache key for filesystem
+  private getCacheKey(cacheKey: string): string {
+    // Sanitize cache key for GCS object naming
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    return path.join(this.cacheDir, `${safeKey}.json`);
+    return `${this.cachePrefix}${safeKey}.json`;
   }
 
   /**
@@ -126,15 +141,17 @@ export class UseCacheFileHandler implements UseCacheHandler {
     log.debug(`GET: ${cacheKey}`);
 
     try {
-      const filePath = this.getCacheFilePath(cacheKey);
+      const gcsKey = this.getCacheKey(cacheKey);
+      const file = this.bucket.file(gcsKey);
 
-      if (!fs.existsSync(filePath)) {
+      const [exists] = await file.exists();
+      if (!exists) {
         log.debug(`MISS: ${cacheKey} (not found)`);
         return undefined;
       }
 
-      const data = fs.readFileSync(filePath, 'utf-8');
-      const stored = JSON.parse(data);
+      const [data] = await file.download();
+      const stored = JSON.parse(data.toString());
       const entry = deserializeUseCacheEntry(stored);
 
       // Check expiration
@@ -142,7 +159,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
         log.debug(`MISS: ${cacheKey} (expired)`);
         // Optionally delete expired entry
         try {
-          fs.unlinkSync(filePath);
+          await file.delete();
         } catch {
           // Ignore deletion errors
         }
@@ -176,9 +193,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
       }
 
       const serialized = await serializeUseCacheEntry(entry);
-      const filePath = this.getCacheFilePath(cacheKey);
+      const gcsKey = this.getCacheKey(cacheKey);
+      const file = this.bucket.file(gcsKey);
 
-      fs.writeFileSync(filePath, JSON.stringify(serialized, null, 2), 'utf-8');
+      await file.save(JSON.stringify(serialized, null, 2), {
+        metadata: { contentType: 'application/json' },
+      });
 
       log.debug(`Cached ${cacheKey}`);
     } catch (error) {
@@ -188,11 +208,11 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
   /**
    * Synchronize tag state from external source.
-   * For file-based handler, this reloads from disk.
+   * Reloads tag timestamps from GCS.
    */
   async refreshTags(): Promise<void> {
     log.debug('REFRESH TAGS');
-    this.loadTagTimestamps();
+    await this.loadTagTimestamps();
   }
 
   /**
@@ -214,7 +234,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
   /**
    * Invalidate cache entries with matching tags.
-   * Also triggers CDN edge cache clearing via Surrogate-Key if configured.
    */
   async updateTags(tags: string[], durations: number[]): Promise<void> {
     log.debug(`UPDATE TAGS: [${tags.join(', ')}]`);
@@ -229,7 +248,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
       this.tagTimestamps.set(tag, now);
     }
 
-    this.saveTagTimestamps();
+    await this.saveTagTimestamps();
 
     // Clear edge cache if configured
     if (this.edgeCacheClearer) {
@@ -244,10 +263,15 @@ export class UseCacheFileHandler implements UseCacheHandler {
         }
       }
 
+      // Purge explicit tags as surrogate keys
       if (explicitTags.length > 0) {
-        this.edgeCacheClearer.clearKeysInBackground(explicitTags, `use-cache tag invalidation: ${explicitTags.join(', ')}`);
+        this.edgeCacheClearer.clearKeysInBackground(
+          explicitTags,
+          `use-cache tag invalidation: ${explicitTags.join(', ')}`
+        );
       }
 
+      // Use path-based purge for _N_T_ path tags
       if (paths.length > 0) {
         this.edgeCacheClearer.clearPathsInBackground(paths, `path revalidation: ${paths.join(', ')}`);
       }
@@ -255,7 +279,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   /**
-   * Get cache statistics for the use-cache entries.
+   * Get cache statistics for the use-cache entries in GCS.
    * Returns information about all valid (non-expired) cache entries.
    */
   async getStats(): Promise<UseCacheStats> {
@@ -265,25 +289,28 @@ export class UseCacheFileHandler implements UseCacheHandler {
     const keys: string[] = [];
 
     try {
-      if (!fs.existsSync(this.cacheDir)) {
-        return { size: 0, entries: [], keys: [] };
-      }
+      await this.ensureInitialized();
 
-      const files = fs.readdirSync(this.cacheDir);
+      // List all files in the use-cache prefix
+      const [files] = await this.bucket.getFiles({ prefix: this.cachePrefix });
 
       for (const file of files) {
-        // Skip tags file and non-JSON files
-        if (file === '_tags.json' || !file.endsWith('.json')) {
+        // Skip tags file
+        if (file.name === this.tagsKey) {
+          continue;
+        }
+
+        // Only process .json files
+        if (!file.name.endsWith('.json')) {
           continue;
         }
 
         try {
-          const filePath = path.join(this.cacheDir, file);
-          const data = fs.readFileSync(filePath, 'utf-8');
-          const stored = JSON.parse(data);
+          const [data] = await file.download();
+          const stored = JSON.parse(data.toString());
 
-          // Reconstruct the key from the filename (reverse of sanitization)
-          const key = file.replace('.json', '');
+          // Extract key from filename (remove prefix and .json suffix)
+          const key = file.name.replace(this.cachePrefix, '').replace('.json', '');
 
           // Deserialize to check expiration
           const entry = deserializeUseCacheEntry(stored);
@@ -293,15 +320,15 @@ export class UseCacheFileHandler implements UseCacheHandler {
             continue;
           }
 
-          // Get file stats for size
-          const fileStat = fs.statSync(filePath);
+          // Get file metadata for size
+          const [metadata] = await file.getMetadata();
 
           const entryInfo: UseCacheEntryInfo = {
             key,
             tags: stored.tags || [],
             type: 'use-cache',
             lastModified: new Date(entry.timestamp).toISOString(),
-            size: fileStat.size,
+            size: Number(metadata.size) || 0,
             revalidate: entry.revalidate,
             stale: entry.stale,
             expire: entry.expire,
@@ -310,7 +337,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
           entries.push(entryInfo);
           keys.push(key);
         } catch (error) {
-          log.warn(`Error reading cache file ${file}:`, error);
+          log.warn(`Error reading cache file ${file.name}:`, error);
         }
       }
     } catch (error) {
@@ -327,4 +354,4 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 }
 
-export default UseCacheFileHandler;
+export default UseCacheGcsHandler;

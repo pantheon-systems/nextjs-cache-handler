@@ -1,12 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import type {
-  CacheStats,
-  CacheEntryInfo,
-  CacheHandlerValue,
-  FileSystemCacheContext,
-} from '../types.js';
+import type { CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
@@ -55,7 +50,7 @@ export class FileCacheHandler extends BaseCacheHandler {
 
     this.ensureCacheDir();
     // Initialize asynchronously (don't await to avoid blocking constructor)
-    this.initialize().catch(() => { });
+    this.initialize().catch(() => {});
   }
 
   private ensureCacheDir(): void {
@@ -171,7 +166,7 @@ export class FileCacheHandler extends BaseCacheHandler {
       const filePath = this.getCacheFilePath(cacheKey, cacheType);
       const data = await readFile(filePath, 'utf-8');
       const parsedData = JSON.parse(data);
-      return this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue || null;
+      return (this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue) || null;
     } catch {
       return null;
     }

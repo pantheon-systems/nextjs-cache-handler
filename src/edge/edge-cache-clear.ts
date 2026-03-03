@@ -104,10 +104,7 @@ export class EdgeCacheClear {
     }
   }
 
-  private async clearSinglePath(
-    routePath: string,
-    results: { path: string; success: boolean }[]
-  ): Promise<void> {
+  private async clearSinglePath(routePath: string, results: { path: string; success: boolean }[]): Promise<void> {
     try {
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
       const cleanPath = normalizedPath.replace(/\/$/, '') || '/';
@@ -209,10 +206,7 @@ export class EdgeCacheClear {
     }
   }
 
-  private async clearSingleKey(
-    key: string,
-    results: { key: string; success: boolean }[]
-  ): Promise<void> {
+  private async clearSingleKey(key: string, results: { key: string; success: boolean }[]): Promise<void> {
     try {
       // Double-encode because the edge-cache-clearer expects URL-encoded values.
       const url = `${this.baseUrl}/keys/${encodeURIComponent(encodeURIComponent(key))}`;

@@ -11,8 +11,8 @@
       "types": "./dist/index.d.ts"
     },
     "./use-cache": {
-      "import": "./dist/use-cache/index.js",
-      "types": "./dist/use-cache/index.d.ts"
+      "import": "./dist/handlers/use-cache/index.js",
+      "types": "./dist/handlers/use-cache/index.d.ts"
     }
   },
   "files": [
@@ -25,7 +25,9 @@
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\""
   },
   "keywords": [
     "next.js",
@@ -47,6 +49,7 @@
     "@types/node": "^20",
     "@vitest/coverage-v8": "^4.0.18",
     "next": "^16.1.6",
+    "prettier": "^3.0.0",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"
   },

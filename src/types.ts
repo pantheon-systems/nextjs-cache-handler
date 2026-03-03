@@ -1,9 +1,9 @@
 import type {
   CacheHandler as NextCacheHandler,
   CacheHandlerValue as NextCacheHandlerValue,
-} from "next/dist/server/lib/incremental-cache";
+} from 'next/dist/server/lib/incremental-cache';
 
-import type FileSystemCache from "next/dist/server/lib/incremental-cache/file-system-cache";
+import type FileSystemCache from 'next/dist/server/lib/incremental-cache/file-system-cache';
 
 // ============================================================================
 // Cache Handler Configuration Types
@@ -98,10 +98,10 @@ export interface CacheStats {
 // Cache Handler Interface Types
 // ============================================================================
 
-export type CacheHandlerParametersGet = Parameters<NextCacheHandler["get"]>;
-export type CacheHandlerParametersSet = Parameters<NextCacheHandler["set"]>;
+export type CacheHandlerParametersGet = Parameters<NextCacheHandler['get']>;
+export type CacheHandlerParametersSet = Parameters<NextCacheHandler['set']>;
 export type FileSystemCacheContext = ConstructorParameters<typeof FileSystemCache>[0];
-export type CacheHandlerParametersRevalidateTag = Parameters<NextCacheHandler["revalidateTag"]>;
+export type CacheHandlerParametersRevalidateTag = Parameters<NextCacheHandler['revalidateTag']>;
 
 export type CacheHandlerValue = NextCacheHandlerValue & {
   /**
@@ -130,17 +130,14 @@ export declare class CacheHandler implements NextCacheHandler {
    */
   constructor(context: FileSystemCacheContext);
 
-  get(
-    cacheKey: CacheHandlerParametersGet[0],
-    ctx?: CacheHandlerParametersGet[1],
-  ): Promise<CacheHandlerValue | null>;
+  get(cacheKey: CacheHandlerParametersGet[0], ctx?: CacheHandlerParametersGet[1]): Promise<CacheHandlerValue | null>;
 
   set(
     cacheKey: CacheHandlerParametersSet[0],
     incrementalCacheValue: CacheHandlerParametersSet[1],
     ctx: CacheHandlerParametersSet[2] & {
       internal_lastModified?: number;
-    },
+    }
   ): Promise<void>;
 
   revalidateTag(tag: CacheHandlerParametersRevalidateTag[0]): Promise<void>;

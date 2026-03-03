@@ -186,9 +186,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Verify edge cache was cleared for the route path
+      // Verify edge cache was cleared for the route path (double-encoded)
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/paths/blogs/my-post'),
+        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -207,10 +207,7 @@ describe('GcsCacheHandler', () => {
       await new Promise((r) => setTimeout(r, 50));
 
       // Fetch cache entries should not trigger edge cache clearing
-      expect(fetch).not.toHaveBeenCalledWith(
-        expect.stringContaining('/paths/'),
-        expect.anything()
-      );
+      expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/paths/'), expect.anything());
     });
 
     it('should handle route cache keys with underscores (encoded paths)', async () => {
@@ -227,9 +224,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Should convert underscores to slashes
+      // Should convert underscores to slashes and double-encode
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/paths/blogs/my-post'),
+        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -326,20 +323,14 @@ describe('GCS getSharedCacheStats', () => {
   it('should return stats for cache entries', async () => {
     const fetchFile = {
       name: 'fetch-cache/key1.json',
-      download: vi.fn().mockResolvedValue([
-        Buffer.from(JSON.stringify({ tags: ['tag1'], lastModified: 123 })),
-      ]),
+      download: vi.fn().mockResolvedValue([Buffer.from(JSON.stringify({ tags: ['tag1'], lastModified: 123 }))]),
     };
     const routeFile = {
       name: 'route-cache/key2.json',
-      download: vi.fn().mockResolvedValue([
-        Buffer.from(JSON.stringify({ tags: ['tag2'], lastModified: 456 })),
-      ]),
+      download: vi.fn().mockResolvedValue([Buffer.from(JSON.stringify({ tags: ['tag2'], lastModified: 456 }))]),
     };
 
-    mockBucket.getFiles
-      .mockResolvedValueOnce([[fetchFile]])
-      .mockResolvedValueOnce([[routeFile]]);
+    mockBucket.getFiles.mockResolvedValueOnce([[fetchFile]]).mockResolvedValueOnce([[routeFile]]);
 
     const stats = await getSharedCacheStats();
 
@@ -404,9 +395,7 @@ describe('GCS clearSharedCache', () => {
     process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
     const file1 = { name: 'fetch-cache/key1.json', delete: vi.fn().mockResolvedValue(undefined) };
-    mockBucket.getFiles
-      .mockResolvedValueOnce([[file1]])
-      .mockResolvedValueOnce([[]]);
+    mockBucket.getFiles.mockResolvedValueOnce([[file1]]).mockResolvedValueOnce([[]]);
 
     vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 

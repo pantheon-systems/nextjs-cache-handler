@@ -4,8 +4,8 @@ import {
   bytesToStream,
   serializeUseCacheEntry,
   deserializeUseCacheEntry,
-} from '../../src/use-cache/stream-serialization.js';
-import type { UseCacheEntry } from '../../src/use-cache/types.js';
+} from '../../src/utils/stream-serialization.js';
+import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 describe('streamToBytes', () => {
   it('should convert a ReadableStream to Uint8Array', async () => {

@@ -111,9 +111,7 @@ describe('static-routes', () => {
 
       getStaticRoutes();
 
-      expect(fs.existsSync).toHaveBeenCalledWith(
-        path.join(process.cwd(), '.next', 'prerender-manifest.json')
-      );
+      expect(fs.existsSync).toHaveBeenCalledWith(path.join(process.cwd(), '.next', 'prerender-manifest.json'));
     });
   });
 });

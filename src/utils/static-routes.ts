@@ -2,9 +2,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 interface PrerenderManifest {
-  routes?: Record<string, {
-    initialRevalidateSeconds?: false | number;
-  }>;
+  routes?: Record<
+    string,
+    {
+      initialRevalidateSeconds?: false | number;
+    }
+  >;
 }
 
 /**

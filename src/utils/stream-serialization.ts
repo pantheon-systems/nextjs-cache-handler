@@ -1,4 +1,4 @@
-import type { UseCacheEntry, SerializedUseCacheEntry } from './types.js';
+import type { UseCacheEntry, SerializedUseCacheEntry } from '../handlers/use-cache/types.js';
 
 /**
  * Convert a ReadableStream<Uint8Array> to a Uint8Array.

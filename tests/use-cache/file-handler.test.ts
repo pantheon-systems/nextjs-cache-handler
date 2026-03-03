@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
-import { UseCacheFileHandler } from '../../src/use-cache/file-handler.js';
-import type { UseCacheEntry } from '../../src/use-cache/types.js';
-import { streamToBytes } from '../../src/use-cache/stream-serialization.js';
+import { UseCacheFileHandler } from '../../src/handlers/use-cache/file.js';
+import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
+import { streamToBytes } from '../../src/utils/stream-serialization.js';
 // Helper to create a test stream
 function createTestStream(data: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -275,9 +275,7 @@ describe('UseCacheFileHandler', () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'localhost:8080';
 
       // Mock fetch to capture edge cache clear calls
-      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-        new Response(null, { status: 200 })
-      );
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 200 }));
 
       try {
         const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
@@ -286,16 +284,14 @@ describe('UseCacheFileHandler', () => {
         await handler.updateTags(['test-tag-1', 'test-tag-2'], [0, 0]);
 
         // Wait a bit for background clearing to be initiated
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 50));
 
         // Verify fetch was called for edge cache clearing
         // The EdgeCacheClear calls DELETE on /rest/v0alpha1/cache/keys/{key}
         expect(fetchSpy).toHaveBeenCalled();
 
         const calls = fetchSpy.mock.calls;
-        const edgeCacheCalls = calls.filter(call =>
-          typeof call[0] === 'string' && call[0].includes('/cache/keys/')
-        );
+        const edgeCacheCalls = calls.filter((call) => typeof call[0] === 'string' && call[0].includes('/cache/keys/'));
 
         expect(edgeCacheCalls.length).toBeGreaterThanOrEqual(1);
       } finally {
@@ -322,13 +318,11 @@ describe('UseCacheFileHandler', () => {
         await handler.updateTags(['test-tag'], [0]);
 
         // Wait a bit
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 50));
 
         // Verify no edge cache clear calls were made
         const calls = fetchSpy.mock.calls;
-        const edgeCacheCalls = calls.filter(call =>
-          typeof call[0] === 'string' && call[0].includes('/cache/keys/')
-        );
+        const edgeCacheCalls = calls.filter((call) => typeof call[0] === 'string' && call[0].includes('/cache/keys/'));
 
         expect(edgeCacheCalls.length).toBe(0);
       } finally {
@@ -429,5 +423,4 @@ describe('UseCacheFileHandler', () => {
       expect(stats.keys).not.toContain('expired-key');
     });
   });
-
 });

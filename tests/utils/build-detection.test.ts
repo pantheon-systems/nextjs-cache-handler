@@ -40,9 +40,7 @@ describe('build-detection', () => {
       const result = getBuildId();
 
       expect(result).toBe(buildId);
-      expect(fs.existsSync).toHaveBeenCalledWith(
-        path.join(process.cwd(), '.next', 'BUILD_ID')
-      );
+      expect(fs.existsSync).toHaveBeenCalledWith(path.join(process.cwd(), '.next', 'BUILD_ID'));
     });
 
     it('should trim whitespace from build ID', () => {

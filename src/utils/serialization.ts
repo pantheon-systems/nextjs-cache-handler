@@ -1,10 +1,4 @@
-import type {
-  CacheData,
-  SerializedCacheData,
-  SerializableValue,
-  SerializedBuffer,
-  SerializedMap,
-} from '../types.js';
+import type { CacheData, SerializedCacheData, SerializableValue, SerializedBuffer, SerializedMap } from '../types.js';
 
 /**
  * Serializes cache data for JSON storage.
