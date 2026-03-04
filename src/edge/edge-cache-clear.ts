@@ -110,7 +110,7 @@ export class EdgeCacheClear {
     try {
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
       const cleanPath = normalizedPath.replace(/\/$/, '') || '/';
-      const pathSegment = cleanPath === '/' ? '' : cleanPath.substring(1);
+      const pathSegment = cleanPath === '/' ? '/' : cleanPath.substring(1);
       // Double-encode because the edge-cache-clearer expects URL-encoded values.
       const encodedPathSegment = encodeURIComponent(encodeURIComponent(pathSegment));
       const url = `${this.baseUrl}/paths/${encodedPathSegment}`;

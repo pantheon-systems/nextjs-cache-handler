@@ -142,6 +142,24 @@ describe('EdgeCacheClear', () => {
       );
     });
 
+    it('should double-encode root path / as %252F', async () => {
+      vi.mocked(fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+      } as Response);
+
+      const clearer = new EdgeCacheClear();
+      const result = await clearer.clearPaths(['/']);
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledWith(
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/%252F`,
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(result.success).toBe(true);
+      expect(result.paths).toEqual(['/']);
+    });
+
     it('should handle partial failures', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce({ ok: true, status: 200 } as Response)
@@ -334,7 +352,7 @@ describe('clearEdgeCachePaths', () => {
     const result = await clearEdgeCachePaths(['/']);
 
     expect(fetch).toHaveBeenCalledWith(
-      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/',
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
       expect.objectContaining({ method: 'DELETE' })
     );
     expect(result).not.toBeNull();
