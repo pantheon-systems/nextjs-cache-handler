@@ -10,6 +10,8 @@ import {
   UseCacheFileHandler,
   UseCacheGcsHandler,
 } from './handlers/index.js';
+import { createEdgeCacheClearer } from './edge/edge-cache-clear.js';
+import type { CacheClearResult } from './edge/edge-cache-clear.js';
 
 // ============================================================================
 // Factory Functions
@@ -113,6 +115,35 @@ export async function clearSharedCache(): Promise<number> {
 }
 
 // ============================================================================
+// Edge Cache Clearing (for Pages Router SSR sites)
+// ============================================================================
+
+/**
+ * Clear specific paths from Pantheon's edge cache.
+ * Use this for Pages Router SSR sites where routes aren't cached by Next.js
+ * internally but are cached at the CDN layer.
+ *
+ * Returns null if OUTBOUND_PROXY_ENDPOINT is not configured (local dev).
+ */
+export async function clearEdgeCachePaths(paths: string[]): Promise<CacheClearResult | null> {
+  const clearer = createEdgeCacheClearer();
+  if (!clearer) return null;
+  return clearer.clearPaths(paths);
+}
+
+/**
+ * Clear the entire Pantheon edge cache.
+ * Use sparingly — prefer clearEdgeCachePaths() for targeted invalidation.
+ *
+ * Returns null if OUTBOUND_PROXY_ENDPOINT is not configured (local dev).
+ */
+export async function clearEdgeCache(): Promise<CacheClearResult | null> {
+  const clearer = createEdgeCacheClearer();
+  if (!clearer) return null;
+  return clearer.nukeCache();
+}
+
+// ============================================================================
 // Handler Exports
 // ============================================================================
 
@@ -153,6 +184,8 @@ export type {
   SerializableValue,
   SerializedCacheData,
 } from './types.js';
+
+export type { CacheClearResult } from './edge/edge-cache-clear.js';
 
 export type {
   // Use cache types (Next.js 16)

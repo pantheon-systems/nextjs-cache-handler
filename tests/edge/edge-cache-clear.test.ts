@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../../src/edge/edge-cache-clear.js';
+import { clearEdgeCachePaths, clearEdgeCache } from '../../src/index.js';
 
 describe('EdgeCacheClear', () => {
   const mockEndpoint = 'proxy.example.com:8080';
@@ -140,6 +141,24 @@ describe('EdgeCacheClear', () => {
         `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent(encodeURIComponent('blog/post'))}`,
         expect.any(Object)
       );
+    });
+
+    it('should double-encode root path / as %252F', async () => {
+      vi.mocked(fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+      } as Response);
+
+      const clearer = new EdgeCacheClear();
+      const result = await clearer.clearPaths(['/']);
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledWith(
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/%252F`,
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(result.success).toBe(true);
+      expect(result.paths).toEqual(['/']);
     });
 
     it('should handle partial failures', async () => {
@@ -305,5 +324,93 @@ describe('createEdgeCacheClearer', () => {
     delete process.env.OUTBOUND_PROXY_ENDPOINT;
     const clearer = createEdgeCacheClearer();
     expect(clearer).toBeNull();
+  });
+});
+
+describe('clearEdgeCachePaths', () => {
+  let originalEnv: string | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env.OUTBOUND_PROXY_ENDPOINT = originalEnv;
+    } else {
+      delete process.env.OUTBOUND_PROXY_ENDPOINT;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('should make DELETE request to proxy when env var is set', async () => {
+    process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as Response);
+
+    const result = await clearEdgeCachePaths(['/']);
+
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(true);
+  });
+
+  it('should return null when env var is missing', async () => {
+    delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+    const result = await clearEdgeCachePaths(['/']);
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+});
+
+describe('clearEdgeCache', () => {
+  let originalEnv: string | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env.OUTBOUND_PROXY_ENDPOINT = originalEnv;
+    } else {
+      delete process.env.OUTBOUND_PROXY_ENDPOINT;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('should call nukeCache when configured', async () => {
+    process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as Response);
+
+    const result = await clearEdgeCache();
+
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(true);
+  });
+
+  it('should return null when env var is missing', async () => {
+    delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+    const result = await clearEdgeCache();
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(result).toBeNull();
   });
 });
