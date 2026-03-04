@@ -1,13 +1,20 @@
-// Re-export for subpath import compatibility
-export { UseCacheFileHandler } from './file.js';
-export { UseCacheGcsHandler } from './gcs.js';
+// Re-export from main index for subpath import compatibility
+// All functions are defined in src/index.ts as the single source of truth
 
 export {
+  // Factory function
+  createUseCacheHandler,
+  // Stats function
+  getUseCacheStats,
+  // Handlers
+  UseCacheFileHandler,
+  UseCacheGcsHandler,
+  // Stream utilities
   streamToBytes,
   bytesToStream,
   serializeUseCacheEntry,
   deserializeUseCacheEntry,
-} from '../../utils/stream-serialization.js';
+} from '../../index.js';
 
 export type {
   UseCacheEntry,
@@ -16,4 +23,4 @@ export type {
   SerializedUseCacheEntry,
   UseCacheStats,
   UseCacheEntryInfo,
-} from './types.js';
+} from '../../index.js';

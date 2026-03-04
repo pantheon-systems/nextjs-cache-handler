@@ -24,7 +24,7 @@ import {
  *
  * @example
  * ```typescript
- * // In your cacheHandler.ts file:
+ * In your cacheHandler.ts file:
  * import { createCacheHandler } from '@pantheon-systems/nextjs-cache-handler';
  *
  * const CacheHandler = createCacheHandler({
@@ -50,7 +50,7 @@ export function createCacheHandler(config?: CacheHandlerConfig): typeof FileCach
  *
  * @example
  * ```typescript
- * // In your use-cache-handler.ts file:
+ * In your use-cache-handler.ts file:
  * import { createUseCacheHandler } from '@pantheon-systems/nextjs-cache-handler';
  *
  * const UseCacheHandler = createUseCacheHandler({
