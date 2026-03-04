@@ -4,9 +4,8 @@ const edgeLog = createLogger('EdgeCacheClear');
 
 /**
  * Result of a cache clear operation.
- * @internal
  */
-interface CacheClearResult {
+export interface CacheClearResult {
   success: boolean;
   error?: string;
   statusCode?: number;
