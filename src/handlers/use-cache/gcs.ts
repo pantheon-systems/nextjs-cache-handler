@@ -3,6 +3,7 @@ import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo }
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { createEdgeCacheClearer, type EdgeCacheClear } from '../../edge/edge-cache-clear.js';
+import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 
 const log = createLogger('UseCacheGcsHandler');
 
@@ -39,7 +40,8 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     const storage = new Storage();
     this.bucket = storage.bucket(bucketName);
 
-    this.cachePrefix = 'use-cache/';
+    const envPrefix = getEnvironmentPrefix();
+    this.cachePrefix = `${envPrefix}use-cache/`;
     this.tagsKey = `${this.cachePrefix}_tags.json`;
 
     this.edgeCacheClearer = createEdgeCacheClearer();

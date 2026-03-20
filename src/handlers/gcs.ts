@@ -5,6 +5,7 @@ import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
+import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -33,10 +34,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
     const storage = new Storage();
     this.bucket = storage.bucket(bucketName);
 
-    this.fetchCachePrefix = 'fetch-cache/';
-    this.routeCachePrefix = 'route-cache/';
-    this.buildMetaKey = 'build-meta.json';
-    this.tagsPrefix = 'cache/tags/';
+    const envPrefix = getEnvironmentPrefix();
+    this.fetchCachePrefix = `${envPrefix}fetch-cache/`;
+    this.routeCachePrefix = `${envPrefix}route-cache/`;
+    this.buildMetaKey = `${envPrefix}build-meta.json`;
+    this.tagsPrefix = `${envPrefix}cache/tags/`;
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
 
     this.edgeCacheClearer = createEdgeCacheClearer();
@@ -320,8 +322,9 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   const storage = new Storage();
   const bucket = storage.bucket(bucketName);
 
-  const fetchCachePrefix = 'fetch-cache/';
-  const routeCachePrefix = 'route-cache/';
+  const envPrefix = getEnvironmentPrefix();
+  const fetchCachePrefix = `${envPrefix}fetch-cache/`;
+  const routeCachePrefix = `${envPrefix}route-cache/`;
 
   const keys: string[] = [];
   const entries: CacheEntryInfo[] = [];
@@ -405,9 +408,10 @@ export async function clearSharedCache(): Promise<number> {
   const storage = new Storage();
   const bucket = storage.bucket(bucketName);
 
-  const fetchCachePrefix = 'fetch-cache/';
-  const routeCachePrefix = 'route-cache/';
-  const tagsFilePath = 'cache/tags/tags.json';
+  const envPrefix = getEnvironmentPrefix();
+  const fetchCachePrefix = `${envPrefix}fetch-cache/`;
+  const routeCachePrefix = `${envPrefix}route-cache/`;
+  const tagsFilePath = `${envPrefix}cache/tags/tags.json`;
 
   const staticRoutes = getStaticRoutes();
   let clearedCount = 0;
