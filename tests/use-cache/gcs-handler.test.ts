@@ -459,6 +459,84 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('environment prefix', () => {
+    let originalPantheonEnv: string | undefined;
+
+    beforeEach(() => {
+      originalPantheonEnv = process.env.PANTHEON_ENVIRONMENT;
+    });
+
+    afterEach(() => {
+      if (originalPantheonEnv !== undefined) {
+        process.env.PANTHEON_ENVIRONMENT = originalPantheonEnv;
+      } else {
+        delete process.env.PANTHEON_ENVIRONMENT;
+      }
+    });
+
+    it('should prefix cache keys for multidev environment', async () => {
+      process.env.PANTHEON_ENVIRONMENT = 'pr-77';
+      mockFile.exists.mockResolvedValue([false]);
+
+      const handler = new UseCacheGcsHandler();
+      await handler.get('my-key', []);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-77/use-cache/my-key.json');
+    });
+
+    it('should prefix tags file for multidev environment', async () => {
+      process.env.PANTHEON_ENVIRONMENT = 'pr-77';
+      mockFile.exists.mockResolvedValue([false]);
+
+      new UseCacheGcsHandler();
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-77/use-cache/_tags.json');
+    });
+
+    it('should save tag timestamps to prefixed path for multidev', async () => {
+      process.env.PANTHEON_ENVIRONMENT = 'pr-77';
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new UseCacheGcsHandler();
+      await handler.updateTags(['blog'], [0]);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-77/use-cache/_tags.json');
+    });
+
+    it('should use no prefix for live environment', async () => {
+      process.env.PANTHEON_ENVIRONMENT = 'live';
+      mockFile.exists.mockResolvedValue([false]);
+
+      const handler = new UseCacheGcsHandler();
+      await handler.get('my-key', []);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('use-cache/my-key.json');
+    });
+
+    it('should use no prefix when PANTHEON_ENVIRONMENT is not set', async () => {
+      delete process.env.PANTHEON_ENVIRONMENT;
+      mockFile.exists.mockResolvedValue([false]);
+
+      const handler = new UseCacheGcsHandler();
+      await handler.get('my-key', []);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('use-cache/my-key.json');
+    });
+
+    it('should list files under prefixed path for multidev getStats', async () => {
+      process.env.PANTHEON_ENVIRONMENT = 'pr-77';
+      mockFile.exists.mockResolvedValue([false]);
+      mockBucket.getFiles.mockResolvedValue([[]]);
+
+      const handler = new UseCacheGcsHandler();
+      await handler.getStats();
+
+      expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-77/use-cache/' });
+    });
+  });
+
   describe('cache key sanitization', () => {
     it('should handle keys with special characters', async () => {
       mockFile.exists.mockResolvedValue([false]);

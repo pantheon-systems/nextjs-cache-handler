@@ -28,6 +28,7 @@ vi.mock('@google-cloud/storage', () => {
 
 // Import after mock is set up
 import { GcsCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/gcs.js';
+import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 
 // Mock fetch for edge cache
 vi.stubGlobal('fetch', vi.fn());
@@ -293,6 +294,191 @@ describe('GcsCacheHandler', () => {
       const handler = new GcsCacheHandler({} as any);
       expect(() => handler.resetRequestCache()).not.toThrow();
     });
+  });
+});
+
+describe('GcsCacheHandler environment prefix', () => {
+  let originalCacheBucket: string | undefined;
+  let originalPantheonEnv: string | undefined;
+
+  beforeEach(() => {
+    originalCacheBucket = process.env.CACHE_BUCKET;
+    originalPantheonEnv = process.env.PANTHEON_ENVIRONMENT;
+
+    process.env.CACHE_BUCKET = 'test-bucket';
+    delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+    vi.clearAllMocks();
+
+    mockFile.exists.mockResolvedValue([false]);
+    mockFile.save.mockResolvedValue(undefined);
+    mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+    mockFile.delete.mockResolvedValue(undefined);
+    mockBucket.getFiles.mockResolvedValue([[]]);
+    mockBucket.file.mockReturnValue(mockFile);
+  });
+
+  afterEach(() => {
+    if (originalCacheBucket !== undefined) {
+      process.env.CACHE_BUCKET = originalCacheBucket;
+    } else {
+      delete process.env.CACHE_BUCKET;
+    }
+
+    if (originalPantheonEnv !== undefined) {
+      process.env.PANTHEON_ENVIRONMENT = originalPantheonEnv;
+    } else {
+      delete process.env.PANTHEON_ENVIRONMENT;
+    }
+  });
+
+  it('should prefix cache keys with environment directory for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+
+    const handler = new GcsCacheHandler({} as any);
+    await handler.get('my-key', { fetchIdx: 0 } as any);
+
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/fetch-cache/my-key.json');
+  });
+
+  it('should prefix route cache keys for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+
+    const handler = new GcsCacheHandler({} as any);
+    await handler.get('my-key');
+
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/route-cache/my-key.json');
+  });
+
+  it('should prefix tags mapping for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+
+    new GcsCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/cache/tags/tags.json');
+  });
+
+  it('should prefix build meta for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+    resetBuildInvalidationCheck();
+    mockFile.exists.mockResolvedValue([true]);
+    mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ buildId: 'old', timestamp: 1 }))]);
+
+    new GcsCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/build-meta.json');
+  });
+
+  it('should use no prefix for live (production) environment', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'live';
+
+    const handler = new GcsCacheHandler({} as any);
+    await handler.get('my-key', { fetchIdx: 0 } as any);
+
+    expect(mockBucket.file).toHaveBeenCalledWith('fetch-cache/my-key.json');
+  });
+
+  it('should invalidate only prefixed route cache for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+    resetBuildInvalidationCheck();
+    mockFile.exists.mockResolvedValue([true]);
+
+    const buildMeta = { buildId: 'old-build', timestamp: 1 };
+    mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(buildMeta))]);
+
+    new GcsCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Build invalidation should list files only under the env prefix
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-42/route-cache/' });
+  });
+
+  it('should not touch other environments cache during invalidation', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-42';
+    resetBuildInvalidationCheck();
+    mockFile.exists.mockResolvedValue([true]);
+
+    const buildMeta = { buildId: 'old-build', timestamp: 1 };
+    mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(buildMeta))]);
+
+    new GcsCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Verify no calls to unprefixed or other environment paths
+    const getFilesCalls = mockBucket.getFiles.mock.calls;
+    for (const [args] of getFilesCalls) {
+      expect(args.prefix).toMatch(/^environments\/pr-42\//);
+    }
+  });
+});
+
+describe('GCS standalone functions environment prefix', () => {
+  let originalCacheBucket: string | undefined;
+  let originalPantheonEnv: string | undefined;
+
+  beforeEach(() => {
+    originalCacheBucket = process.env.CACHE_BUCKET;
+    originalPantheonEnv = process.env.PANTHEON_ENVIRONMENT;
+
+    process.env.CACHE_BUCKET = 'test-bucket';
+    delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+    vi.clearAllMocks();
+
+    mockFile.exists.mockResolvedValue([false]);
+    mockFile.save.mockResolvedValue(undefined);
+    mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+    mockFile.delete.mockResolvedValue(undefined);
+    mockBucket.getFiles.mockResolvedValue([[]]);
+    mockBucket.file.mockReturnValue(mockFile);
+  });
+
+  afterEach(() => {
+    if (originalCacheBucket !== undefined) {
+      process.env.CACHE_BUCKET = originalCacheBucket;
+    } else {
+      delete process.env.CACHE_BUCKET;
+    }
+
+    if (originalPantheonEnv !== undefined) {
+      process.env.PANTHEON_ENVIRONMENT = originalPantheonEnv;
+    } else {
+      delete process.env.PANTHEON_ENVIRONMENT;
+    }
+  });
+
+  it('getSharedCacheStats should use prefixed paths for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-99';
+    mockBucket.getFiles.mockResolvedValue([[]]);
+
+    await getSharedCacheStats();
+
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/fetch-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/route-cache/' });
+  });
+
+  it('clearSharedCache should use prefixed paths for multidev', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'pr-99';
+    mockBucket.getFiles.mockResolvedValue([[]]);
+
+    await clearSharedCache();
+
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/fetch-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/route-cache/' });
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-99/cache/tags/tags.json');
+  });
+
+  it('clearSharedCache should use unprefixed paths for live', async () => {
+    process.env.PANTHEON_ENVIRONMENT = 'live';
+    mockBucket.getFiles.mockResolvedValue([[]]);
+
+    await clearSharedCache();
+
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'fetch-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'route-cache/' });
+    expect(mockBucket.file).toHaveBeenCalledWith('cache/tags/tags.json');
   });
 });
 
