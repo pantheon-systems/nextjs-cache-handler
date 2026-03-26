@@ -3,14 +3,7 @@ import * as path from 'path';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
-import { createEdgeCacheClearer, type EdgeCacheClear } from '../../edge/edge-cache-clear.js';
-
 const log = createLogger('UseCacheFileHandler');
-
-/**
- * Next.js internal prefix for path-based cache tags.
- */
-const NEXTJS_PATH_TAG_PREFIX = '_N_T_';
 
 /**
  * Configuration for UseCacheFileHandler.
@@ -36,7 +29,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
   private tagTimestamps: Map<string, number> = new Map();
-  private readonly edgeCacheClearer: EdgeCacheClear | null;
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
     this.cacheDir = config.cacheDir ?? path.join(process.cwd(), '.next', 'cache', 'use-cache');
@@ -44,12 +36,6 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
     this.ensureCacheDir();
     this.loadTagTimestamps();
-
-    // Initialize edge cache clearer if OUTBOUND_PROXY_ENDPOINT is configured
-    this.edgeCacheClearer = createEdgeCacheClearer();
-    if (this.edgeCacheClearer) {
-      log.debug('Edge cache clearing enabled');
-    }
 
     log.debug('Initialized with cache dir:', this.cacheDir);
   }
@@ -177,7 +163,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
       fs.writeFileSync(filePath, JSON.stringify(serialized, null, 2), 'utf-8');
 
-      log.debug(`Cached ${cacheKey}`);
+      log.debug(`Cached ${cacheKey} with ${entry.tags?.length ?? 0} tags`);
     } catch (error) {
       log.error(`Error setting cache for key ${cacheKey}:`, error);
     }
@@ -211,7 +197,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
   /**
    * Invalidate cache entries with matching tags.
-   * Also triggers CDN edge cache clearing via Surrogate-Key if configured.
+   *
+   * Updates tag timestamps so that subsequent get() calls for entries
+   * with these tags will return undefined (expired). CDN path-based
+   * purging is handled by the legacy cacheHandler which maintains the
+   * tag-to-path mapping — the use-cache handler only caches function
+   * return values (opaque keys), not URL-addressable pages.
    */
   async updateTags(tags: string[], durations: number[]): Promise<void> {
     log.debug(`UPDATE TAGS: [${tags.join(', ')}]`);
@@ -227,31 +218,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
     }
 
     this.saveTagTimestamps();
-
-    // Clear edge cache if configured
-    if (this.edgeCacheClearer) {
-      const explicitTags: string[] = [];
-      const paths: string[] = [];
-
-      for (const tag of tags) {
-        if (tag.startsWith(NEXTJS_PATH_TAG_PREFIX)) {
-          paths.push(tag.substring(NEXTJS_PATH_TAG_PREFIX.length));
-        } else {
-          explicitTags.push(tag);
-        }
-      }
-
-      if (explicitTags.length > 0) {
-        this.edgeCacheClearer.clearKeysInBackground(
-          explicitTags,
-          `use-cache tag invalidation: ${explicitTags.join(', ')}`
-        );
-      }
-
-      if (paths.length > 0) {
-        this.edgeCacheClearer.clearPathsInBackground(paths, `path revalidation: ${paths.join(', ')}`);
-      }
-    }
+    log.debug(`Updated ${tags.length} tag timestamps`);
   }
 
   /**

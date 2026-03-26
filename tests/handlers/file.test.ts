@@ -164,6 +164,183 @@ describe('FileCacheHandler', () => {
     });
   });
 
+  describe('extractTagsFromDataHeaders fallback', () => {
+    it('should extract tags from data.headers when ctx.tags is empty (APP_PAGE)', async () => {
+      const cacheValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html></html>',
+        headers: {
+          'x-next-cache-tags': '_N_T_/layout,_N_T_/blogs/page,post-123,post-list,term-5',
+          'content-type': 'text/html',
+        },
+      };
+
+      await handler.set('/blogs', cacheValue as any, { tags: [] });
+
+      // Wait for the buffer to flush
+      await new Promise((r) => setTimeout(r, 150));
+
+      const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
+      const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+
+      expect(tagsMapping['post-123']).toContain('/blogs');
+      expect(tagsMapping['post-list']).toContain('/blogs');
+      expect(tagsMapping['term-5']).toContain('/blogs');
+      expect(tagsMapping['_N_T_/layout']).toContain('/blogs');
+      expect(tagsMapping['_N_T_/blogs/page']).toContain('/blogs');
+    });
+
+    it('should merge ctx.tags and header tags when both are present', async () => {
+      const cacheValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html></html>',
+        headers: {
+          'x-next-cache-tags': 'header-tag-1,header-tag-2',
+        },
+      };
+
+      await handler.set('/page', cacheValue as any, { tags: ['ctx-tag-1', 'ctx-tag-2'] });
+
+      // Wait for the buffer to flush
+      await new Promise((r) => setTimeout(r, 150));
+
+      const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
+      const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+
+      // Should have BOTH ctx.tags and header tags
+      expect(tagsMapping['ctx-tag-1']).toContain('/page');
+      expect(tagsMapping['ctx-tag-2']).toContain('/page');
+      expect(tagsMapping['header-tag-1']).toContain('/page');
+      expect(tagsMapping['header-tag-2']).toContain('/page');
+    });
+
+    it('should deduplicate tags when same tag appears in both ctx and headers', async () => {
+      const cacheValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html></html>',
+        headers: {
+          'x-next-cache-tags': 'shared-tag,header-only',
+        },
+      };
+
+      await handler.set('/dedup-page', cacheValue as any, { tags: ['shared-tag', 'ctx-only'] });
+
+      const result = await handler.get('/dedup-page');
+      expect(result).not.toBeNull();
+
+      // Tags should be deduplicated
+      const tagCount = result!.tags.filter(t => t === 'shared-tag').length;
+      expect(tagCount).toBe(1);
+
+      // All unique tags should be present
+      expect(result!.tags).toContain('shared-tag');
+      expect(result!.tags).toContain('ctx-only');
+      expect(result!.tags).toContain('header-only');
+    });
+
+    it('should not extract tags from FETCH entries (no headers)', async () => {
+      const cacheValue = {
+        kind: 'FETCH' as const,
+        data: { test: 'data' },
+      };
+
+      await handler.set('fetch-key', cacheValue as any, { tags: [] });
+
+      // Wait for the buffer to flush
+      await new Promise((r) => setTimeout(r, 150));
+
+      const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
+      const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+
+      // No tags should be stored since both ctx.tags and headers are empty
+      expect(Object.keys(tagsMapping).length).toBe(0);
+    });
+
+    it('should handle missing x-next-cache-tags header gracefully', async () => {
+      const cacheValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html></html>',
+        headers: {
+          'content-type': 'text/html',
+          // No x-next-cache-tags header
+        },
+      };
+
+      await handler.set('/no-tags-page', cacheValue as any, { tags: [] });
+
+      // Wait for the buffer to flush
+      await new Promise((r) => setTimeout(r, 150));
+
+      const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
+      const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+
+      expect(Object.keys(tagsMapping).length).toBe(0);
+    });
+
+    it('should store tags on the cache entry itself when extracted from headers', async () => {
+      const cacheValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html></html>',
+        headers: {
+          'x-next-cache-tags': 'post-456,post-list',
+        },
+      };
+
+      await handler.set('/blogs/my-post', cacheValue as any, { tags: [] });
+
+      const result = await handler.get('/blogs/my-post');
+      expect(result).not.toBeNull();
+      expect(result?.tags).toEqual(['post-456', 'post-list']);
+    });
+
+    it('should enable CDN path purging via tag mapping after header extraction', async () => {
+      // Simulate WordPress: blog list page with multiple post tags
+      const blogListValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html>blog list</html>',
+        headers: {
+          'x-next-cache-tags': '_N_T_/blogs/page,post-list,post-100,post-200,term-5',
+        },
+      };
+
+      // Simulate WordPress: individual blog post with specific tags
+      const blogPostValue = {
+        kind: 'APP_PAGE' as const,
+        html: '<html>blog post</html>',
+        headers: {
+          'x-next-cache-tags': '_N_T_/blogs/[slug]/page,post-100,post-my-post,term-5',
+        },
+      };
+
+      await handler.set('/blogs', blogListValue as any, { tags: [] });
+      await handler.set('/blogs/my-post', blogPostValue as any, { tags: [] });
+
+      // Wait for the buffer to flush
+      await new Promise((r) => setTimeout(r, 150));
+
+      const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
+      const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+
+      // post-100 should map to BOTH pages
+      expect(tagsMapping['post-100']).toContain('/blogs');
+      expect(tagsMapping['post-100']).toContain('/blogs/my-post');
+
+      // post-list should only map to /blogs
+      expect(tagsMapping['post-list']).toContain('/blogs');
+      expect(tagsMapping['post-list']).not.toContain('/blogs/my-post');
+
+      // term-5 should map to both
+      expect(tagsMapping['term-5']).toContain('/blogs');
+      expect(tagsMapping['term-5']).toContain('/blogs/my-post');
+
+      // Now revalidate post-100 — should delete both pages
+      await handler.revalidateTag('post-100');
+
+      expect(await handler.get('/blogs')).toBeNull();
+      expect(await handler.get('/blogs/my-post')).toBeNull();
+    });
+  });
+
   describe('resetRequestCache', () => {
     it('should not throw', () => {
       expect(() => handler.resetRequestCache()).not.toThrow();

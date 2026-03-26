@@ -269,33 +269,31 @@ describe('UseCacheFileHandler', () => {
       expect(exp3).toBeGreaterThan(0);
     });
 
-    it('should trigger edge cache clearing when OUTBOUND_PROXY_ENDPOINT is configured', async () => {
-      // Set up environment for edge cache clearing
+    it('should only update timestamps without triggering CDN clearing', async () => {
+      // CDN path-based purging is handled by the legacy cacheHandler.
+      // The use-cache handler only manages function-level cache staleness
+      // via timestamps — it should NOT make any edge cache clear calls.
       const originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
       process.env.OUTBOUND_PROXY_ENDPOINT = 'localhost:8080';
 
-      // Mock fetch to capture edge cache clear calls
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 200 }));
 
       try {
         const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
 
-        // Call updateTags which should trigger edge cache clearing
-        await handler.updateTags(['test-tag-1', 'test-tag-2'], [0, 0]);
+        await handler.updateTags(['post-123', 'post-list'], [0, 0]);
 
-        // Wait a bit for background clearing to be initiated
+        // Wait for any potential background calls
         await new Promise((resolve) => setTimeout(resolve, 50));
 
-        // Verify fetch was called for edge cache clearing
-        // The EdgeCacheClear calls DELETE on /rest/v0alpha1/cache/keys/{key}
-        expect(fetchSpy).toHaveBeenCalled();
+        // No fetch calls should have been made — use-cache handler
+        // doesn't do CDN clearing
+        expect(fetchSpy).not.toHaveBeenCalled();
 
-        const calls = fetchSpy.mock.calls;
-        const edgeCacheCalls = calls.filter((call) => typeof call[0] === 'string' && call[0].includes('/cache/keys/'));
-
-        expect(edgeCacheCalls.length).toBeGreaterThanOrEqual(1);
+        // But timestamps should be updated
+        const exp = await handler.getExpiration(['post-123']);
+        expect(exp).toBeGreaterThan(0);
       } finally {
-        // Restore environment
         if (originalEnv === undefined) {
           delete process.env.OUTBOUND_PROXY_ENDPOINT;
         } else {
@@ -305,33 +303,60 @@ describe('UseCacheFileHandler', () => {
       }
     });
 
-    it('should not trigger edge cache clearing when OUTBOUND_PROXY_ENDPOINT is not set', async () => {
-      // Ensure environment variable is not set
-      const originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
-      delete process.env.OUTBOUND_PROXY_ENDPOINT;
+    it('should make entries with matching tags expire on next get()', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
 
-      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      // Set an entry with a tag, timestamp in the past
+      const pastTimestamp = Date.now() - 1000;
+      const entry = createTestEntry({
+        tags: ['post-123'],
+        timestamp: pastTimestamp,
+        revalidate: 86400, // Long revalidate so it wouldn't expire by time alone
+      });
+      await handler.set('cached-func', Promise.resolve(entry));
 
-      try {
-        const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      // Verify entry exists before invalidation
+      const before = await handler.get('cached-func', []);
+      expect(before).not.toBeUndefined();
 
-        await handler.updateTags(['test-tag'], [0]);
+      // Invalidate the tag
+      await handler.updateTags(['post-123'], [0]);
 
-        // Wait a bit
-        await new Promise((resolve) => setTimeout(resolve, 50));
+      // Entry should now be expired because tag timestamp > entry timestamp
+      const after = await handler.get('cached-func', []);
+      expect(after).toBeUndefined();
+    });
 
-        // Verify no edge cache clear calls were made
-        const calls = fetchSpy.mock.calls;
-        const edgeCacheCalls = calls.filter((call) => typeof call[0] === 'string' && call[0].includes('/cache/keys/'));
+    it('should not affect entries without matching tags', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
 
-        expect(edgeCacheCalls.length).toBe(0);
-      } finally {
-        // Restore environment
-        if (originalEnv !== undefined) {
-          process.env.OUTBOUND_PROXY_ENDPOINT = originalEnv;
-        }
-        fetchSpy.mockRestore();
-      }
+      const pastTimestamp = Date.now() - 1000;
+      const entry = createTestEntry({
+        tags: ['post-456'],
+        timestamp: pastTimestamp,
+        revalidate: 86400,
+      });
+      await handler.set('unrelated-func', Promise.resolve(entry));
+
+      // Invalidate a different tag
+      await handler.updateTags(['post-123'], [0]);
+
+      // Entry with post-456 should still be valid
+      const result = await handler.get('unrelated-func', []);
+      expect(result).not.toBeUndefined();
+    });
+
+    it('should persist tag timestamps to disk for cross-request consistency', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      await handler.updateTags(['post-789'], [0]);
+
+      // Read the _tags.json file directly
+      const tagsFile = path.join(testCacheDir, '_tags.json');
+      expect(fs.existsSync(tagsFile)).toBe(true);
+
+      const timestamps = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
+      expect(timestamps['post-789']).toBeGreaterThan(0);
     });
   });
 

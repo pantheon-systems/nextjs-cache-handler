@@ -367,7 +367,7 @@ describe('UseCacheGcsHandler', () => {
       expect(exp3).toBeGreaterThan(0);
     });
 
-    it('should clear edge cache when configured', async () => {
+    it('should not trigger edge cache clearing (handled by legacy handler)', async () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
       mockFile.exists.mockResolvedValue([true]);
@@ -377,10 +377,15 @@ describe('UseCacheGcsHandler', () => {
       const handler = new UseCacheGcsHandler();
       await handler.updateTags(['posts'], [0]);
 
-      // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      expect(fetch).toHaveBeenCalled();
+      // Use-cache handler should NOT call fetch for CDN clearing.
+      // CDN purging is handled by the legacy cacheHandler.
+      expect(fetch).not.toHaveBeenCalled();
+
+      // But timestamps should be updated
+      const exp = await handler.getExpiration(['posts']);
+      expect(exp).toBeGreaterThan(0);
     });
   });
 
@@ -398,63 +403,36 @@ describe('UseCacheGcsHandler', () => {
       expect(expiration).toBeGreaterThan(0);
     });
 
-    it('should handle mixed explicit and _N_T_ tags', async () => {
-      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
-
+    it('should handle mixed explicit and _N_T_ tags (timestamps only)', async () => {
       mockFile.exists.mockResolvedValue([true]);
       mockFile.download.mockResolvedValue([Buffer.from('{}')]);
-      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
       const handler = new UseCacheGcsHandler();
 
-      // Mixed: explicit tag + path tag
+      // Mixed: explicit tag + path tag — both should update timestamps
       await handler.updateTags(['posts', '_N_T_/api/cdnprobe'], [0, 0]);
 
-      await new Promise((r) => setTimeout(r, 50));
-
-      const fetchCalls = vi.mocked(fetch).mock.calls;
-
-      // Explicit tags should be purged via keys
-      const keyPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/keys/'));
-      const purgedKeys = keyPurgeCalls.map(([url]) => decodeURIComponent((url as string).split('/keys/')[1]));
-      expect(purgedKeys).toContain('posts');
-
-      // Path tags should be purged via paths
-      const pathPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/paths/'));
-      expect(pathPurgeCalls.length).toBeGreaterThan(0);
+      const exp1 = await handler.getExpiration(['posts']);
+      const exp2 = await handler.getExpiration(['_N_T_/api/cdnprobe']);
+      expect(exp1).toBeGreaterThan(0);
+      expect(exp2).toBeGreaterThan(0);
     });
 
-    it('should use path purge for _N_T_ tags', async () => {
+    it('should not trigger CDN clearing (handled by legacy handler)', async () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
       mockFile.exists.mockResolvedValue([true]);
       mockFile.download.mockResolvedValue([Buffer.from('{}')]);
-      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
       const handler = new UseCacheGcsHandler();
 
-      await handler.updateTags(['_N_T_/blogs'], [0]);
+      await handler.updateTags(['_N_T_/blogs', 'post-123'], [0, 0]);
 
       await new Promise((r) => setTimeout(r, 50));
 
-      const fetchCalls = vi.mocked(fetch).mock.calls;
-
-      // Should use path purge for _N_T_ tags (prefix stripped)
-      const pathPurgeCalls = fetchCalls.filter(([url]) => typeof url === 'string' && url.includes('/paths/'));
-      expect(pathPurgeCalls.length).toBeGreaterThan(0);
-    });
-
-    it('should not purge _N_T_ tags when no edge cache clearer configured', async () => {
-      // No OUTBOUND_PROXY_ENDPOINT — edge cache clearing disabled
-      mockFile.exists.mockResolvedValue([true]);
-      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
-
-      const handler = new UseCacheGcsHandler();
-
-      // Should not throw
-      await handler.updateTags(['_N_T_/api/cdnprobe'], [0]);
-
-      // No fetch calls expected
+      // No fetch calls — use-cache handler doesn't do CDN clearing
+      // CDN purging is handled by the legacy cacheHandler which has
+      // the tag-to-path mapping
       expect(fetch).not.toHaveBeenCalled();
     });
   });

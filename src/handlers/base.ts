@@ -222,6 +222,41 @@ export abstract class BaseCacheHandler {
   }
 
   // ============================================================================
+  // Tag extraction from cached data headers
+  // ============================================================================
+
+  /**
+   * Extracts cache tags from the cached data's headers.
+   * Next.js stores tags in x-next-cache-tags header on the cached data
+   * regardless of minimal mode. This is a fallback for when ctx.tags is empty
+   * (common in Next.js 16.2+ for page cache entries).
+   */
+  private extractTagsFromDataHeaders(data: CacheHandlerParametersSet[1]): string[] {
+    if (!data || typeof data !== 'object') {
+      this.log.debug('extractTagsFromDataHeaders: no data or not an object');
+      return [];
+    }
+
+    const kind = 'kind' in data ? (data as { kind: string }).kind : 'unknown';
+
+    // APP_PAGE and PAGES kinds have headers with x-next-cache-tags
+    if ('headers' in data && data.headers) {
+      const tagHeader = (data.headers as Record<string, string | undefined>)['x-next-cache-tags'];
+      if (typeof tagHeader === 'string' && tagHeader.length > 0) {
+        const tags = tagHeader.split(',');
+        this.log.info(`extractTagsFromDataHeaders: found ${tags.length} tags from data.headers (kind=${kind})`);
+        this.log.debug('extractTagsFromDataHeaders: tags:', tags);
+        return tags;
+      }
+      this.log.debug(`extractTagsFromDataHeaders: data.headers exists but no x-next-cache-tags (kind=${kind})`);
+    } else {
+      this.log.debug(`extractTagsFromDataHeaders: no headers on data (kind=${kind})`);
+    }
+
+    return [];
+  }
+
+  // ============================================================================
   // CacheHandler interface implementation
   // ============================================================================
 
@@ -268,7 +303,16 @@ export abstract class BaseCacheHandler {
     });
 
     try {
-      const { tags = [] } = ctx;
+      const { tags: ctxTags = [] } = ctx;
+
+      // Extract tags from the cached data's headers as well.
+      // In Next.js 16.2+, ctx.tags may be empty for page cache entries
+      // (see https://github.com/vercel/next.js/issues/78864), but the tags
+      // are always present in data.headers['x-next-cache-tags'].
+      // We merge both sources (deduplicated) to ensure we never miss tags,
+      // whether they come from ctx or from the cached data headers.
+      const headerTags = this.extractTagsFromDataHeaders(incrementalCacheValue);
+      const tags = [...new Set([...ctxTags, ...headerTags])];
 
       const cacheHandlerValue: CacheHandlerValue = {
         value: incrementalCacheValue,
