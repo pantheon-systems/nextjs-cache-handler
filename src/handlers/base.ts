@@ -237,23 +237,25 @@ export abstract class BaseCacheHandler {
       return [];
     }
 
-    const kind = 'kind' in data ? (data as { kind: string }).kind : 'unknown';
+    const record = data as unknown as Record<string, unknown>;
+    const kind = typeof record.kind === 'string' ? record.kind : 'unknown';
+    const headers = record.headers as Record<string, string | undefined> | undefined;
 
-    // APP_PAGE and PAGES kinds have headers with x-next-cache-tags
-    if ('headers' in data && data.headers) {
-      const tagHeader = (data.headers as Record<string, string | undefined>)['x-next-cache-tags'];
-      if (typeof tagHeader === 'string' && tagHeader.length > 0) {
-        const tags = tagHeader.split(',');
-        this.log.info(`extractTagsFromDataHeaders: found ${tags.length} tags from data.headers (kind=${kind})`);
-        this.log.debug('extractTagsFromDataHeaders: tags:', tags);
-        return tags;
-      }
-      this.log.debug(`extractTagsFromDataHeaders: data.headers exists but no x-next-cache-tags (kind=${kind})`);
-    } else {
+    if (!headers) {
       this.log.debug(`extractTagsFromDataHeaders: no headers on data (kind=${kind})`);
+      return [];
     }
 
-    return [];
+    const tagHeader = headers['x-next-cache-tags'];
+    if (!tagHeader) {
+      this.log.debug(`extractTagsFromDataHeaders: data.headers exists but no x-next-cache-tags (kind=${kind})`);
+      return [];
+    }
+
+    const tags = tagHeader.split(',');
+    this.log.info(`extractTagsFromDataHeaders: found ${tags.length} tags from data.headers (kind=${kind})`);
+    this.log.debug('extractTagsFromDataHeaders: tags:', tags);
+    return tags;
   }
 
   // ============================================================================
