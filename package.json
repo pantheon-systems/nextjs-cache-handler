@@ -48,7 +48,7 @@
   "devDependencies": {
     "@types/node": "^22",
     "@vitest/coverage-v8": "^4.0.18",
-    "next": "^16.1.6",
+    "next": "^16.1.7",
     "prettier": "^3.0.0",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"

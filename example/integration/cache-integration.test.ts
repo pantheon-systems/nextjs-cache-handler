@@ -48,9 +48,11 @@ describe('Cache Integration Tests', () => {
           return
         }
 
-        // Start the server
+        // Start the server in its own process group so we can kill the whole
+        // tree (npm wrapper + node grandchild) cleanly during teardown.
         nextServer = spawn('npm', ['run', 'start'], {
           stdio: ['pipe', 'pipe', 'pipe'],
+          detached: true,
           env: {
             ...process.env,
             NODE_ENV: 'production',
@@ -94,32 +96,40 @@ describe('Cache Integration Tests', () => {
   /**
    * Stop Next.js server
    */
+  const killProcessGroup = (signal: NodeJS.Signals): void => {
+    if (!nextServer?.pid) return
+    try {
+      process.kill(-nextServer.pid, signal)
+    } catch (err: any) {
+      if (err.code !== 'ESRCH') throw err
+    }
+  }
+
   const stopNextServer = (): Promise<void> => {
     return new Promise((resolve) => {
-      if (nextServer && !nextServer.killed) {
-        let resolved = false
+      if (!nextServer || nextServer.killed) {
+        resolve()
+        return
+      }
 
-        const forceKillTimeout = setTimeout(() => {
-          if (!resolved && !nextServer.killed) {
-            nextServer.kill('SIGKILL')
-          }
-          if (!resolved) {
-            resolved = true
-            resolve()
-          }
-        }, 5000)
-
-        nextServer.kill('SIGTERM')
-        nextServer.on('close', () => {
-          clearTimeout(forceKillTimeout)
-          if (!resolved) {
-            resolved = true
-            resolve()
-          }
-        })
-      } else {
+      let resolved = false
+      const done = () => {
+        if (resolved) return
+        resolved = true
         resolve()
       }
+
+      const forceKillTimeout = setTimeout(() => {
+        killProcessGroup('SIGKILL')
+        done()
+      }, 5000)
+
+      nextServer.on('close', () => {
+        clearTimeout(forceKillTimeout)
+        done()
+      })
+
+      killProcessGroup('SIGTERM')
     })
   }
 
