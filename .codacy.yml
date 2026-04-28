@@ -1,0 +1,10 @@
+---
+exclude_paths:
+  - 'dist/**'
+  - 'coverage/**'
+  - '.next/**'
+  - 'example/.next/**'
+  - 'node_modules/**'
+  - '**/*.min.js'
+  - 'package-lock.json'
+  - '**/package-lock.json'

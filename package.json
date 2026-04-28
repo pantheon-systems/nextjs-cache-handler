@@ -46,7 +46,7 @@
     "@google-cloud/storage": "^7.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20",
+    "@types/node": "^22",
     "@vitest/coverage-v8": "^4.0.18",
     "next": "^16.1.6",
     "prettier": "^3.0.0",
@@ -54,7 +54,7 @@
     "vitest": "^4.0.18"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   },
   "repository": {
     "type": "git",
