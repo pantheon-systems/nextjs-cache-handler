@@ -46,7 +46,7 @@
     "@google-cloud/storage": "^7.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22",
+    "@types/node": "^25",
     "@vitest/coverage-v8": "^4.0.18",
     "next": "^16.1.7",
     "prettier": "^3.0.0",
