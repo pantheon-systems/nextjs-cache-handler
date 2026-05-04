@@ -64,11 +64,11 @@ export function createCacheHandler(config?: CacheHandlerConfig): typeof FileCach
  */
 export function createUseCacheHandler(
   config?: UseCacheHandlerConfig
-): typeof UseCacheFileHandler | typeof UseCacheGcsHandler {
+): UseCacheFileHandler | UseCacheGcsHandler {
   if (shouldUseGcs(config?.type ?? 'auto')) {
-    return UseCacheGcsHandler;
+    return new UseCacheGcsHandler();
   }
-  return UseCacheFileHandler;
+  return new UseCacheFileHandler();
 }
 
 function shouldUseGcs(type: 'auto' | 'file' | 'gcs'): boolean {
