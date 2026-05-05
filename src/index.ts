@@ -47,8 +47,14 @@ export function createCacheHandler(config?: CacheHandlerConfig): typeof FileCach
  * Factory function to create a use cache handler based on configuration.
  * For Next.js 16 cacheHandlers (plural) configuration.
  *
+ * Returns the handler class. Next.js's `cacheHandlers` API does NOT call
+ * `new` on the value it imports — it calls `.get/.set/...` directly. So in
+ * your handler module you must instantiate the returned class with `new`
+ * and export the resulting instance (see example).
+ *
  * @param config - Configuration options for the cache handler
- * @returns A cache handler class that implements the cacheHandlers interface
+ * @returns A cache handler class that implements the cacheHandlers interface.
+ *   Instantiate with `new` before exporting from your handler module.
  *
  * @example
  * ```typescript
@@ -59,7 +65,9 @@ export function createCacheHandler(config?: CacheHandlerConfig): typeof FileCach
  *   type: 'auto', // Auto-detect: GCS if CACHE_BUCKET exists, else file-based
  * });
  *
- * export default UseCacheHandler;
+ * Note the `new` — Next.js calls methods on this export directly
+ * and will not instantiate the class for you.
+ * export default new UseCacheHandler();
  * ```
  */
 export function createUseCacheHandler(

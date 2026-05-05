@@ -142,6 +142,11 @@ Next.js 16 introduces the `'use cache'` directive with a new `cacheHandlers` (pl
 
 ### 1. Create a use-cache handler file
 
+`createUseCacheHandler` returns the handler **class**. Next.js's `cacheHandlers`
+(plural) API expects each entry's default export to be an **instance** with
+callable `.get/.set/...` methods — Next does not call `new` on it. So you must
+instantiate the class with `new` and export the instance:
+
 ```typescript
 // use-cache-handler.mjs
 import { createUseCacheHandler } from '@pantheon-systems/nextjs-cache-handler/use-cache';
@@ -150,8 +155,13 @@ const UseCacheHandler = createUseCacheHandler({
   type: 'auto', // Auto-detect: GCS if CACHE_BUCKET exists, else file-based
 });
 
-export default UseCacheHandler;
+// Note the `new` — Next.js calls methods directly on this exported value
+// and will not instantiate the class for you.
+export default new UseCacheHandler();
 ```
+
+> If you forget the `new`, Next.js builds will hang (~60s) and then fail
+> because `.get/.set/...` are undefined on the class itself.
 
 ### 2. Configure Next.js
 
