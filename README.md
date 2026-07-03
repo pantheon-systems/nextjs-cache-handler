@@ -10,6 +10,7 @@ Custom cache handler for Next.js with support for Google Cloud Storage and file-
 - **Edge Cache Clearing**: Automatic CDN cache invalidation on Pantheon infrastructure
 - **Build-Aware Caching**: Automatically invalidates route cache on new builds
 - **Static Route Preservation**: Preserves SSG routes during cache clearing
+- **Edge-Runtime Safe**: Ships an edge-safe entry (resolved via the `edge-light`/`worker` export conditions) so a globally-configured cache handler doesn't break edge routes or edge middleware
 
 ## Installation
 
@@ -48,6 +49,32 @@ const nextConfig = {
 
 export default nextConfig;
 ```
+
+## Edge runtime safety
+
+The GCS and file handlers are Node-only — they import `fs` and
+`@google-cloud/storage`. When a cache handler is configured **globally** (via
+`cacheHandler` / `cacheHandlers` in `next.config`, as Pantheon's build adapter
+does zero-touch), Next.js bundles it into **edge routes and edge middleware**
+too. If the entry point pulled in `fs`, those edge builds would fail with
+`edge runtime does not support Node.js 'fs'` (or `Can't resolve 'net'`).
+
+To avoid that, the package ships a separate **edge-safe entry** exposing the same
+API backed by no-op handlers, and maps it through the `edge-light`, `worker`,
+`workerd`, and `browser` [export conditions](https://nodejs.org/api/packages.html#conditional-exports).
+Next's edge compiler resolves the edge-safe entry; the Node server resolves the
+real handlers. No configuration is needed — importing `@pantheon-systems/nextjs-cache-handler`
+just works in both runtimes.
+
+> ⚠️ **Do not add this package to `transpilePackages`.** Transpiling a package
+> makes Next's edge compiler bundle its source and **ignore the `edge-light`
+> export condition**, which drags the Node handlers back into the edge bundle and
+> reintroduces the `fs`/`net` build failure. Leave it as a normal (externalized)
+> dependency.
+
+Edge routes/middleware never persist to the shared cache, so the edge no-op
+handlers are correct: reads miss and writes are dropped at the edge, while the
+Node server performs real caching.
 
 ## Configuration
 

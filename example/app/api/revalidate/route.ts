@@ -16,7 +16,7 @@ export async function POST(request: NextRequest) {
     console.log(`[API] /api/revalidate - Revalidating cache tag: ${tag}`);
 
     // Revalidate the specified cache tag
-    revalidateTag(tag);
+    revalidateTag(tag, 'max');
 
     return NextResponse.json({
       message: `Cache tag '${tag}' has been revalidated`,
@@ -52,7 +52,7 @@ export async function GET(request: NextRequest) {
   console.log(`[API] /api/revalidate - Revalidating cache tag: ${tag}`);
 
   try {
-    revalidateTag(tag);
+    revalidateTag(tag, 'max');
 
     return NextResponse.json({
       message: `Cache tag '${tag}' has been revalidated`,

@@ -10,8 +10,17 @@ const path = require('path')
 
 // Clean up cache directory before tests
 beforeAll(async () => {
-  const cacheDir = path.join(process.cwd(), '.next', 'cache')
-  if (fs.existsSync(cacheDir)) {
+  const projectRoot = path.resolve(process.cwd())
+  const cacheDir = path.resolve(projectRoot, '.next', 'cache')
+
+  // Defence-in-depth: only ever delete a directory that lives inside the
+  // project's own .next/cache. The path is built from constants, but the
+  // explicit containment check keeps the recursive delete provably scoped.
+  if (
+    cacheDir !== projectRoot &&
+    cacheDir.startsWith(projectRoot + path.sep) &&
+    fs.existsSync(cacheDir)
+  ) {
     fs.rmSync(cacheDir, { recursive: true, force: true })
   }
 })

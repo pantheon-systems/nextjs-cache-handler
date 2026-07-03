@@ -3,6 +3,7 @@ import * as path from 'path';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
+import { safeJoin } from '../../utils/path-safety.js';
 const log = createLogger('UseCacheFileHandler');
 
 /**
@@ -32,7 +33,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
     this.cacheDir = config.cacheDir ?? path.join(process.cwd(), '.next', 'cache', 'use-cache');
-    this.tagsFile = path.join(this.cacheDir, '_tags.json');
+    this.tagsFile = safeJoin(this.cacheDir, '_tags.json');
 
     this.ensureCacheDir();
     this.loadTagTimestamps();
@@ -75,7 +76,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   private getCacheFilePath(cacheKey: string): string {
     // Sanitize cache key for filesystem
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    return path.join(this.cacheDir, `${safeKey}.json`);
+    return safeJoin(this.cacheDir, `${safeKey}.json`);
   }
 
   /**
@@ -245,7 +246,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
         }
 
         try {
-          const filePath = path.join(this.cacheDir, file);
+          const filePath = safeJoin(this.cacheDir, file);
           const data = fs.readFileSync(filePath, 'utf-8');
           const stored = JSON.parse(data);
 

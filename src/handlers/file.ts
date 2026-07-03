@@ -6,6 +6,7 @@ import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
+import { safeJoin } from '../utils/path-safety.js';
 
 const fileLog = createLogger('FileCacheHandler');
 
@@ -158,7 +159,9 @@ export class FileCacheHandler extends BaseCacheHandler {
   private getCacheFilePath(cacheKey: string, cacheType: 'fetch' | 'route'): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
     const dir = cacheType === 'fetch' ? this.fetchCacheDir : this.routeCacheDir;
-    return path.join(dir, `${safeKey}.json`);
+    // safeJoin guarantees the resolved path stays within the cache directory,
+    // in addition to the character sanitization applied to the key above.
+    return safeJoin(dir, `${safeKey}.json`);
   }
 
   protected async readCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<CacheHandlerValue | null> {
@@ -285,7 +288,7 @@ async function processJsonCacheFile(
   keys.push(displayKey);
 
   try {
-    const filePath = path.join(dir, file);
+    const filePath = safeJoin(dir, file);
     const data = await fs.promises.readFile(filePath, 'utf-8');
     const cacheData = JSON.parse(data);
 
@@ -342,7 +345,7 @@ async function clearFetchCache(dir: string): Promise<number> {
     const jsonFiles = files.filter((file) => file.endsWith('.json'));
 
     for (const file of jsonFiles) {
-      await fs.promises.unlink(path.join(dir, file));
+      await fs.promises.unlink(safeJoin(dir, file));
     }
 
     fileLog.debug(`Cleared ${jsonFiles.length} fetch cache entries`);
@@ -371,7 +374,7 @@ async function clearRouteCache(
         continue;
       }
 
-      await fs.promises.unlink(path.join(dir, file));
+      await fs.promises.unlink(safeJoin(dir, file));
       cleared++;
     }
 
