@@ -1,18 +1,28 @@
 {
   "name": "@pantheon-systems/nextjs-cache-handler",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Custom cache handler for Next.js with support for Google Cloud Storage and file-based caching",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
+      "edge-light": "./dist/index.edge.js",
+      "workerd": "./dist/index.edge.js",
+      "worker": "./dist/index.edge.js",
+      "browser": "./dist/index.edge.js",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
     },
     "./use-cache": {
+      "types": "./dist/handlers/use-cache/index.d.ts",
+      "edge-light": "./dist/handlers/use-cache/index.edge.js",
+      "workerd": "./dist/handlers/use-cache/index.edge.js",
+      "worker": "./dist/handlers/use-cache/index.edge.js",
+      "browser": "./dist/handlers/use-cache/index.edge.js",
       "import": "./dist/handlers/use-cache/index.js",
-      "types": "./dist/handlers/use-cache/index.d.ts"
+      "default": "./dist/handlers/use-cache/index.js"
     }
   },
   "files": [
@@ -43,7 +53,12 @@
     "next": ">=14.0.0"
   },
   "dependencies": {
-    "@google-cloud/storage": "^7.0.0"
+    "@google-cloud/storage": "^7.21.0"
+  },
+  "overrides": {
+    "form-data": "2.5.6",
+    "postcss": "^8.5.10",
+    "uuid": "^11.1.1"
   },
   "devDependencies": {
     "@types/node": "^22",
