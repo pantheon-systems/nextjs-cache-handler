@@ -17,6 +17,32 @@ import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manife
 let buildInvalidationChecked = false;
 
 /**
+ * Minimal shape of Next.js's built-in FileSystemCache that we delegate to for
+ * reading build-time prerenders (see BaseCacheHandler.get).
+ */
+interface FileSystemCacheLike {
+  get(key: string, ctx: unknown): Promise<CacheHandlerValue | null>;
+}
+type FileSystemCacheCtor = new (context: FileSystemCacheContext) => FileSystemCacheLike;
+
+// Lazily-resolved Next.js FileSystemCache constructor. The module is CJS
+// (`exports.default = FileSystemCache`); imported from ESM it surfaces as
+// `mod.default.default`, but we probe every interop shape defensively. Loaded
+// via dynamic import so it never lands in the edge bundle (Node-only path).
+let fileSystemCacheCtorPromise: Promise<FileSystemCacheCtor | null> | null = null;
+function loadFileSystemCacheCtor(): Promise<FileSystemCacheCtor | null> {
+  if (!fileSystemCacheCtorPromise) {
+    fileSystemCacheCtorPromise = import('next/dist/server/lib/incremental-cache/file-system-cache.js')
+      .then((mod: unknown) => {
+        const m = mod as { default?: { default?: FileSystemCacheCtor } & FileSystemCacheCtor } & FileSystemCacheCtor;
+        return m?.default?.default ?? m?.default ?? m ?? null;
+      })
+      .catch(() => null);
+  }
+  return fileSystemCacheCtorPromise;
+}
+
+/**
  * Reset the build invalidation check flag.
  * Useful for testing purposes.
  * @internal
@@ -38,6 +64,11 @@ export abstract class BaseCacheHandler {
   protected readonly context: FileSystemCacheContext;
   protected readonly handlerName: string;
   protected readonly log: Logger;
+
+  // Read-through fallback to Next's built-in FileSystemCache for build-time
+  // prerenders (lazily constructed on first miss). See getBuildPrerender.
+  private buildPrerenderFallback: FileSystemCacheLike | null = null;
+  private buildPrerenderFallbackInit = false;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
     this.context = context;
@@ -273,6 +304,20 @@ export abstract class BaseCacheHandler {
       const entry = await this.readCacheEntry(cacheKey, cacheType);
 
       if (!entry) {
+        // Our store only holds entries written at *runtime*. The initial value
+        // for a statically prerendered route/handler is emitted at build to
+        // `<serverDistDir>/app|pages/<key>.body|.html|.meta` and is never
+        // written through this handler — so a plain store miss here would send
+        // Next off to regenerate the route on demand, discarding the build-time
+        // output (e.g. a `'use cache'` value computed during the build phase).
+        // Next's own FileSystemCache seeds itself from those files; since we
+        // replace it, we must reproduce that read-through.
+        const prerender = await this.getBuildPrerender(cacheKey, ctx);
+        if (prerender) {
+          this.log.debug(`HIT (build prerender): ${cacheKey} (${cacheType})`);
+          return prerender;
+        }
+
         this.log.debug(`MISS: ${cacheKey} (${cacheType})`);
         return null;
       }
@@ -285,6 +330,47 @@ export abstract class BaseCacheHandler {
       return entry;
     } catch (error) {
       this.log.error(`Error reading cache for key ${cacheKey}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Read-through to Next.js's built-in FileSystemCache for build-time
+   * prerendered routes, used only when our own store misses.
+   *
+   * Safe against revalidation: the FileSystemCache we build shares the process
+   * `tagsManifest` external singleton that {@link revalidateTag} writes to, so
+   * FileSystemCache's own `areTagsExpired` check suppresses a build prerender
+   * whose tag has since been revalidated (returns null) rather than resurrecting
+   * stale content. Applies to both file- and GCS-backed handlers because
+   * build-time prerenders always live on local disk in the deployed image.
+   */
+  private async getBuildPrerender(
+    cacheKey: CacheHandlerParametersGet[0],
+    ctx?: CacheHandlerParametersGet[1]
+  ): Promise<CacheHandlerValue | null> {
+    try {
+      if (!this.buildPrerenderFallbackInit) {
+        this.buildPrerenderFallbackInit = true;
+        const Ctor = await loadFileSystemCacheCtor();
+        if (Ctor) {
+          try {
+            this.buildPrerenderFallback = new Ctor(this.context);
+          } catch (error) {
+            this.log.warn('Build-prerender fallback unavailable:', error);
+            this.buildPrerenderFallback = null;
+          }
+        }
+      }
+
+      if (!this.buildPrerenderFallback) {
+        return null;
+      }
+
+      const entry = await this.buildPrerenderFallback.get(cacheKey, ctx);
+      return entry ?? null;
+    } catch (error) {
+      this.log.debug(`Build-prerender fallback failed for ${cacheKey}:`, error);
       return null;
     }
   }
