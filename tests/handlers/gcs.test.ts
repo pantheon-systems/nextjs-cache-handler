@@ -249,7 +249,11 @@ describe('GcsCacheHandler', () => {
   });
 
   describe('revalidateTag', () => {
-    it('should delete cache entries with matching tag', async () => {
+    // Staleness is tracked via Next's shared tagsManifest, not by deleting the
+    // stored entry — Next needs the last-good value to still be gettable so it
+    // can serve it once while revalidating in the background (see base.ts's
+    // revalidateTag for the full rationale).
+    it('should not delete cache entries with matching tag', async () => {
       // Setup: tags mapping with entries
       const tagsMapping = { posts: ['key1', 'key2'] };
       mockFile.exists.mockResolvedValue([true]);
@@ -258,8 +262,7 @@ describe('GcsCacheHandler', () => {
       const handler = new GcsCacheHandler({} as any);
       await handler.revalidateTag('posts');
 
-      // Verify delete was called
-      expect(mockFile.delete).toHaveBeenCalled();
+      expect(mockFile.delete).not.toHaveBeenCalled();
     });
 
     it('should handle non-existent tag gracefully', async () => {
