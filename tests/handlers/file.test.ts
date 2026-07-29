@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { FileCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/file.js';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 describe('FileCacheHandler', () => {
   let tempDir: string;
@@ -169,6 +170,43 @@ describe('FileCacheHandler', () => {
 
       expect(await handler.get('key1', { fetchIdx: 0 } as any)).not.toBeNull();
       expect(await handler.get('key2', { fetchIdx: 0 } as any)).not.toBeNull();
+    });
+
+    describe('durations.expire (soft staleness)', () => {
+      afterEach(() => {
+        tagsManifest.clear();
+      });
+
+      it('sets an immediate expiry when called without durations', async () => {
+        const before = Date.now();
+        await handler.revalidateTag('immediate-tag');
+        const after = Date.now();
+
+        const entry = tagsManifest.get('immediate-tag');
+        expect(entry?.expired).toBeGreaterThanOrEqual(before);
+        expect(entry?.expired).toBeLessThanOrEqual(after);
+      });
+
+      it('sets a future expiry equal to now + expire*1000 when durations.expire is provided', async () => {
+        const before = Date.now();
+        await handler.revalidateTag('soft-tag', { expire: 60 });
+        const after = Date.now();
+
+        const entry = tagsManifest.get('soft-tag');
+        expect(entry?.expired).toBeGreaterThanOrEqual(before + 60 * 1000);
+        expect(entry?.expired).toBeLessThanOrEqual(after + 60 * 1000);
+        // Confirms this is a genuinely future expiry, not an immediate one.
+        expect(entry?.expired).toBeGreaterThan(after);
+      });
+
+      it('preserves the existing expiry when durations is present but expire is undefined', async () => {
+        await handler.revalidateTag('profile-tag', { expire: 120 });
+        const softExpired = tagsManifest.get('profile-tag')?.expired;
+
+        await handler.revalidateTag('profile-tag', {});
+
+        expect(tagsManifest.get('profile-tag')?.expired).toBe(softExpired);
+      });
     });
   });
 

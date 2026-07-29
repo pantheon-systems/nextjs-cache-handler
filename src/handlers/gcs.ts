@@ -226,6 +226,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected override async onRevalidateComplete(tags: string[], affectedKeys: string[]): Promise<void> {
+    // Runs on every revalidation, including soft ones (durations.expire in the
+    // future): the CDN edge cache has no concept of "stale-while-revalidate"
+    // for tag invalidation, so it must be cleared immediately whenever a tag
+    // is revalidated, even though the origin's own stored entry is intentionally
+    // kept servable in the interim (see BaseCacheHandler.revalidateTag).
     if (affectedKeys.length === 0 || !this.edgeCacheClearer) {
       return;
     }

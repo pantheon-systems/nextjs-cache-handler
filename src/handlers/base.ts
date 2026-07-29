@@ -465,13 +465,24 @@ export abstract class BaseCacheHandler {
     // `durations.expire` (present when the caller passed a cacheLife profile,
     // e.g. `revalidateTag(tag, 'minutes')`) sets a FUTURE expiry, which keeps
     // areTagsExpired() false and areTagsStale() true — a soft/background
-    // revalidation. Omitting it (e.g. `updateTag()`, which never carries a
-    // profile) keeps the prior immediate/hard expiry — correct there, since
+    // revalidation. Omitting it while `durations` is still present (no
+    // `expire` on the profile) leaves any previously-set expiry untouched.
+    // No `durations` at all (e.g. `updateTag()`, which never carries a
+    // profile) forces an immediate/hard expiry — correct there, since
     // updateTag's whole point is read-your-own-writes within the same action.
+    // This mirrors Next's own FileSystemCache.revalidateTag exactly.
     const now = Date.now();
-    const expired = durations?.expire !== undefined ? now + durations.expire * 1000 : now;
     for (const currentTag of tagArray) {
-      tagsManifest.set(currentTag, { stale: now, expired });
+      const existingEntry = tagsManifest.get(currentTag) ?? {};
+      if (durations) {
+        const updates: { stale: number; expired?: number } = { ...existingEntry, stale: now };
+        if (durations.expire !== undefined) {
+          updates.expired = now + durations.expire * 1000;
+        }
+        tagsManifest.set(currentTag, updates);
+      } else {
+        tagsManifest.set(currentTag, { ...existingEntry, expired: now });
+      }
     }
 
     this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
