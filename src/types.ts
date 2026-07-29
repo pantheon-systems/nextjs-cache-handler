@@ -140,7 +140,10 @@ export declare class CacheHandler implements NextCacheHandler {
     }
   ): Promise<void>;
 
-  revalidateTag(tag: CacheHandlerParametersRevalidateTag[0]): Promise<void>;
+  revalidateTag(
+    tag: CacheHandlerParametersRevalidateTag[0],
+    durations?: CacheHandlerParametersRevalidateTag[1]
+  ): Promise<void>;
 
   resetRequestCache(): void;
 }

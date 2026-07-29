@@ -67,8 +67,11 @@ export abstract class BaseCacheHandler {
 
   // Read-through fallback to Next's built-in FileSystemCache for build-time
   // prerenders (lazily constructed on first miss). See getBuildPrerender.
-  private buildPrerenderFallback: FileSystemCacheLike | null = null;
-  private buildPrerenderFallbackInit = false;
+  // Memoized as an in-flight PROMISE (not a boolean flag) so concurrent
+  // callers racing on the first miss all await the same construction instead
+  // of a second caller observing the "already initializing" flag and reading
+  // the not-yet-assigned instance field as null (a false miss).
+  private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
     this.context = context;
@@ -110,7 +113,6 @@ export abstract class BaseCacheHandler {
     cacheValue: CacheHandlerValue,
     cacheType: 'fetch' | 'route'
   ): Promise<void>;
-  protected abstract deleteCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<void>;
 
   protected abstract readBuildMeta(): Promise<BuildMeta>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
@@ -133,18 +135,6 @@ export abstract class BaseCacheHandler {
       await this.writeTagsMapping(tagsMapping);
     } catch (error) {
       this.log.error('Error updating tags mapping:', error);
-    }
-  }
-
-  protected async updateTagsMappingBulkDelete(
-    cacheKeysToDelete: string[],
-    tagsMapping: Record<string, string[]>
-  ): Promise<void> {
-    try {
-      this.removeKeysFromAllTags(tagsMapping, cacheKeysToDelete);
-      await this.writeTagsMapping(tagsMapping);
-    } catch (error) {
-      this.log.error('Error bulk updating tags mapping:', error);
     }
   }
 
@@ -350,29 +340,36 @@ export abstract class BaseCacheHandler {
     ctx?: CacheHandlerParametersGet[1]
   ): Promise<CacheHandlerValue | null> {
     try {
-      if (!this.buildPrerenderFallbackInit) {
-        this.buildPrerenderFallbackInit = true;
-        const Ctor = await loadFileSystemCacheCtor();
-        if (Ctor) {
-          try {
-            this.buildPrerenderFallback = new Ctor(this.context);
-          } catch (error) {
-            this.log.warn('Build-prerender fallback unavailable:', error);
-            this.buildPrerenderFallback = null;
-          }
-        }
-      }
-
-      if (!this.buildPrerenderFallback) {
+      const fallback = await this.loadBuildPrerenderFallback();
+      if (!fallback) {
         return null;
       }
 
-      const entry = await this.buildPrerenderFallback.get(cacheKey, ctx);
+      const entry = await fallback.get(cacheKey, ctx);
       return entry ?? null;
     } catch (error) {
       this.log.debug(`Build-prerender fallback failed for ${cacheKey}:`, error);
       return null;
     }
+  }
+
+  private loadBuildPrerenderFallback(): Promise<FileSystemCacheLike | null> {
+    if (!this.buildPrerenderFallbackPromise) {
+      this.buildPrerenderFallbackPromise = (async () => {
+        const Ctor = await loadFileSystemCacheCtor();
+        if (!Ctor) {
+          return null;
+        }
+        try {
+          return new Ctor(this.context);
+        } catch (error) {
+          this.log.warn('Build-prerender fallback unavailable:', error);
+          return null;
+        }
+      })();
+    }
+
+    return this.buildPrerenderFallbackPromise;
   }
 
   async set(
@@ -426,11 +423,14 @@ export abstract class BaseCacheHandler {
     }
   }
 
-  async revalidateTag(tag: CacheHandlerParametersRevalidateTag[0]): Promise<void> {
+  async revalidateTag(
+    tag: CacheHandlerParametersRevalidateTag[0],
+    durations?: CacheHandlerParametersRevalidateTag[1]
+  ): Promise<void> {
     this.log.debug(`REVALIDATE TAG: ${tag}`);
 
     const tagArray = [tag].flat();
-    const deletedKeys: string[] = [];
+    const affectedKeys: string[] = [];
 
     let tagsMapping: Record<string, string[]>;
     try {
@@ -449,39 +449,53 @@ export abstract class BaseCacheHandler {
       }
 
       this.log.debug(`Found ${cacheKeysForTag.length} cache entries for tag: ${currentTag}`);
+      affectedKeys.push(...cacheKeysForTag);
+    }
 
-      for (const cacheKey of cacheKeysForTag) {
-        const deleted = await this.tryDeleteCacheEntry(cacheKey);
-        if (deleted) {
-          deletedKeys.push(cacheKey);
+    // Update Next.js's shared tagsManifest so the staleness checks the
+    // IncrementalCache wrapper runs on every subsequent get() (areTagsStale /
+    // areTagsExpired) recognise this tag as invalidated. We deliberately do
+    // NOT delete the underlying stored entries here (unlike Next's own
+    // built-in FileSystemCache.revalidateTag, which also never deletes
+    // anything): the last-good value must stay servable so Next can serve it
+    // once while revalidating in the background, and — for cacheComponents
+    // (PPR) routes — so a dynamic request can still find the cached postponed
+    // state to resume from instead of being forced into a full fresh render.
+    //
+    // `durations.expire` (present when the caller passed a cacheLife profile,
+    // e.g. `revalidateTag(tag, 'minutes')`) sets a FUTURE expiry, which keeps
+    // areTagsExpired() false and areTagsStale() true — a soft/background
+    // revalidation. Omitting it while `durations` is still present (no
+    // `expire` on the profile) leaves any previously-set expiry untouched.
+    // No `durations` at all (e.g. `updateTag()`, which never carries a
+    // profile) forces an immediate/hard expiry — correct there, since
+    // updateTag's whole point is read-your-own-writes within the same action.
+    // This mirrors Next's own FileSystemCache.revalidateTag exactly.
+    const now = Date.now();
+    for (const currentTag of tagArray) {
+      const existingEntry = tagsManifest.get(currentTag) ?? {};
+      if (durations) {
+        const updates: { stale: number; expired?: number } = { ...existingEntry, stale: now };
+        if (durations.expire !== undefined) {
+          updates.expired = now + durations.expire * 1000;
         }
+        tagsManifest.set(currentTag, updates);
+      } else {
+        tagsManifest.set(currentTag, { ...existingEntry, expired: now });
       }
     }
 
-    if (deletedKeys.length > 0) {
-      await this.updateTagsMappingBulkDelete(deletedKeys, tagsMapping);
-      this.log.debug(`Updated tags mapping after deleting ${deletedKeys.length} entries`);
-    }
-
-    // Update Next.js internal tagsManifest so the route-level staleness
-    // checks (areTagsStale / areTagsExpired) recognise this tag as invalidated.
-    // Without this, the response cache serves stale HTML without re-rendering.
-    const now = Date.now();
-    for (const currentTag of tagArray) {
-      tagsManifest.set(currentTag, { stale: now, expired: now });
-    }
-
-    this.log.info(`Revalidated ${deletedKeys.length} entries for tags: ${tagArray.join(', ')}`);
+    this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
-    await this.onRevalidateComplete(tagArray, deletedKeys);
+    await this.onRevalidateComplete(tagArray, affectedKeys);
   }
 
   /**
    * Hook called after revalidation is complete.
    * Subclasses can override to perform additional cleanup.
    */
-  protected async onRevalidateComplete(_tags: string[], _deletedKeys: string[]): Promise<void> {
+  protected async onRevalidateComplete(_tags: string[], _affectedKeys: string[]): Promise<void> {
     // Default implementation does nothing
   }
 
@@ -491,28 +505,6 @@ export abstract class BaseCacheHandler {
    */
   protected onRouteCacheSet(_cacheKey: string): void {
     // Default implementation does nothing
-  }
-
-  private async tryDeleteCacheEntry(cacheKey: string): Promise<boolean> {
-    // Try fetch cache first
-    try {
-      await this.deleteCacheEntry(cacheKey, 'fetch');
-      this.log.debug(`Deleted fetch cache entry: ${cacheKey}`);
-      return true;
-    } catch {
-      // Entry might not exist in fetch cache
-    }
-
-    // Try route cache
-    try {
-      await this.deleteCacheEntry(cacheKey, 'route');
-      this.log.debug(`Deleted route cache entry: ${cacheKey}`);
-      return true;
-    } catch {
-      this.log.warn(`Cache entry not found in either cache: ${cacheKey}`);
-    }
-
-    return false;
   }
 
   resetRequestCache(): void {

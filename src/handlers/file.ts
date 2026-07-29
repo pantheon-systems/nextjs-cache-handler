@@ -140,18 +140,6 @@ export class FileCacheHandler extends BaseCacheHandler {
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
   }
 
-  /**
-   * Override to use buffered deletes instead of immediate writes.
-   */
-  protected override async updateTagsMappingBulkDelete(
-    cacheKeysToDelete: string[],
-    _tagsMapping: Record<string, string[]>
-  ): Promise<void> {
-    this.tagsBuffer.deleteKeys(cacheKeysToDelete);
-    // Force flush after bulk delete to ensure consistency for revalidation
-    await this.tagsBuffer.flush();
-  }
-
   // ============================================================================
   // Cache entry implementation
   // ============================================================================
@@ -187,18 +175,6 @@ export class FileCacheHandler extends BaseCacheHandler {
       await writeFile(filePath, JSON.stringify(serializedData[cacheKey], null, 2), 'utf-8');
     } catch (error) {
       this.log.error(`Error writing cache entry ${cacheKey}:`, error);
-    }
-  }
-
-  protected async deleteCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<void> {
-    try {
-      const filePath = this.getCacheFilePath(cacheKey, cacheType);
-      await fs.promises.unlink(filePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        this.log.error(`Error deleting cache entry ${cacheKey}:`, error);
-      }
-      throw error;
     }
   }
 

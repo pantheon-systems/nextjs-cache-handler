@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { FileCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/file.js';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 describe('FileCacheHandler', () => {
   let tempDir: string;
@@ -127,26 +128,34 @@ describe('FileCacheHandler', () => {
   });
 
   describe('revalidateTag', () => {
-    it('should delete cache entries with matching tag', async () => {
+    // Entries stay servable (as "stale") after revalidateTag rather than being
+    // deleted outright. Next's own IncrementalCache wrapper is what decides
+    // staleness (via the shared tagsManifest, asserted in tags-manifest.test.ts)
+    // and needs the last-good value to still be gettable to serve it once while
+    // revalidating in the background — deleting it here would force every
+    // post-revalidate read into a synchronous full regenerate, which breaks
+    // Next's documented "first read stale, second read fresh" SWR contract
+    // (see the official resume-data-cache e2e suite).
+    it('should keep cache entries retrievable after revalidation (staleness is tracked via tagsManifest, not deletion)', async () => {
       await handler.set('key1', { kind: 'FETCH' as const } as any, { tags: ['posts'] });
       await handler.set('key2', { kind: 'FETCH' as const } as any, { tags: ['posts'] });
       await handler.set('key3', { kind: 'FETCH' as const } as any, { tags: ['other'] });
 
       await handler.revalidateTag('posts');
 
-      expect(await handler.get('key1', { fetchIdx: 0 } as any)).toBeNull();
-      expect(await handler.get('key2', { fetchIdx: 0 } as any)).toBeNull();
+      expect(await handler.get('key1', { fetchIdx: 0 } as any)).not.toBeNull();
+      expect(await handler.get('key2', { fetchIdx: 0 } as any)).not.toBeNull();
       expect(await handler.get('key3', { fetchIdx: 0 } as any)).not.toBeNull();
     });
 
-    it('should update tags mapping after revalidation', async () => {
+    it('should keep the tags mapping intact after revalidation', async () => {
       await handler.set('key1', { kind: 'FETCH' as const } as any, { tags: ['posts'] });
       await handler.revalidateTag('posts');
 
       const tagsFile = path.join(tempDir, '.next', 'cache', 'tags', 'tags.json');
       const tagsMapping = JSON.parse(fs.readFileSync(tagsFile, 'utf-8'));
 
-      expect(tagsMapping['posts']).toBeUndefined();
+      expect(tagsMapping['posts']).toContain('key1');
     });
 
     it('should handle non-existent tag gracefully', async () => {
@@ -159,8 +168,45 @@ describe('FileCacheHandler', () => {
 
       await handler.revalidateTag(['tag1', 'tag2'] as any);
 
-      expect(await handler.get('key1', { fetchIdx: 0 } as any)).toBeNull();
-      expect(await handler.get('key2', { fetchIdx: 0 } as any)).toBeNull();
+      expect(await handler.get('key1', { fetchIdx: 0 } as any)).not.toBeNull();
+      expect(await handler.get('key2', { fetchIdx: 0 } as any)).not.toBeNull();
+    });
+
+    describe('durations.expire (soft staleness)', () => {
+      afterEach(() => {
+        tagsManifest.clear();
+      });
+
+      it('sets an immediate expiry when called without durations', async () => {
+        const before = Date.now();
+        await handler.revalidateTag('immediate-tag');
+        const after = Date.now();
+
+        const entry = tagsManifest.get('immediate-tag');
+        expect(entry?.expired).toBeGreaterThanOrEqual(before);
+        expect(entry?.expired).toBeLessThanOrEqual(after);
+      });
+
+      it('sets a future expiry equal to now + expire*1000 when durations.expire is provided', async () => {
+        const before = Date.now();
+        await handler.revalidateTag('soft-tag', { expire: 60 });
+        const after = Date.now();
+
+        const entry = tagsManifest.get('soft-tag');
+        expect(entry?.expired).toBeGreaterThanOrEqual(before + 60 * 1000);
+        expect(entry?.expired).toBeLessThanOrEqual(after + 60 * 1000);
+        // Confirms this is a genuinely future expiry, not an immediate one.
+        expect(entry?.expired).toBeGreaterThan(after);
+      });
+
+      it('preserves the existing expiry when durations is present but expire is undefined', async () => {
+        await handler.revalidateTag('profile-tag', { expire: 120 });
+        const softExpired = tagsManifest.get('profile-tag')?.expired;
+
+        await handler.revalidateTag('profile-tag', {});
+
+        expect(tagsManifest.get('profile-tag')?.expired).toBe(softExpired);
+      });
     });
   });
 
@@ -333,11 +379,13 @@ describe('FileCacheHandler', () => {
       expect(tagsMapping['term-5']).toContain('/blogs');
       expect(tagsMapping['term-5']).toContain('/blogs/my-post');
 
-      // Now revalidate post-100 — should delete both pages
-      await handler.revalidateTag('post-100');
+      // Revalidating post-100 must not throw, and — since staleness is tracked
+      // via tagsManifest rather than deletion — both pages stay retrievable so
+      // Next can still serve them once while it regenerates in the background.
+      await expect(handler.revalidateTag('post-100')).resolves.not.toThrow();
 
-      expect(await handler.get('/blogs')).toBeNull();
-      expect(await handler.get('/blogs/my-post')).toBeNull();
+      expect(await handler.get('/blogs')).not.toBeNull();
+      expect(await handler.get('/blogs/my-post')).not.toBeNull();
     });
   });
 

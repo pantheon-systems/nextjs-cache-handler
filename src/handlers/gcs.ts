@@ -134,18 +134,6 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
   }
 
-  /**
-   * Override to use buffered deletes instead of immediate writes.
-   */
-  protected override async updateTagsMappingBulkDelete(
-    cacheKeysToDelete: string[],
-    _tagsMapping: Record<string, string[]>
-  ): Promise<void> {
-    this.tagsBuffer.deleteKeys(cacheKeysToDelete);
-    // Force flush after bulk delete to ensure consistency for revalidation
-    await this.tagsBuffer.flush();
-  }
-
   // ============================================================================
   // Cache entry implementation
   // ============================================================================
@@ -194,19 +182,6 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
   }
 
-  protected async deleteCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<void> {
-    try {
-      const gcsKey = this.getCacheKey(cacheKey, cacheType);
-      const file = this.bucket.file(gcsKey);
-      await file.delete();
-    } catch (error) {
-      if (!error || typeof error !== 'object' || !('code' in error) || (error as { code: number }).code !== 404) {
-        this.log.error(`Error deleting cache entry ${cacheKey}:`, error);
-      }
-      throw error;
-    }
-  }
-
   // ============================================================================
   // Build meta implementation
   // ============================================================================
@@ -250,8 +225,13 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.edgeCacheClearer.nukeCacheInBackground(context);
   }
 
-  protected override async onRevalidateComplete(tags: string[], deletedKeys: string[]): Promise<void> {
-    if (deletedKeys.length === 0 || !this.edgeCacheClearer) {
+  protected override async onRevalidateComplete(tags: string[], affectedKeys: string[]): Promise<void> {
+    // Runs on every revalidation, including soft ones (durations.expire in the
+    // future): the CDN edge cache has no concept of "stale-while-revalidate"
+    // for tag invalidation, so it must be cleared immediately whenever a tag
+    // is revalidated, even though the origin's own stored entry is intentionally
+    // kept servable in the interim (see BaseCacheHandler.revalidateTag).
+    if (affectedKeys.length === 0 || !this.edgeCacheClearer) {
       return;
     }
 
@@ -259,7 +239,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.edgeCacheClearer.clearKeysInBackground(tags, `tag revalidation: ${tags.join(', ')}`);
 
     // Also clear by route paths for routes that may not have tags (e.g., ISR routes)
-    const routePaths = this.extractRoutePaths(deletedKeys);
+    const routePaths = this.extractRoutePaths(affectedKeys);
     if (routePaths.length > 0) {
       this.edgeCacheClearer.clearPathsInBackground(routePaths, `path revalidation: ${routePaths.join(', ')}`);
     }
