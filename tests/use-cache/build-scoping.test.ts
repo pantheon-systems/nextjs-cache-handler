@@ -32,6 +32,10 @@ vi.mock('@google-cloud/storage', () => ({
   Bucket: vi.fn(),
 }));
 
+// Mock fetch for edge cache clearing (used by the "clears the edge cache on
+// a new build" tests below).
+vi.stubGlobal('fetch', vi.fn());
+
 const { UseCacheFileHandler } = await import('../../src/handlers/use-cache/file.js');
 const { UseCacheGcsHandler } = await import('../../src/handlers/use-cache/gcs.js');
 const { streamToBytes } = await import('../../src/utils/stream-serialization.js');
@@ -177,6 +181,51 @@ describe('use-cache build scoping', () => {
       const entry = await handlerB.get('sitemap', []);
       expect(entry).toBeDefined();
       expect(await readValue(entry!)).toBe('buildtime-B');
+    });
+
+    describe('edge cache purge on build invalidation', () => {
+      beforeEach(() => {
+        process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+        vi.mocked(fetch).mockClear();
+        vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      });
+
+      afterEach(() => {
+        delete process.env.OUTBOUND_PROXY_ENDPOINT;
+      });
+
+      it('clears the edge cache when a new build is detected', async () => {
+        const handlerA = new UseCacheGcsHandler();
+        // Wait for handlerA's own (first-run) checkBuildInvalidation to settle
+        // before switching build ids, so it can't be mistaken for handlerB's.
+        await handlerA.get('sitemap', []);
+        vi.mocked(fetch).mockClear();
+
+        mockBuildId = 'build-B';
+        const handlerB = new UseCacheGcsHandler();
+        // get()/set() await initPromise (which runs checkBuildInvalidation)
+        // before touching the store -- by the time this resolves, the purge
+        // request has been issued if a mismatch was found.
+        await handlerB.get('sitemap', []);
+
+        expect(fetch).toHaveBeenCalledWith(
+          'http://proxy.example.com:8080/rest/v0alpha1/cache',
+          expect.objectContaining({ method: 'DELETE' })
+        );
+      });
+
+      it('does not clear the edge cache when the build id is unchanged', async () => {
+        const handlerA = new UseCacheGcsHandler();
+        await handlerA.get('sitemap', []);
+        vi.mocked(fetch).mockClear();
+
+        // Same mockBuildId ('build-A') -- a second handler for the same build
+        // (e.g. a server restart with no redeploy) should not re-purge.
+        const handlerA2 = new UseCacheGcsHandler();
+        await handlerA2.get('sitemap', []);
+
+        expect(fetch).not.toHaveBeenCalled();
+      });
     });
   });
 });

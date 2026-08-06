@@ -51,8 +51,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
       handlerName: 'GcsCacheHandler',
     });
 
-    // Initialize asynchronously (don't await to avoid blocking constructor)
-    this.initialize().catch(() => {});
+    // Initialize asynchronously (constructors can't be async) -- stored via
+    // setInitPromise() so get()/set() can await it before touching the store.
+    this.setInitPromise(this.initialize().catch(() => {}));
   }
 
   // ============================================================================
@@ -205,8 +206,20 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const deletePromises = files.map((file) => file.delete());
       await Promise.all(deletePromises);
 
-      // Also clear the edge cache since route cache was invalidated
-      this.clearEdgeCache('route cache invalidation on new build');
+      // Awaited (unlike the ordinary tag-revalidation path below, which uses
+      // the fire-and-forget clearEdgeCache()/nukeCacheInBackground): this runs
+      // during startup-time build invalidation, which get()/set() now block
+      // on via ensureInitialized() before touching the store. Awaiting here
+      // means the edge purge request has actually been ISSUED (not just
+      // queued) before this process starts serving real traffic that could
+      // otherwise race a still-cached page from the previous build. Bounded
+      // by nukeCache()'s own internal timeout, so this can't hang startup.
+      if (this.edgeCacheClearer) {
+        const result = await this.edgeCacheClearer.nukeCache();
+        if (!result.success) {
+          this.log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
+        }
+      }
     } catch {
       // Silently fail - cache invalidation is best effort
     }

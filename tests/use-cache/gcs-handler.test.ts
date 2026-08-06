@@ -227,7 +227,10 @@ describe('UseCacheGcsHandler', () => {
       await handler.set('stored-key', Promise.resolve(entry));
 
       expect(mockFile.save).toHaveBeenCalled();
-      const savedData = JSON.parse(mockFile.save.mock.calls[0][0]);
+      // calls[0] is checkBuildInvalidation()'s own build-meta write (init is
+      // awaited via ensureInitialized() before set() proceeds); calls[1] is
+      // the actual cache entry write under test.
+      const savedData = JSON.parse(mockFile.save.mock.calls[1][0]);
       expect(savedData.tags).toEqual(['stored']);
     });
 
@@ -254,7 +257,9 @@ describe('UseCacheGcsHandler', () => {
       await handler.set('stream-key', Promise.resolve(entry));
 
       expect(mockFile.save).toHaveBeenCalled();
-      const savedData = JSON.parse(mockFile.save.mock.calls[0][0]);
+      // calls[0] is checkBuildInvalidation()'s own build-meta write; see the
+      // matching comment in the "should save cache entry to GCS" test above.
+      const savedData = JSON.parse(mockFile.save.mock.calls[1][0]);
       expect(typeof savedData.value).toBe('string');
       expect(Buffer.from(savedData.value, 'base64')).toEqual(Buffer.from(data));
     });

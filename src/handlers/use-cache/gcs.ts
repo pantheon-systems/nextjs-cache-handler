@@ -4,6 +4,12 @@ import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/st
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 import { getBuildId } from '../../utils/build-detection.js';
+import { EdgeCacheClear, createEdgeCacheClearer } from '../../edge/edge-cache-clear.js';
+
+interface BuildMeta {
+  buildId: string;
+  timestamp: number;
+}
 
 const log = createLogger('UseCacheGcsHandler');
 
@@ -25,6 +31,8 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   // comparing a fresh get()-time value against a fresh set()-time value would
   // spuriously mismatch even within the same build.
   private readonly buildId: string = getBuildId();
+  private readonly buildMetaKey: string;
+  private readonly edgeCacheClearer: EdgeCacheClear | null;
   private tagTimestamps: Map<string, number> = new Map();
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
@@ -41,6 +49,9 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     const envPrefix = getEnvironmentPrefix();
     this.cachePrefix = `${envPrefix}use-cache/`;
     this.tagsKey = `${this.cachePrefix}_tags.json`;
+    this.buildMetaKey = `${this.cachePrefix}_build-meta.json`;
+
+    this.edgeCacheClearer = createEdgeCacheClearer();
 
     // Initialize asynchronously but track the promise
     this.initPromise = this.initialize().catch(() => {});
@@ -51,7 +62,53 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private async initialize(): Promise<void> {
     if (this.initialized) return;
     await this.loadTagTimestamps();
+    // Unlike the per-entry __buildId check in get() (which only rejects a
+    // stale read once something happens to touch that specific entry), this
+    // proactively purges the EDGE cache the moment a new build is detected --
+    // without it, a page rendered via 'use cache' can keep being served stale
+    // from the CDN edge indefinitely after a redeploy, since nothing else in
+    // this handler ever tells Fastly to drop its copy.
+    await this.checkBuildInvalidation();
     this.initialized = true;
+  }
+
+  private async checkBuildInvalidation(): Promise<void> {
+    const file = this.bucket.file(this.buildMetaKey);
+
+    try {
+      const [exists] = await file.exists();
+      if (exists) {
+        const [data] = await file.download();
+        const meta: BuildMeta = JSON.parse(data.toString());
+
+        if (meta.buildId && meta.buildId !== this.buildId) {
+          log.info(`New build detected (${meta.buildId} -> ${this.buildId}), clearing edge cache`);
+
+          // Awaited, not the usual fire-and-forget nukeCacheInBackground used
+          // for ordinary tag revalidation elsewhere: get()/set() block on
+          // initPromise (via ensureInitialized()) before touching the store,
+          // so this guarantees the purge request has been issued before this
+          // process starts serving real traffic. Bounded by nukeCache()'s own
+          // internal timeout.
+          if (this.edgeCacheClearer) {
+            const result = await this.edgeCacheClearer.nukeCache();
+            if (!result.success) {
+              log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      log.warn('Error checking build invalidation:', error);
+    }
+
+    try {
+      await file.save(JSON.stringify({ buildId: this.buildId, timestamp: Date.now() }), {
+        metadata: { contentType: 'application/json' },
+      });
+    } catch (error) {
+      log.warn('Error writing build meta:', error);
+    }
   }
 
   private async ensureInitialized(): Promise<void> {
