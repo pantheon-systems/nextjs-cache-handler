@@ -3,6 +3,7 @@ import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo }
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
+import { getBuildId } from '../../utils/build-detection.js';
 
 const log = createLogger('UseCacheGcsHandler');
 
@@ -18,6 +19,12 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private readonly bucket: Bucket;
   private readonly cachePrefix: string;
   private readonly tagsKey: string;
+  // Resolved once per instance, not per call: getBuildId()'s last-resort
+  // fallback (no .next/BUILD_ID or build-manifest.json present) is
+  // `fallback-${Date.now()}`, which is NOT stable across separate calls --
+  // comparing a fresh get()-time value against a fresh set()-time value would
+  // spuriously mismatch even within the same build.
+  private readonly buildId: string = getBuildId();
   private tagTimestamps: Map<string, number> = new Map();
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
@@ -131,6 +138,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   async get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined> {
     log.debug(`GET: ${cacheKey}`);
 
+    // Tag timestamps are loaded asynchronously in the constructor; without this,
+    // a request racing the very first GET on a cold instance could read an
+    // empty tagTimestamps map and treat a tag-invalidated entry as still fresh.
+    await this.ensureInitialized();
+
     try {
       const gcsKey = this.getCacheKey(cacheKey);
       const file = this.bucket.file(gcsKey);
@@ -143,6 +155,24 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
       const [data] = await file.download();
       const stored = JSON.parse(data.toString());
+
+      // An entry written by a different build must never be served as current:
+      // this store is keyed by cache key + environment only (no build scoping),
+      // and Pantheon Multidev environments are reused/redeployed in place, so a
+      // stale build's entry would otherwise be indistinguishable from a fresh
+      // one whenever revalidate/tags never touch it. Entries written before this
+      // check existed have no `__buildId` and are treated as valid (no forced
+      // mass-invalidation on rollout).
+      if (stored.__buildId && stored.__buildId !== this.buildId) {
+        log.debug(`MISS: ${cacheKey} (stale build: ${stored.__buildId} != ${this.buildId})`);
+        try {
+          await file.delete();
+        } catch {
+          // Ignore deletion errors
+        }
+        return undefined;
+      }
+
       const entry = deserializeUseCacheEntry(stored);
 
       // Check expiration
@@ -173,6 +203,8 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   async set(cacheKey: string, pendingEntry: Promise<UseCacheEntry>): Promise<void> {
     log.debug(`SET: ${cacheKey}`);
 
+    await this.ensureInitialized();
+
     try {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
@@ -184,10 +216,13 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       }
 
       const serialized = await serializeUseCacheEntry(entry);
+      // __buildId is our own addition (not part of SerializedUseCacheEntry) --
+      // see the matching check in get().
+      const withBuildId = { ...serialized, __buildId: this.buildId };
       const gcsKey = this.getCacheKey(cacheKey);
       const file = this.bucket.file(gcsKey);
 
-      await file.save(JSON.stringify(serialized, null, 2), {
+      await file.save(JSON.stringify(withBuildId, null, 2), {
         metadata: { contentType: 'application/json' },
       });
 

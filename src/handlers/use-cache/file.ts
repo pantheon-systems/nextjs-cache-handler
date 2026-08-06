@@ -4,6 +4,7 @@ import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo }
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
+import { getBuildId } from '../../utils/build-detection.js';
 const log = createLogger('UseCacheFileHandler');
 
 /**
@@ -29,6 +30,12 @@ export interface UseCacheFileHandlerConfig {
 export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
+  // Resolved once per instance, not per call: getBuildId()'s last-resort
+  // fallback (no .next/BUILD_ID or build-manifest.json present) is
+  // `fallback-${Date.now()}`, which is NOT stable across separate calls --
+  // comparing a fresh get()-time value against a fresh set()-time value would
+  // spuriously mismatch even within the same build.
+  private readonly buildId: string = getBuildId();
   private tagTimestamps: Map<string, number> = new Map();
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
@@ -119,6 +126,19 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
       const data = fs.readFileSync(filePath, 'utf-8');
       const stored = JSON.parse(data);
+
+      // An entry written by a different build must never be served as current
+      // -- see the matching comment in the GCS handler's get().
+      if (stored.__buildId && stored.__buildId !== this.buildId) {
+        log.debug(`MISS: ${cacheKey} (stale build: ${stored.__buildId} != ${this.buildId})`);
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          // Ignore deletion errors
+        }
+        return undefined;
+      }
+
       const entry = deserializeUseCacheEntry(stored);
 
       // Check expiration
@@ -160,9 +180,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
       }
 
       const serialized = await serializeUseCacheEntry(entry);
+      // __buildId is our own addition (not part of SerializedUseCacheEntry) --
+      // see the matching check in get().
+      const withBuildId = { ...serialized, __buildId: this.buildId };
       const filePath = this.getCacheFilePath(cacheKey);
 
-      fs.writeFileSync(filePath, JSON.stringify(serialized, null, 2), 'utf-8');
+      fs.writeFileSync(filePath, JSON.stringify(withBuildId, null, 2), 'utf-8');
 
       log.debug(`Cached ${cacheKey} with ${entry.tags?.length ?? 0} tags`);
     } catch (error) {
