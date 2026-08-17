@@ -138,6 +138,50 @@ describe('GcsCacheHandler', () => {
 
       expect(mockBucket.file).toHaveBeenCalledWith('route-cache/key.json');
     });
+
+    it('should use image-cache prefix for image optimizer requests (kind: IMAGE ctx)', async () => {
+      mockFile.exists.mockResolvedValue([false]);
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.get('key', { kind: 'IMAGE', isFallback: false } as any);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('image-cache/key.json');
+    });
+
+    it('should round-trip the image buffer through base64 storage', async () => {
+      const buffer = Buffer.from('fake-jpeg-bytes');
+      const cachedData = {
+        value: { kind: 'IMAGE', etag: 'abc', upstreamEtag: 'def', extension: 'jpg', buffer },
+        lastModified: 1234567890,
+        tags: [],
+      };
+
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([
+        Buffer.from(
+          JSON.stringify({
+            ...cachedData,
+            value: { ...cachedData.value, buffer: { type: 'Buffer', data: buffer.toString('base64') } },
+          })
+        ),
+      ]);
+
+      const handler = new GcsCacheHandler({} as any);
+      const result = await handler.get('key', { kind: 'IMAGE', isFallback: false } as any);
+
+      expect(mockBucket.file).toHaveBeenCalledWith('image-cache/key.json');
+      expect(Buffer.isBuffer((result?.value as any).buffer)).toBe(true);
+      expect((result?.value as any).buffer.toString()).toBe('fake-jpeg-bytes');
+    });
+
+    it('does not fall through to the build-prerender fallback on an image miss', async () => {
+      mockFile.exists.mockResolvedValue([false]);
+
+      const handler = new GcsCacheHandler({} as any);
+      const result = await handler.get('missing-image', { kind: 'IMAGE', isFallback: false } as any);
+
+      expect(result).toBeNull();
+    });
   });
 
   describe('set', () => {
@@ -172,6 +216,23 @@ describe('GcsCacheHandler', () => {
       await handler.set('key', { kind: 'APP_PAGE' as const } as any, { tags: [] });
 
       expect(mockBucket.file).toHaveBeenCalledWith('route-cache/key.json');
+    });
+
+    it('should use image-cache prefix for IMAGE kind and base64-encode the buffer', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new GcsCacheHandler({} as any);
+      const buffer = Buffer.from('fake-jpeg-bytes');
+      await handler.set(
+        'key',
+        { kind: 'IMAGE' as const, etag: 'abc', upstreamEtag: 'def', extension: 'jpg', buffer } as any,
+        { cacheControl: { revalidate: 60 } } as any
+      );
+
+      expect(mockBucket.file).toHaveBeenCalledWith('image-cache/key.json');
+      const savedData = JSON.parse(mockFile.save.mock.calls[0][0]);
+      expect(savedData.value.buffer).toEqual({ type: 'Buffer', data: buffer.toString('base64') });
     });
 
     it('should clear edge cache when setting route cache entry (ISR update)', async () => {

@@ -58,6 +58,30 @@ describe('serialization', () => {
       });
     });
 
+    it('should convert the image cache buffer to base64 serialized format', () => {
+      const buffer = Buffer.from('fake-jpeg-bytes');
+      const data = {
+        'test-key': {
+          value: { kind: 'IMAGE', etag: 'abc', upstreamEtag: 'def', extension: 'jpg', buffer },
+          lastModified: 1234567890,
+          tags: [],
+        },
+      };
+
+      const result = serializeForStorage(data);
+
+      expect(result['test-key'].value).toEqual({
+        kind: 'IMAGE',
+        etag: 'abc',
+        upstreamEtag: 'def',
+        extension: 'jpg',
+        buffer: {
+          type: 'Buffer',
+          data: buffer.toString('base64'),
+        },
+      });
+    });
+
     it('should convert Map with Buffers to serialized format', () => {
       const segmentMap = new Map<string, Buffer>();
       segmentMap.set('segment1', Buffer.from('data1'));
@@ -150,6 +174,28 @@ describe('serialization', () => {
 
       expect(Buffer.isBuffer((result['test-key'] as any).value.rscData)).toBe(true);
       expect((result['test-key'] as any).value.rscData.toString()).toBe(originalContent);
+    });
+
+    it('should convert the serialized image cache buffer back to a Buffer', () => {
+      const originalContent = 'fake-jpeg-bytes';
+      const data = {
+        'test-key': {
+          value: {
+            kind: 'IMAGE' as const,
+            buffer: {
+              type: 'Buffer' as const,
+              data: Buffer.from(originalContent).toString('base64'),
+            },
+          },
+          lastModified: 1234567890,
+          tags: [],
+        },
+      };
+
+      const result = deserializeFromStorage(data);
+
+      expect(Buffer.isBuffer((result['test-key'] as any).value.buffer)).toBe(true);
+      expect((result['test-key'] as any).value.buffer.toString()).toBe(originalContent);
     });
 
     it('should convert serialized Map back to Map with Buffers', () => {

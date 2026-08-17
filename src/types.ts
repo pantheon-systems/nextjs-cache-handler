@@ -40,6 +40,13 @@ export interface CacheEntry {
   tags: string[];
 }
 
+/**
+ * The three storage buckets a cache entry can land in: Next's ISR/route
+ * cache, the fetch ('use cache' / data) cache, and the `/_next/image`
+ * optimizer cache (opted into via `images.customCacheHandler: true`).
+ */
+export type CacheEntryType = 'fetch' | 'route' | 'image';
+
 export interface CacheData {
   [key: string]: unknown;
 }
@@ -85,7 +92,7 @@ export interface CacheEntryInfo {
   key: string;
   tags: string[];
   lastModified?: number;
-  type: 'fetch' | 'route';
+  type: CacheEntryType;
 }
 
 export interface CacheStats {
