@@ -1,5 +1,6 @@
 import type {
   CacheData,
+  CacheEntryType,
   CacheHandlerParametersGet,
   CacheHandlerParametersSet,
   CacheHandlerParametersRevalidateTag,
@@ -73,6 +74,15 @@ export abstract class BaseCacheHandler {
   // the not-yet-assigned instance field as null (a false miss).
   private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
+  // Tracks the in-flight initialize() call so get()/set() can await it before
+  // touching the store. Without this, a request's get() could race ahead of
+  // checkBuildInvalidation() below and read a stale route-cache entry left
+  // over from the previous build, before this process has had a chance to
+  // wipe it -- initialize() itself can't be awaited from the constructor (JS
+  // constructors can't be async), so this is the only place that gap can
+  // close. Cleared to null once awaited so later get()/set() calls short-circuit.
+  private initPromise: Promise<void> | null = null;
+
   constructor(context: FileSystemCacheContext, handlerName: string) {
     this.context = context;
     this.handlerName = handlerName;
@@ -81,6 +91,22 @@ export abstract class BaseCacheHandler {
     // Only log during server runtime, not during build (too noisy with parallel workers)
     if (!isBuildPhase()) {
       this.log.info('Initializing cache handler');
+    }
+  }
+
+  /**
+   * Subclass constructors must assign the result of initialize() here
+   * (`this.initPromise = this.initialize().catch(() => {})`) instead of
+   * calling initialize() directly, so get()/set() below can await it.
+   */
+  protected setInitPromise(promise: Promise<void>): void {
+    this.initPromise = promise;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.initPromise) {
+      await this.initPromise;
+      this.initPromise = null;
     }
   }
 
@@ -107,11 +133,11 @@ export abstract class BaseCacheHandler {
   protected abstract readTagsMapping(): Promise<Record<string, string[]>>;
   protected abstract writeTagsMapping(tagsMapping: Record<string, string[]>): Promise<void>;
 
-  protected abstract readCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<CacheHandlerValue | null>;
+  protected abstract readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null>;
   protected abstract writeCacheEntry(
     cacheKey: string,
     cacheValue: CacheHandlerValue,
-    cacheType: 'fetch' | 'route'
+    cacheType: CacheEntryType
   ): Promise<void>;
 
   protected abstract readBuildMeta(): Promise<BuildMeta>;
@@ -210,9 +236,16 @@ export abstract class BaseCacheHandler {
   // Cache type determination
   // ============================================================================
 
-  protected determineCacheType(ctx?: CacheHandlerParametersGet[1]): 'fetch' | 'route' {
+  protected determineCacheType(ctx?: CacheHandlerParametersGet[1]): CacheEntryType {
     if (!ctx) {
       return 'route';
+    }
+
+    // The image optimizer (`images.customCacheHandler: true`) calls get() with
+    // `{ kind: 'IMAGE', isFallback: false }` — check this before the fetch checks
+    // below, since it doesn't carry any of the fetchCache/fetchUrl/fetchIdx fields.
+    if ('kind' in ctx && ctx.kind === 'IMAGE') {
+      return 'image';
     }
 
     if ('fetchCache' in ctx && ctx.fetchCache === true) {
@@ -230,14 +263,14 @@ export abstract class BaseCacheHandler {
     return 'route';
   }
 
-  protected determineCacheTypeFromValue(incrementalCacheValue: CacheHandlerParametersSet[1]): 'fetch' | 'route' {
-    if (
-      incrementalCacheValue &&
-      typeof incrementalCacheValue === 'object' &&
-      'kind' in incrementalCacheValue &&
-      incrementalCacheValue.kind === 'FETCH'
-    ) {
-      return 'fetch';
+  protected determineCacheTypeFromValue(incrementalCacheValue: CacheHandlerParametersSet[1]): CacheEntryType {
+    if (incrementalCacheValue && typeof incrementalCacheValue === 'object' && 'kind' in incrementalCacheValue) {
+      if (incrementalCacheValue.kind === 'FETCH') {
+        return 'fetch';
+      }
+      if (incrementalCacheValue.kind === 'IMAGE') {
+        return 'image';
+      }
     }
     return 'route';
   }
@@ -289,6 +322,12 @@ export abstract class BaseCacheHandler {
   ): Promise<CacheHandlerValue | null> {
     this.log.debug(`GET: ${cacheKey}`);
 
+    // Without this, a request racing the very first GET on a cold instance
+    // could read a route-cache entry left over from the previous build,
+    // before checkBuildInvalidation() (in initialize()) has had a chance to
+    // wipe it.
+    await this.ensureInitialized();
+
     try {
       const cacheType = this.determineCacheType(ctx);
       const entry = await this.readCacheEntry(cacheKey, cacheType);
@@ -302,10 +341,17 @@ export abstract class BaseCacheHandler {
         // output (e.g. a `'use cache'` value computed during the build phase).
         // Next's own FileSystemCache seeds itself from those files; since we
         // replace it, we must reproduce that read-through.
-        const prerender = await this.getBuildPrerender(cacheKey, ctx);
-        if (prerender) {
-          this.log.debug(`HIT (build prerender): ${cacheKey} (${cacheType})`);
-          return prerender;
+        //
+        // Doesn't apply to images: `/_next/image` requests are always resolved
+        // on demand (never build-time prerendered), and this fallback delegates
+        // to Next's page/fetch FileSystemCache, which doesn't understand the
+        // `kind: 'IMAGE'` ctx shape.
+        if (cacheType !== 'image') {
+          const prerender = await this.getBuildPrerender(cacheKey, ctx);
+          if (prerender) {
+            this.log.debug(`HIT (build prerender): ${cacheKey} (${cacheType})`);
+            return prerender;
+          }
         }
 
         this.log.debug(`MISS: ${cacheKey} (${cacheType})`);
@@ -380,6 +426,11 @@ export abstract class BaseCacheHandler {
       revalidate?: Revalidate;
     }
   ): Promise<void> {
+    // Same race as get() above -- a write racing ahead of build invalidation
+    // could persist a fresh entry that the still-pending wipe would then
+    // incorrectly delete.
+    await this.ensureInitialized();
+
     const cacheType = this.determineCacheTypeFromValue(incrementalCacheValue);
 
     this.log.debug(`SET: ${cacheKey} (${cacheType})`, {

@@ -1,5 +1,5 @@
 import { Bucket, Storage } from '@google-cloud/storage';
-import type { CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
@@ -17,6 +17,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private readonly bucket: Bucket;
   private readonly fetchCachePrefix: string;
   private readonly routeCachePrefix: string;
+  private readonly imageCachePrefix: string;
   private readonly buildMetaKey: string;
   private readonly tagsPrefix: string;
   private readonly tagsMapKey: string;
@@ -37,6 +38,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     const envPrefix = getEnvironmentPrefix();
     this.fetchCachePrefix = `${envPrefix}fetch-cache/`;
     this.routeCachePrefix = `${envPrefix}route-cache/`;
+    this.imageCachePrefix = `${envPrefix}image-cache/`;
     this.buildMetaKey = `${envPrefix}build-meta.json`;
     this.tagsPrefix = `${envPrefix}cache/tags/`;
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
@@ -51,8 +53,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
       handlerName: 'GcsCacheHandler',
     });
 
-    // Initialize asynchronously (don't await to avoid blocking constructor)
-    this.initialize().catch(() => {});
+    // Initialize asynchronously (constructors can't be async) -- stored via
+    // setInitPromise() so get()/set() can await it before touching the store.
+    this.setInitPromise(this.initialize().catch(() => {}));
   }
 
   // ============================================================================
@@ -138,13 +141,14 @@ export class GcsCacheHandler extends BaseCacheHandler {
   // Cache entry implementation
   // ============================================================================
 
-  private getCacheKey(cacheKey: string, cacheType: 'fetch' | 'route'): string {
+  private getCacheKey(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    const prefix = cacheType === 'fetch' ? this.fetchCachePrefix : this.routeCachePrefix;
+    const prefix =
+      cacheType === 'fetch' ? this.fetchCachePrefix : cacheType === 'image' ? this.imageCachePrefix : this.routeCachePrefix;
     return `${prefix}${safeKey}.json`;
   }
 
-  protected async readCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<CacheHandlerValue | null> {
+  protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
     try {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
       const file = this.bucket.file(gcsKey);
@@ -166,7 +170,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   protected async writeCacheEntry(
     cacheKey: string,
     cacheValue: CacheHandlerValue,
-    cacheType: 'fetch' | 'route'
+    cacheType: CacheEntryType
   ): Promise<void> {
     try {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
@@ -205,8 +209,20 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const deletePromises = files.map((file) => file.delete());
       await Promise.all(deletePromises);
 
-      // Also clear the edge cache since route cache was invalidated
-      this.clearEdgeCache('route cache invalidation on new build');
+      // Awaited (unlike the ordinary tag-revalidation path below, which uses
+      // the fire-and-forget clearEdgeCache()/nukeCacheInBackground): this runs
+      // during startup-time build invalidation, which get()/set() now block
+      // on via ensureInitialized() before touching the store. Awaiting here
+      // means the edge purge request has actually been ISSUED (not just
+      // queued) before this process starts serving real traffic that could
+      // otherwise race a still-cached page from the previous build. Bounded
+      // by nukeCache()'s own internal timeout, so this can't hang startup.
+      if (this.edgeCacheClearer) {
+        const result = await this.edgeCacheClearer.nukeCache();
+        if (!result.success) {
+          this.log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
+        }
+      }
     } catch {
       // Silently fail - cache invalidation is best effort
     }
@@ -305,6 +321,7 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   const envPrefix = getEnvironmentPrefix();
   const fetchCachePrefix = `${envPrefix}fetch-cache/`;
   const routeCachePrefix = `${envPrefix}route-cache/`;
+  const imageCachePrefix = `${envPrefix}image-cache/`;
 
   const keys: string[] = [];
   const entries: CacheEntryInfo[] = [];
@@ -312,11 +329,13 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   try {
     await processGcsCachePrefix(bucket, fetchCachePrefix, 'fetch', keys, entries);
     await processGcsCachePrefix(bucket, routeCachePrefix, 'route', keys, entries);
+    await processGcsCachePrefix(bucket, imageCachePrefix, 'image', keys, entries);
 
     gcsLog.debug(
       `Found ${keys.length} cache entries ` +
         `(${keys.filter((k) => k.startsWith('fetch:')).length} fetch, ` +
-        `${keys.filter((k) => k.startsWith('route:')).length} route)`
+        `${keys.filter((k) => k.startsWith('route:')).length} route, ` +
+        `${keys.filter((k) => k.startsWith('image:')).length} image)`
     );
 
     return { size: keys.length, keys, entries };
@@ -329,7 +348,7 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
 async function processGcsCachePrefix(
   bucket: Bucket,
   prefix: string,
-  cacheType: 'fetch' | 'route',
+  cacheType: CacheEntryType,
   keys: string[],
   entries: CacheEntryInfo[]
 ): Promise<void> {
@@ -348,7 +367,7 @@ async function processGcsCachePrefix(
 async function processGcsFile(
   file: { name: string; download: () => Promise<[Buffer]> },
   prefix: string,
-  cacheType: 'fetch' | 'route',
+  cacheType: CacheEntryType,
   keys: string[],
   entries: CacheEntryInfo[]
 ): Promise<void> {
@@ -391,6 +410,7 @@ export async function clearSharedCache(): Promise<number> {
   const envPrefix = getEnvironmentPrefix();
   const fetchCachePrefix = `${envPrefix}fetch-cache/`;
   const routeCachePrefix = `${envPrefix}route-cache/`;
+  const imageCachePrefix = `${envPrefix}image-cache/`;
   const tagsFilePath = `${envPrefix}cache/tags/tags.json`;
 
   const staticRoutes = getStaticRoutes();
@@ -403,6 +423,9 @@ export async function clearSharedCache(): Promise<number> {
     // Clear route cache (skip static routes)
     const routeResult = await clearGcsRouteCache(bucket, routeCachePrefix, staticRoutes);
     clearedCount += routeResult.cleared;
+
+    // Clear image cache (content-derived, no build/static-route scoping needed)
+    clearedCount += await clearGcsFetchCache(bucket, imageCachePrefix);
 
     // Clear tags mapping
     await clearGcsTagsMapping(bucket, tagsFilePath);

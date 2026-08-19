@@ -77,6 +77,11 @@ function serializeValue(value: Record<string, unknown>): SerializableValue {
     serializedValue.rscData = bufferToSerializable(serializedValue.rscData as Buffer);
   }
 
+  // Convert the image optimizer cache's buffer (kind: 'IMAGE') to base64 for storage
+  if (isBuffer(serializedValue.buffer)) {
+    serializedValue.buffer = bufferToSerializable(serializedValue.buffer as Buffer);
+  }
+
   // Handle segmentData if it's a Map with Buffers
   if (serializedValue.segmentData instanceof Map) {
     serializedValue.segmentData = mapToSerializable(serializedValue.segmentData);
@@ -96,6 +101,11 @@ function deserializeValue(value: Record<string, unknown>): Record<string, unknow
   // Convert base64 string back to Buffer for rscData
   if (isSerializedBuffer(deserializedValue.rscData)) {
     deserializedValue.rscData = serializableToBuffer(deserializedValue.rscData as SerializedBuffer);
+  }
+
+  // Convert the image optimizer cache's buffer back from base64
+  if (isSerializedBuffer(deserializedValue.buffer)) {
+    deserializedValue.buffer = serializableToBuffer(deserializedValue.buffer as SerializedBuffer);
   }
 
   // Convert serialized Map back to Map with Buffers

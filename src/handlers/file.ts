@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import type { CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
@@ -22,6 +22,7 @@ export class FileCacheHandler extends BaseCacheHandler {
   private readonly baseDir: string;
   private readonly fetchCacheDir: string;
   private readonly routeCacheDir: string;
+  private readonly imageCacheDir: string;
   private readonly buildMetaFile: string;
   private readonly tagsDir: string;
   private readonly tagsMapFile: string;
@@ -33,6 +34,7 @@ export class FileCacheHandler extends BaseCacheHandler {
     this.baseDir = path.join(process.cwd(), '.next', 'cache');
     this.fetchCacheDir = path.join(this.baseDir, 'fetch-cache');
     this.routeCacheDir = path.join(this.baseDir, 'route-cache');
+    this.imageCacheDir = path.join(this.baseDir, 'image-cache');
     // Store build-meta.json outside .next/ to survive Next.js cache clearing during builds
     this.buildMetaFile = path.join(process.cwd(), '.cache', 'build-meta.json');
     this.tagsDir = path.join(this.baseDir, 'tags');
@@ -58,6 +60,7 @@ export class FileCacheHandler extends BaseCacheHandler {
     try {
       fs.mkdirSync(this.fetchCacheDir, { recursive: true });
       fs.mkdirSync(this.routeCacheDir, { recursive: true });
+      fs.mkdirSync(this.imageCacheDir, { recursive: true });
       fs.mkdirSync(this.tagsDir, { recursive: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
@@ -144,15 +147,15 @@ export class FileCacheHandler extends BaseCacheHandler {
   // Cache entry implementation
   // ============================================================================
 
-  private getCacheFilePath(cacheKey: string, cacheType: 'fetch' | 'route'): string {
+  private getCacheFilePath(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    const dir = cacheType === 'fetch' ? this.fetchCacheDir : this.routeCacheDir;
+    const dir = cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
     // safeJoin guarantees the resolved path stays within the cache directory,
     // in addition to the character sanitization applied to the key above.
     return safeJoin(dir, `${safeKey}.json`);
   }
 
-  protected async readCacheEntry(cacheKey: string, cacheType: 'fetch' | 'route'): Promise<CacheHandlerValue | null> {
+  protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
     try {
       const filePath = this.getCacheFilePath(cacheKey, cacheType);
       const data = await readFile(filePath, 'utf-8');
@@ -166,7 +169,7 @@ export class FileCacheHandler extends BaseCacheHandler {
   protected async writeCacheEntry(
     cacheKey: string,
     cacheValue: CacheHandlerValue,
-    cacheType: 'fetch' | 'route'
+    cacheType: CacheEntryType
   ): Promise<void> {
     try {
       this.ensureCacheDir();
@@ -213,6 +216,7 @@ export class FileCacheHandler extends BaseCacheHandler {
 export async function getSharedCacheStats(): Promise<CacheStats> {
   const fetchCacheDir = path.join(process.cwd(), '.next', 'cache', 'fetch-cache');
   const routeCacheDir = path.join(process.cwd(), '.next', 'cache', 'route-cache');
+  const imageCacheDir = path.join(process.cwd(), '.next', 'cache', 'image-cache');
 
   const keys: string[] = [];
   const entries: CacheEntryInfo[] = [];
@@ -220,11 +224,13 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   try {
     await processCacheDirectory(fetchCacheDir, 'fetch', keys, entries);
     await processCacheDirectory(routeCacheDir, 'route', keys, entries);
+    await processCacheDirectory(imageCacheDir, 'image', keys, entries);
 
     fileLog.debug(
       `Found ${keys.length} cache entries ` +
         `(${keys.filter((k) => k.startsWith('fetch:')).length} fetch, ` +
-        `${keys.filter((k) => k.startsWith('route:')).length} route)`
+        `${keys.filter((k) => k.startsWith('route:')).length} route, ` +
+        `${keys.filter((k) => k.startsWith('image:')).length} image)`
     );
 
     return { size: keys.length, keys, entries };
@@ -236,7 +242,7 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
 
 async function processCacheDirectory(
   dir: string,
-  cacheType: 'fetch' | 'route',
+  cacheType: CacheEntryType,
   keys: string[],
   entries: CacheEntryInfo[]
 ): Promise<void> {
@@ -255,7 +261,7 @@ async function processCacheDirectory(
 async function processJsonCacheFile(
   dir: string,
   file: string,
-  cacheType: 'fetch' | 'route',
+  cacheType: CacheEntryType,
   keys: string[],
   entries: CacheEntryInfo[]
 ): Promise<void> {
@@ -289,6 +295,7 @@ async function processJsonCacheFile(
 export async function clearSharedCache(): Promise<number> {
   const fetchCacheDir = path.join(process.cwd(), '.next', 'cache', 'fetch-cache');
   const routeCacheDir = path.join(process.cwd(), '.next', 'cache', 'route-cache');
+  const imageCacheDir = path.join(process.cwd(), '.next', 'cache', 'image-cache');
   const tagsFilePath = path.join(process.cwd(), '.next', 'cache', 'tags', 'tags.json');
 
   const staticRoutes = getStaticRoutes();
@@ -303,6 +310,9 @@ export async function clearSharedCache(): Promise<number> {
     const routeResult = await clearRouteCache(routeCacheDir, staticRoutes);
     clearedCount += routeResult.cleared;
     preservedCount = routeResult.preserved;
+
+    // Clear image cache (content-derived, no build/static-route scoping needed)
+    clearedCount += await clearFetchCache(imageCacheDir);
 
     // Clear tags mapping
     await clearTagsMapping(tagsFilePath);

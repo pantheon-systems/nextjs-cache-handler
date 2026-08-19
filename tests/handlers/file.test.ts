@@ -37,6 +37,7 @@ describe('FileCacheHandler', () => {
     it('should create cache directories', () => {
       expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'fetch-cache'))).toBe(true);
       expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache'))).toBe(true);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache'))).toBe(true);
       expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'tags'))).toBe(true);
     });
 
@@ -85,6 +86,30 @@ describe('FileCacheHandler', () => {
       expect(result).not.toBeNull();
       expect(Buffer.isBuffer((result?.value as any).body)).toBe(true);
       expect((result?.value as any).body.toString()).toBe('test content');
+    });
+
+    it('should store image optimizer cache entries under image-cache/ and round-trip the buffer', async () => {
+      const buffer = Buffer.from('fake-jpeg-bytes');
+      const cacheValue = { kind: 'IMAGE' as const, etag: 'abc', upstreamEtag: 'def', extension: 'jpg', buffer };
+
+      await handler.set('image-key', cacheValue as any, { cacheControl: { revalidate: 60 } } as any);
+
+      expect(
+        fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))
+      ).toBe(true);
+      expect(
+        fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))
+      ).toBe(false);
+
+      const result = await handler.get('image-key', { kind: 'IMAGE', isFallback: false } as any);
+      expect(result).not.toBeNull();
+      expect(Buffer.isBuffer((result?.value as any).buffer)).toBe(true);
+      expect((result?.value as any).buffer.toString()).toBe('fake-jpeg-bytes');
+    });
+
+    it('should not fall through to the build-prerender fallback on an image miss', async () => {
+      const result = await handler.get('missing-image', { kind: 'IMAGE', isFallback: false } as any);
+      expect(result).toBeNull();
     });
 
     it('should set lastModified timestamp', async () => {
@@ -423,6 +448,8 @@ describe('getSharedCacheStats', () => {
     // Create some cache files
     const fetchCacheDir = path.join(tempDir, '.next', 'cache', 'fetch-cache');
     const routeCacheDir = path.join(tempDir, '.next', 'cache', 'route-cache');
+    const imageCacheDir = path.join(tempDir, '.next', 'cache', 'image-cache');
+    fs.mkdirSync(imageCacheDir, { recursive: true });
 
     fs.writeFileSync(
       path.join(fetchCacheDir, 'fetch_key.json'),
@@ -432,12 +459,17 @@ describe('getSharedCacheStats', () => {
       path.join(routeCacheDir, 'route_key.json'),
       JSON.stringify({ tags: ['tag2'], lastModified: 1234567891 })
     );
+    fs.writeFileSync(
+      path.join(imageCacheDir, 'image_key.json'),
+      JSON.stringify({ tags: [], lastModified: 1234567892 })
+    );
 
     const stats = await getSharedCacheStats();
 
-    expect(stats.size).toBe(2);
+    expect(stats.size).toBe(3);
     expect(stats.keys).toContain('fetch:fetch-key');
     expect(stats.keys).toContain('route:route-key');
+    expect(stats.keys).toContain('image:image-key');
   });
 });
 
@@ -460,16 +492,20 @@ describe('clearSharedCache', () => {
   it('should clear all cache entries', async () => {
     const fetchCacheDir = path.join(tempDir, '.next', 'cache', 'fetch-cache');
     const routeCacheDir = path.join(tempDir, '.next', 'cache', 'route-cache');
+    const imageCacheDir = path.join(tempDir, '.next', 'cache', 'image-cache');
+    fs.mkdirSync(imageCacheDir, { recursive: true });
 
     fs.writeFileSync(path.join(fetchCacheDir, 'key1.json'), '{}');
     fs.writeFileSync(path.join(fetchCacheDir, 'key2.json'), '{}');
     fs.writeFileSync(path.join(routeCacheDir, 'key3.json'), '{}');
+    fs.writeFileSync(path.join(imageCacheDir, 'key4.json'), '{}');
 
     const cleared = await clearSharedCache();
 
-    expect(cleared).toBe(3);
+    expect(cleared).toBe(4);
     expect(fs.readdirSync(fetchCacheDir)).toHaveLength(0);
     expect(fs.readdirSync(routeCacheDir)).toHaveLength(0);
+    expect(fs.readdirSync(imageCacheDir)).toHaveLength(0);
   });
 
   it('should clear tags mapping file', async () => {
