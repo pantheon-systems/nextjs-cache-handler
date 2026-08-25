@@ -136,14 +136,15 @@ describe('EdgeCacheClear', () => {
       const clearer = new EdgeCacheClear();
       await clearer.clearPaths(['blog/post']);
 
-      // Double-encoded: blog/post -> blog%2Fpost -> blog%252Fpost
+      // Single-encoded: blog/post -> blog%2Fpost (tenant-outbound-proxy adds its own
+      // encode pass on top of this to reach the gateway's expected two total passes).
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent(encodeURIComponent('blog/post'))}`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('blog/post')}`,
         expect.any(Object)
       );
     });
 
-    it('should double-encode root path / as %252F', async () => {
+    it('should single-encode root path / as %2F', async () => {
       vi.mocked(fetch).mockResolvedValue({
         ok: true,
         status: 200,
@@ -154,11 +155,29 @@ describe('EdgeCacheClear', () => {
 
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/%252F`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/%2F`,
         expect.objectContaining({ method: 'DELETE' })
       );
       expect(result.success).toBe(true);
       expect(result.paths).toEqual(['/']);
+    });
+
+    it('should single-encode non-ASCII path segments (ticket 10c)', async () => {
+      vi.mocked(fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+      } as Response);
+
+      const clearer = new EdgeCacheClear();
+      await clearer.clearPaths(['/日本語']);
+
+      // Exactly one encode pass client-side. Double-encoding here (the pre-fix behavior)
+      // would leave tenant-outbound-proxy's own encode pass producing 3 total passes
+      // reaching the gateway instead of the 2 its own tests assume.
+      expect(fetch).toHaveBeenCalledWith(
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('日本語')}`,
+        expect.any(Object)
+      );
     });
 
     it('should handle partial failures', async () => {
@@ -354,7 +373,7 @@ describe('clearEdgeCachePaths', () => {
     const result = await clearEdgeCachePaths(['/']);
 
     expect(fetch).toHaveBeenCalledWith(
-      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%2F',
       expect.objectContaining({ method: 'DELETE' })
     );
     expect(result).not.toBeNull();

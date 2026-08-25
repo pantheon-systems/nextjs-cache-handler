@@ -6,8 +6,19 @@ import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
+import type { TagsManifestRecord } from '../utils/tags-manifest-sync.js';
+import { isBuildPhase } from '../utils/build-detection.js';
+import { withBuildTimeout } from '../utils/build-timeout.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
+
+/**
+ * How long a GCS read/write is allowed to run during the build/prerender
+ * phase before this handler gives up on it and lets prerendering proceed
+ * (cache miss on read, fire-and-forget on write) -- see `build-timeout.ts`
+ * for why this exists and why it's build-phase-only. Not applied at runtime.
+ */
+const BUILD_IO_TIMEOUT_MS = 500;
 
 /**
  * Google Cloud Storage cache handler for production/Pantheon environments.
@@ -21,6 +32,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private readonly buildMetaKey: string;
   private readonly tagsPrefix: string;
   private readonly tagsMapKey: string;
+  private readonly tagsManifestKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
   private readonly tagsBuffer: TagsBuffer;
 
@@ -42,6 +54,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.buildMetaKey = `${envPrefix}build-meta.json`;
     this.tagsPrefix = `${envPrefix}cache/tags/`;
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
+    this.tagsManifestKey = `${this.tagsPrefix}manifest.json`;
 
     this.edgeCacheClearer = createEdgeCacheClearer();
 
@@ -125,6 +138,49 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   /**
+   * Read the shared tags-manifest snapshot (tag staleness, not tag -> keys --
+   * see `writeTagsManifest`). Used by `BaseCacheHandler.maybeSyncTagsManifest()`
+   * to fold another replica's `revalidateTag()` into this process's own
+   * in-memory state -- this is the read side of the fix for the cross-replica
+   * staleness bug (adapter repo's ticket 17): without it, a revalidation
+   * handled by one replica is invisible to every other one, since Next's own
+   * `areTagsExpired`/`areTagsStale` only ever check this process's in-memory
+   * `tagsManifest` Map.
+   */
+  protected async readTagsManifest(): Promise<TagsManifestRecord> {
+    try {
+      const file = this.bucket.file(this.tagsManifestKey);
+      const [exists] = await file.exists();
+      if (!exists) {
+        return {};
+      }
+      const [data] = await file.download();
+      return JSON.parse(data.toString());
+    } catch (error) {
+      this.log.warn('Error reading tags manifest:', error);
+      return {};
+    }
+  }
+
+  /**
+   * Write the shared tags-manifest snapshot. Called directly (not buffered)
+   * from `revalidateTag()` -- see that method's own comment in `base.ts` for
+   * why this doesn't go through `TagsBuffer` the way per-key tag mapping
+   * writes do.
+   */
+  protected async writeTagsManifest(manifest: TagsManifestRecord): Promise<void> {
+    try {
+      const file = this.bucket.file(this.tagsManifestKey);
+      await file.save(JSON.stringify(manifest, null, 2), {
+        metadata: { contentType: 'application/json' },
+      });
+    } catch (error) {
+      this.log.error('Error writing tags manifest:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Override to use buffered updates instead of immediate writes.
    */
   protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
@@ -149,7 +205,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
-    try {
+    const doRead = async (): Promise<CacheHandlerValue | null> => {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
       const file = this.bucket.file(gcsKey);
 
@@ -162,6 +218,23 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const parsedData = JSON.parse(data.toString());
 
       return (this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue) || null;
+    };
+
+    try {
+      if (isBuildPhase()) {
+        // A hanging/slowly-failing GCS read during prerendering (e.g. no
+        // credentials reachable) must not block the page for real wall-clock
+        // time -- see BUILD_IO_TIMEOUT_MS's comment and ticket 7. Falling
+        // back to a cache miss here is exactly what a genuine miss already
+        // does, so this can't produce a result Next doesn't already handle.
+        return await withBuildTimeout(doRead(), BUILD_IO_TIMEOUT_MS, () => {
+          this.log.warn(
+            `GCS read for ${cacheKey} exceeded ${BUILD_IO_TIMEOUT_MS}ms during build -- treating as a cache miss rather than blocking prerendering`
+          );
+          return null;
+        });
+      }
+      return await doRead();
     } catch {
       return null;
     }
@@ -172,7 +245,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     cacheValue: CacheHandlerValue,
     cacheType: CacheEntryType
   ): Promise<void> {
-    try {
+    const doWrite = async (): Promise<void> => {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
       const file = this.bucket.file(gcsKey);
 
@@ -181,6 +254,24 @@ export class GcsCacheHandler extends BaseCacheHandler {
       await file.save(JSON.stringify(serializedData[cacheKey], null, 2), {
         metadata: { contentType: 'application/json' },
       });
+    };
+
+    try {
+      if (isBuildPhase()) {
+        // Same rationale as readCacheEntry above: a fetch-cache write this
+        // slow blocks the calling `fetch()` (patch-fetch.ts awaits
+        // incrementalCache.set() inline), which is indistinguishable, from
+        // cacheComponents' perspective, from genuinely uncached/dynamic data
+        // accessed outside Suspense -- regardless of whether the write
+        // eventually throws (it's already caught below either way).
+        await withBuildTimeout(doWrite(), BUILD_IO_TIMEOUT_MS, () => {
+          this.log.warn(
+            `GCS write for ${cacheKey} exceeded ${BUILD_IO_TIMEOUT_MS}ms during build -- letting prerendering proceed without waiting for it (see ticket 7)`
+          );
+        });
+      } else {
+        await doWrite();
+      }
     } catch (error) {
       this.log.error(`Error writing cache entry ${cacheKey}:`, error);
     }
@@ -412,6 +503,7 @@ export async function clearSharedCache(): Promise<number> {
   const routeCachePrefix = `${envPrefix}route-cache/`;
   const imageCachePrefix = `${envPrefix}image-cache/`;
   const tagsFilePath = `${envPrefix}cache/tags/tags.json`;
+  const tagsManifestPath = `${envPrefix}cache/tags/manifest.json`;
 
   const staticRoutes = getStaticRoutes();
   let clearedCount = 0;
@@ -427,8 +519,9 @@ export async function clearSharedCache(): Promise<number> {
     // Clear image cache (content-derived, no build/static-route scoping needed)
     clearedCount += await clearGcsFetchCache(bucket, imageCachePrefix);
 
-    // Clear tags mapping
+    // Clear tags mapping and the shared tags-manifest (staleness state)
     await clearGcsTagsMapping(bucket, tagsFilePath);
+    await clearGcsTagsMapping(bucket, tagsManifestPath);
 
     gcsLog.info(`Total cleared: ${clearedCount} cache entries`);
 

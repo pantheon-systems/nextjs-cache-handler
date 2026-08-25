@@ -248,9 +248,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Verify edge cache was cleared for the route path (double-encoded)
+      // Verify edge cache was cleared for the route path (single-encoded; see ticket 10c)
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -286,9 +286,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Should convert underscores to slashes and double-encode
+      // Should convert underscores to slashes and single-encode (see ticket 10c)
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -332,6 +332,22 @@ describe('GcsCacheHandler', () => {
 
       const handler = new GcsCacheHandler({} as any);
       await expect(handler.revalidateTag('non-existent')).resolves.not.toThrow();
+    });
+
+    it('persists the tag staleness update to the shared store (not just the in-memory tagsManifest)', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new GcsCacheHandler({} as any);
+      const saveCallsBefore = mockFile.save.mock.calls.length;
+
+      await handler.revalidateTag('shared-posts');
+
+      // revalidateTag's shared-manifest persistence (readTagsManifest +
+      // writeTagsManifest) is what makes the invalidation visible to another
+      // replica -- this is the write half of that fix (ticket 17); confirms
+      // it actually runs rather than only updating the process-local Map.
+      expect(mockFile.save.mock.calls.length).toBeGreaterThan(saveCallsBefore);
     });
 
     it('should trigger edge cache clear when configured', async () => {

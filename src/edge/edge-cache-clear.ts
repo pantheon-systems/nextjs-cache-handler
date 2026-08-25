@@ -108,8 +108,11 @@ export class EdgeCacheClear {
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
       const cleanPath = normalizedPath.replace(/\/$/, '') || '/';
       const pathSegment = cleanPath === '/' ? '/' : cleanPath.substring(1);
-      // Double-encode because the edge-cache-clearer expects URL-encoded values.
-      const encodedPathSegment = encodeURIComponent(encodeURIComponent(pathSegment));
+      // Single-encode here: tenant-outbound-proxy's DeleteCachePath preserves whatever
+      // encoding it receives (via EscapedPath()) and then adds its own encode pass before
+      // forwarding to the gateway, which expects exactly two passes total. Double-encoding
+      // here would push that to three passes and corrupt multi-byte (non-ASCII) segments.
+      const encodedPathSegment = encodeURIComponent(pathSegment);
       const url = `${this.baseUrl}/paths/${encodedPathSegment}`;
       edgeLog.debug(`Clearing path from edge cache: ${routePath} (encoded: ${encodedPathSegment}, url: ${url})`);
 

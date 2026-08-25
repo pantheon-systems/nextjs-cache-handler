@@ -233,6 +233,66 @@ describe('FileCacheHandler', () => {
         expect(tagsManifest.get('profile-tag')?.expired).toBe(softExpired);
       });
     });
+
+    describe('cross-replica propagation (ticket 17)', () => {
+      afterEach(() => {
+        tagsManifest.clear();
+      });
+
+      // Regression test for the cross-replica staleness bug: `tagsManifest`
+      // is a process-local in-memory Map, so a revalidateTag() handled by one
+      // replica used to be invisible to every other one sharing the same
+      // storage backend. Two separate FileCacheHandler *instances* pointed at
+      // the same tempDir stand in for two OS-process replicas sharing one
+      // GCS bucket -- `tagsManifest.clear()` between them simulates "a
+      // process that never called revalidateTag itself", which is exactly
+      // what a fresh replica's own in-memory Map looks like.
+      it("a second handler instance's get() picks up a revalidateTag() the first instance performed", async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.set('shared-key', { kind: 'FETCH' as const } as any, { tags: ['shared-tag'] });
+
+        const before = Date.now();
+        await handlerA.revalidateTag('shared-tag');
+
+        // Simulate a separate replica: same shared store, but this process
+        // never called revalidateTag, so its in-memory tagsManifest is empty
+        // for this tag.
+        tagsManifest.delete('shared-tag');
+        const handlerB = new FileCacheHandler({} as any);
+
+        // get() is what triggers the sync pull in the real handler.
+        const entry = await handlerB.get('shared-key', { fetchIdx: 0 } as any);
+        expect(entry).not.toBeNull();
+
+        const synced = tagsManifest.get('shared-tag');
+        expect(synced?.expired).toBeGreaterThanOrEqual(before);
+      });
+
+      it('does not require a second get() call to pick up the sync (first get() on a fresh instance always syncs)', async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.revalidateTag('immediate-sync-tag');
+        const expiredAt = tagsManifest.get('immediate-sync-tag')?.expired;
+
+        tagsManifest.delete('immediate-sync-tag');
+        const handlerB = new FileCacheHandler({} as any);
+
+        await handlerB.get('unrelated-key');
+
+        expect(tagsManifest.get('immediate-sync-tag')?.expired).toBe(expiredAt);
+      });
+
+      it('a soft revalidation (durations.expire) also propagates to another instance', async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.revalidateTag('soft-shared-tag', { expire: 60 });
+        const staleAt = tagsManifest.get('soft-shared-tag')?.stale;
+
+        tagsManifest.delete('soft-shared-tag');
+        const handlerB = new FileCacheHandler({} as any);
+        await handlerB.get('unrelated-key-2');
+
+        expect(tagsManifest.get('soft-shared-tag')?.stale).toBe(staleAt);
+      });
+    });
   });
 
   describe('extractTagsFromDataHeaders fallback', () => {

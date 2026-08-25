@@ -7,6 +7,7 @@ import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
 import { safeJoin } from '../utils/path-safety.js';
+import type { TagsManifestRecord } from '../utils/tags-manifest-sync.js';
 
 const fileLog = createLogger('FileCacheHandler');
 
@@ -26,6 +27,7 @@ export class FileCacheHandler extends BaseCacheHandler {
   private readonly buildMetaFile: string;
   private readonly tagsDir: string;
   private readonly tagsMapFile: string;
+  private readonly tagsManifestFile: string;
   private readonly tagsBuffer: TagsBuffer;
 
   constructor(context: FileSystemCacheContext) {
@@ -39,6 +41,7 @@ export class FileCacheHandler extends BaseCacheHandler {
     this.buildMetaFile = path.join(process.cwd(), '.cache', 'build-meta.json');
     this.tagsDir = path.join(this.baseDir, 'tags');
     this.tagsMapFile = path.join(this.tagsDir, 'tags.json');
+    this.tagsManifestFile = path.join(this.tagsDir, 'manifest.json');
 
     // Create tags buffer for batched writes (improves performance)
     this.tagsBuffer = new TagsBuffer({
@@ -127,6 +130,39 @@ export class FileCacheHandler extends BaseCacheHandler {
     } catch (error) {
       this.log.error('Error writing tags mapping:', error);
       throw error; // Re-throw so buffer can retry
+    }
+  }
+
+  /**
+   * Read the shared tags-manifest snapshot (tag staleness, not tag -> keys --
+   * see `writeTagsManifest`). Used by `BaseCacheHandler.maybeSyncTagsManifest()`
+   * to fold another replica's `revalidateTag()` into this process's own
+   * in-memory state.
+   */
+  protected async readTagsManifest(): Promise<TagsManifestRecord> {
+    try {
+      if (!fs.existsSync(this.tagsManifestFile)) {
+        return {};
+      }
+      const data = await readFile(this.tagsManifestFile, 'utf-8');
+      return JSON.parse(data);
+    } catch (error) {
+      this.log.warn('Error reading tags manifest:', error);
+      return {};
+    }
+  }
+
+  /**
+   * Write the shared tags-manifest snapshot. Called directly (not buffered)
+   * from `revalidateTag()` -- see that method's own comment for why.
+   */
+  protected async writeTagsManifest(manifest: TagsManifestRecord): Promise<void> {
+    try {
+      await mkdir(this.tagsDir, { recursive: true });
+      await writeFile(this.tagsManifestFile, JSON.stringify(manifest, null, 2), 'utf-8');
+    } catch (error) {
+      this.log.error('Error writing tags manifest:', error);
+      throw error;
     }
   }
 
@@ -297,6 +333,7 @@ export async function clearSharedCache(): Promise<number> {
   const routeCacheDir = path.join(process.cwd(), '.next', 'cache', 'route-cache');
   const imageCacheDir = path.join(process.cwd(), '.next', 'cache', 'image-cache');
   const tagsFilePath = path.join(process.cwd(), '.next', 'cache', 'tags', 'tags.json');
+  const tagsManifestPath = path.join(process.cwd(), '.next', 'cache', 'tags', 'manifest.json');
 
   const staticRoutes = getStaticRoutes();
   let clearedCount = 0;
@@ -314,8 +351,9 @@ export async function clearSharedCache(): Promise<number> {
     // Clear image cache (content-derived, no build/static-route scoping needed)
     clearedCount += await clearFetchCache(imageCacheDir);
 
-    // Clear tags mapping
+    // Clear tags mapping and the shared tags-manifest (staleness state)
     await clearTagsMapping(tagsFilePath);
+    await clearTagsMapping(tagsManifestPath);
 
     fileLog.info(`Total cleared: ${clearedCount} cache entries`);
     return clearedCount;
