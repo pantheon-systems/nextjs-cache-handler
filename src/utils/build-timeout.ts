@@ -17,7 +17,7 @@
  * exception, since GCS errors are already caught and logged, never
  * rethrown -- is itself what trips "Uncached data was accessed outside of
  * <Suspense>" for a `fetch({ cache: 'force-cache' })` call the handler is
- * backing (see the adapter repo's ticket 7 for the full live-repro trace).
+ * backing.
  */
 export async function withBuildTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

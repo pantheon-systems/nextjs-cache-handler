@@ -13,9 +13,9 @@ interface BuildMeta {
 
 const log = createLogger('UseCacheGcsHandler');
 
-// Ticket 19 (nextjs-adapter/e2e-tickets): same cross-replica staleness risk
-// ticket 17 found and fixed for the legacy singular cacheHandler, but for this
-// separate 'use cache' handler. See the matching comment in file.ts.
+// Guards the same cross-replica staleness risk the legacy singular
+// cacheHandler has, but for this separate 'use cache' handler. See the
+// matching comment in file.ts.
 const MANIFEST_SYNC_INTERVAL_MS = 2000;
 
 /**

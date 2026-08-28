@@ -94,12 +94,8 @@ describe('FileCacheHandler', () => {
 
       await handler.set('image-key', cacheValue as any, { cacheControl: { revalidate: 60 } } as any);
 
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))
-      ).toBe(true);
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))
-      ).toBe(false);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))).toBe(true);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))).toBe(false);
 
       const result = await handler.get('image-key', { kind: 'IMAGE', isFallback: false } as any);
       expect(result).not.toBeNull();
@@ -234,7 +230,7 @@ describe('FileCacheHandler', () => {
       });
     });
 
-    describe('cross-replica propagation (ticket 17)', () => {
+    describe('cross-replica propagation', () => {
       afterEach(() => {
         tagsManifest.clear();
       });
@@ -291,6 +287,107 @@ describe('FileCacheHandler', () => {
         await handlerB.get('unrelated-key-2');
 
         expect(tagsManifest.get('soft-shared-tag')?.stale).toBe(staleAt);
+      });
+
+      it('BLOCKS the first sync on a cold instance', async () => {
+        // A fresh replica has no local knowledge of any invalidation, so this
+        // one request is worth holding: otherwise it could serve content it
+        // would have known was stale.
+        const coldHandler = new FileCacheHandler({} as any);
+
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        vi.spyOn(coldHandler as any, 'readTagsManifest').mockImplementation(async () => {
+          await gate;
+          return {};
+        });
+
+        const inFlight = coldHandler.get('cold-key');
+        const raced = await Promise.race([
+          inFlight.then(() => 'resolved'),
+          new Promise((r) => setTimeout(() => r('pending'), 30)),
+        ]);
+
+        expect(raced).toBe('pending');
+
+        release();
+        await inFlight;
+      });
+
+      it('does NOT block the request on refreshes after the first sync', async () => {
+        // The recurring pull used to block one request every sync interval on
+        // two GCS round trips, forever, on the hottest path in the handler.
+        const warmHandler = new FileCacheHandler({} as any);
+        await warmHandler.get('warm-up'); // first (blocking) sync happens here
+
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const readSpy = vi.spyOn(warmHandler as any, 'readTagsManifest').mockImplementation(async () => {
+          await gate;
+          return {};
+        });
+
+        // Jump past the throttle window so the next get() triggers a refresh.
+        vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
+
+        // Would hang here (and time the test out) if the refresh were awaited.
+        await warmHandler.get('warm-key');
+
+        expect(readSpy).toHaveBeenCalled();
+
+        release();
+      });
+
+      it('does no shared-manifest I/O during the build phase', async () => {
+        process.env.NEXT_PHASE = 'phase-production-build';
+        try {
+          const buildHandler = new FileCacheHandler({} as any);
+          const readSpy = vi.spyOn(buildHandler as any, 'readTagsManifest');
+          const updateSpy = vi.spyOn(buildHandler as any, 'updateTagsManifest');
+
+          await buildHandler.get('build-key');
+          await buildHandler.revalidateTag('build-tag');
+
+          expect(readSpy).not.toHaveBeenCalled();
+          expect(updateSpy).not.toHaveBeenCalled();
+        } finally {
+          delete process.env.NEXT_PHASE;
+        }
+      });
+
+      it('writes the manifest atomically, leaving no temp file behind', async () => {
+        const atomicHandler = new FileCacheHandler({} as any);
+        await atomicHandler.revalidateTag('atomic-tag');
+
+        const tagsDir = path.join(tempDir, '.next', 'cache', 'tags');
+        const leftovers = fs.readdirSync(tagsDir).filter((f) => f.includes('.tmp'));
+
+        expect(leftovers).toEqual([]);
+        // And the manifest is complete, parseable JSON (not a torn write).
+        const manifest = JSON.parse(fs.readFileSync(path.join(tagsDir, 'manifest.json'), 'utf-8'));
+        expect(manifest['atomic-tag']).toBeDefined();
+      });
+
+      it('prunes manifest entries older than the retention window on write', async () => {
+        const tagsDir = path.join(tempDir, '.next', 'cache', 'tags');
+        const ancient = Date.now() - 400 * 24 * 60 * 60 * 1000;
+        fs.writeFileSync(
+          path.join(tagsDir, 'manifest.json'),
+          JSON.stringify({ 'ancient-tag': { expired: ancient }, 'recent-tag': { expired: Date.now() - 1000 } }),
+          'utf-8'
+        );
+
+        const pruneHandler = new FileCacheHandler({} as any);
+        await pruneHandler.revalidateTag('new-tag');
+
+        const manifest = JSON.parse(fs.readFileSync(path.join(tagsDir, 'manifest.json'), 'utf-8'));
+        expect(manifest['ancient-tag']).toBeUndefined();
+        expect(manifest['recent-tag']).toBeDefined();
+        expect(manifest['new-tag']).toBeDefined();
       });
     });
   });
@@ -360,7 +457,7 @@ describe('FileCacheHandler', () => {
       expect(result).not.toBeNull();
 
       // Tags should be deduplicated
-      const tagCount = result!.tags.filter(t => t === 'shared-tag').length;
+      const tagCount = result!.tags.filter((t) => t === 'shared-tag').length;
       expect(tagCount).toBe(1);
 
       // All unique tags should be present

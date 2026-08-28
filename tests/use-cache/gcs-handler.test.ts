@@ -330,9 +330,8 @@ describe('UseCacheGcsHandler', () => {
       expect(bothExpiration).toBeGreaterThan(firstTimestamp);
     });
 
-    // Ticket 19 (nextjs-adapter/e2e-tickets): same cross-replica staleness
-    // class ticket 17 fixed for the legacy singular cacheHandler, in this
-    // separate 'use cache' GCS handler. A fresh handler instance's tags were
+    // Same cross-replica staleness class as the legacy singular
+    // cacheHandler, in this separate 'use cache' GCS handler. A fresh handler instance's tags were
     // loaded once at construction; without a re-sync on the read path, a tag
     // invalidated by another replica AFTER this instance started would never
     // become visible to it.

@@ -27,9 +27,9 @@ export interface UseCacheFileHandlerConfig {
  * - Single-instance deployments
  * - Testing
  */
-// Ticket 19 (nextjs-adapter/e2e-tickets): same cross-replica staleness risk
-// ticket 17 found and fixed for the legacy singular cacheHandler, but for this
-// separate 'use cache' handler. updateTags() on one replica only updates that
+// Guards the same cross-replica staleness risk the legacy singular
+// cacheHandler has, but for this separate 'use cache' handler.
+// updateTags() on one replica only updates that
 // replica's own in-memory tagTimestamps Map immediately; every other replica
 // only picks it up when something reloads from disk. refreshTags() exists for
 // that, but relying solely on Next.js's own runtime to call it often enough is

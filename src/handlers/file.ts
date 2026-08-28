@@ -1,19 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type {
+  CacheEntryType,
+  CacheStats,
+  CacheEntryInfo,
+  CacheHandlerValue,
+  FileSystemCacheContext,
+} from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
 import { safeJoin } from '../utils/path-safety.js';
-import type { TagsManifestRecord } from '../utils/tags-manifest-sync.js';
+import { getTagsManifestRetentionMs, pruneTagsManifest, type TagsManifestRecord } from '../utils/tags-manifest-sync.js';
 
 const fileLog = createLogger('FileCacheHandler');
 
 const writeFile = promisify(fs.writeFile);
 const readFile = promisify(fs.readFile);
 const mkdir = promisify(fs.mkdir);
+const rename = promisify(fs.rename);
 
 /**
  * File-based cache handler for local development.
@@ -135,11 +142,15 @@ export class FileCacheHandler extends BaseCacheHandler {
 
   /**
    * Read the shared tags-manifest snapshot (tag staleness, not tag -> keys --
-   * see `writeTagsManifest`). Used by `BaseCacheHandler.maybeSyncTagsManifest()`
+   * see `updateTagsManifest`). Used by `BaseCacheHandler.maybeSyncTagsManifest()`
    * to fold another replica's `revalidateTag()` into this process's own
    * in-memory state.
+   *
+   * Always returns a record (never the "unchanged" null the GCS handler can
+   * return): this handler backs single-instance/dev deployments where the file
+   * is local, so there's no body-transfer cost worth optimising away.
    */
-  protected async readTagsManifest(): Promise<TagsManifestRecord> {
+  protected async readTagsManifest(): Promise<TagsManifestRecord | null> {
     try {
       if (!fs.existsSync(this.tagsManifestFile)) {
         return {};
@@ -153,13 +164,28 @@ export class FileCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * Write the shared tags-manifest snapshot. Called directly (not buffered)
+   * Read-modify-write the shared tags-manifest. Called directly (not buffered)
    * from `revalidateTag()` -- see that method's own comment for why.
+   *
+   * Writes via a temp file + rename so a concurrent reader never observes a
+   * half-written JSON document. The read-modify-write itself isn't guarded by
+   * a lock the way the GCS handler's generation precondition guards its own:
+   * this handler serves the single-instance/dev case, where there is no second
+   * writer to race with.
    */
-  protected async writeTagsManifest(manifest: TagsManifestRecord): Promise<void> {
+  protected async updateTagsManifest(mutate: (current: TagsManifestRecord) => TagsManifestRecord): Promise<void> {
     try {
       await mkdir(this.tagsDir, { recursive: true });
-      await writeFile(this.tagsManifestFile, JSON.stringify(manifest, null, 2), 'utf-8');
+
+      const current = (await this.readTagsManifest()) ?? {};
+      const { pruned, dropped } = pruneTagsManifest(mutate(current), getTagsManifestRetentionMs());
+      if (dropped > 0) {
+        this.log.debug(`Pruned ${dropped} tags-manifest entr${dropped === 1 ? 'y' : 'ies'} older than retention`);
+      }
+
+      const tmpFile = `${this.tagsManifestFile}.${process.pid}.tmp`;
+      await writeFile(tmpFile, JSON.stringify(pruned, null, 2), 'utf-8');
+      await rename(tmpFile, this.tagsManifestFile);
     } catch (error) {
       this.log.error('Error writing tags manifest:', error);
       throw error;
@@ -191,7 +217,8 @@ export class FileCacheHandler extends BaseCacheHandler {
 
   private getCacheFilePath(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    const dir = cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
+    const dir =
+      cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
     // safeJoin guarantees the resolved path stays within the cache directory,
     // in addition to the character sanitization applied to the key above.
     return safeJoin(dir, `${safeKey}.json`);

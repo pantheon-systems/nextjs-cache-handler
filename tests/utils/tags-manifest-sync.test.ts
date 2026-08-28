@@ -4,7 +4,11 @@ import {
   mergeRemoteTagsManifest,
   mergeManifestForWrite,
   snapshotLocalTagsManifest,
+  pruneTagsManifest,
+  getTagsManifestRetentionMs,
 } from '../../src/utils/tags-manifest-sync.js';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 describe('mergeRemoteTagsManifest', () => {
   afterEach(() => {
@@ -106,5 +110,92 @@ describe('mergeManifestForWrite', () => {
     const result = mergeManifestForWrite({ untouched: { expired: 42 } }, { other: { expired: 7 } });
     expect(result.untouched).toEqual({ expired: 42 });
     expect(result.other).toEqual({ expired: 7 });
+  });
+});
+
+describe('pruneTagsManifest', () => {
+  const now = 1_000 * DAY_MS;
+
+  it('keeps entries inside the retention window', () => {
+    const { pruned, dropped } = pruneTagsManifest({ fresh: { expired: now - DAY_MS } }, 30 * DAY_MS, now);
+
+    expect(pruned).toEqual({ fresh: { expired: now - DAY_MS } });
+    expect(dropped).toBe(0);
+  });
+
+  it('drops entries older than the retention window', () => {
+    const { pruned, dropped } = pruneTagsManifest({ ancient: { expired: now - 40 * DAY_MS } }, 30 * DAY_MS, now);
+
+    expect(pruned).toEqual({});
+    expect(dropped).toBe(1);
+  });
+
+  it('keeps an entry on the NEWEST of stale/expired, not the oldest', () => {
+    // Expired long ago but marked stale recently -- still live information.
+    const manifest = { mixed: { expired: now - 40 * DAY_MS, stale: now - DAY_MS } };
+
+    const { pruned, dropped } = pruneTagsManifest(manifest, 30 * DAY_MS, now);
+
+    expect(pruned).toEqual(manifest);
+    expect(dropped).toBe(0);
+  });
+
+  it('prunes selectively, leaving unrelated fresh tags intact', () => {
+    const { pruned, dropped } = pruneTagsManifest(
+      {
+        old: { expired: now - 40 * DAY_MS },
+        new: { expired: now - 1000 },
+        alsoOld: { stale: now - 31 * DAY_MS },
+      },
+      30 * DAY_MS,
+      now
+    );
+
+    expect(Object.keys(pruned)).toEqual(['new']);
+    expect(dropped).toBe(2);
+  });
+
+  it('never mutates the input record', () => {
+    const manifest = { old: { expired: now - 40 * DAY_MS } };
+
+    pruneTagsManifest(manifest, 30 * DAY_MS, now);
+
+    expect(manifest).toEqual({ old: { expired: now - 40 * DAY_MS } });
+  });
+
+  it('treats an entry with neither timestamp as prunable', () => {
+    const { pruned, dropped } = pruneTagsManifest({ empty: {} }, 30 * DAY_MS, now);
+
+    expect(pruned).toEqual({});
+    expect(dropped).toBe(1);
+  });
+});
+
+describe('getTagsManifestRetentionMs', () => {
+  const original = process.env.CACHE_TAGS_RETENTION_DAYS;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.CACHE_TAGS_RETENTION_DAYS;
+    } else {
+      process.env.CACHE_TAGS_RETENTION_DAYS = original;
+    }
+  });
+
+  it('defaults to 30 days', () => {
+    delete process.env.CACHE_TAGS_RETENTION_DAYS;
+    expect(getTagsManifestRetentionMs()).toBe(30 * DAY_MS);
+  });
+
+  it('honours a valid override', () => {
+    process.env.CACHE_TAGS_RETENTION_DAYS = '90';
+    expect(getTagsManifestRetentionMs()).toBe(90 * DAY_MS);
+  });
+
+  it('falls back to the default for junk or non-positive values rather than pruning everything', () => {
+    for (const value of ['not-a-number', '0', '-5', '']) {
+      process.env.CACHE_TAGS_RETENTION_DAYS = value;
+      expect(getTagsManifestRetentionMs()).toBe(30 * DAY_MS);
+    }
   });
 });

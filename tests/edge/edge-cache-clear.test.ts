@@ -162,7 +162,7 @@ describe('EdgeCacheClear', () => {
       expect(result.paths).toEqual(['/']);
     });
 
-    it('should single-encode non-ASCII path segments (ticket 10c)', async () => {
+    it('should single-encode non-ASCII path segments', async () => {
       vi.mocked(fetch).mockResolvedValue({
         ok: true,
         status: 200,

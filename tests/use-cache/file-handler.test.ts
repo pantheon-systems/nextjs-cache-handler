@@ -229,8 +229,8 @@ describe('UseCacheFileHandler', () => {
     });
   });
 
-  describe('cross-replica propagation (ticket 19)', () => {
-    // Regression test for the same class of bug ticket 17 fixed in the legacy
+  describe('cross-replica propagation', () => {
+    // Regression test for the same class of bug fixed in the legacy
     // singular cacheHandler: tagTimestamps is a process-local in-memory Map,
     // so updateTags() on one replica used to be invisible to every other
     // replica sharing the same cacheDir until *something* reloaded from disk
