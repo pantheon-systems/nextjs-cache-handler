@@ -367,6 +367,26 @@ describe('GcsCacheHandler', () => {
 
       expect(fetch).toHaveBeenCalled();
     });
+
+    it('still clears the edge cache by tag when the tags mapping lists no keys', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      // An empty mapping for the tag is exactly the case a lost/unflushed
+      // mapping write produces on another replica -- the CDN is still holding
+      // the stale response under that surrogate key, so the purge must run.
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.revalidateTag('posts');
+
+      // Wait for background edge cache clear
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(fetch).toHaveBeenCalled();
+    });
   });
 
   describe('resetRequestCache', () => {

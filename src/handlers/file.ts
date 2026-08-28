@@ -168,6 +168,12 @@ export class FileCacheHandler extends BaseCacheHandler {
 
   /**
    * Override to use buffered updates instead of immediate writes.
+   *
+   * Awaited to durability for the same reason as the GCS handler (see the
+   * comment on its `updateTagsMapping`): a queued mapping only this process
+   * knows about is invisible to a `revalidateTag()` that reads the store
+   * directly, and is lost outright if the process dies before the flush timer
+   * fires. Cheap here -- the flush interval is 100ms and the write is local.
    */
   protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
     if (isDelete) {
@@ -175,8 +181,8 @@ export class FileCacheHandler extends BaseCacheHandler {
     } else if (tags.length > 0) {
       this.tagsBuffer.addTags(cacheKey, tags);
     }
-    // Updates are queued and will be flushed automatically
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
+    await this.tagsBuffer.awaitDurable();
   }
 
   // ============================================================================

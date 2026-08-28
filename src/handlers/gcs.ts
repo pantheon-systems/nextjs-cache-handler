@@ -181,7 +181,21 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * Override to use buffered updates instead of immediate writes.
+   * Override to use buffered (rate-limit-coalesced) updates instead of
+   * immediate per-key writes.
+   *
+   * The queued mapping is then awaited to durability before returning. This
+   * matters because THIS process's buffer is the only thing that can flush it:
+   * `readTagsMapping()` flushes the local buffer before reading, but a
+   * `revalidateTag()` served by any OTHER replica reads straight from GCS and
+   * cannot see a mapping still sitting in this process's memory. If the
+   * mapping never lands -- the container is scaled down or terminated before
+   * the flush timer fires, which on Cloud Run is the normal end of an idle
+   * instance's life -- the cache entry stays in GCS permanently unreachable by
+   * tag, so `revalidateTag()` finds no keys for it and the CDN purge for that
+   * path never happens. Awaiting here closes that window without defeating the
+   * coalescing: `awaitDurable()` waits for the SCHEDULED flush, so GCS still
+   * sees at most one tags.json write per interval.
    */
   protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
     if (isDelete) {
@@ -189,8 +203,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
     } else if (tags.length > 0) {
       this.tagsBuffer.addTags(cacheKey, tags);
     }
-    // Updates are queued and will be flushed automatically
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
+    await this.tagsBuffer.awaitDurable();
   }
 
   // ============================================================================
@@ -338,11 +352,18 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // for tag invalidation, so it must be cleared immediately whenever a tag
     // is revalidated, even though the origin's own stored entry is intentionally
     // kept servable in the interim (see BaseCacheHandler.revalidateTag).
-    if (affectedKeys.length === 0 || !this.edgeCacheClearer) {
+    if (!this.edgeCacheClearer) {
       return;
     }
 
-    // Clear by tags/keys
+    // Clear by tags/keys. Deliberately NOT gated on affectedKeys: purging by
+    // surrogate key needs only the tags themselves, and an empty affectedKeys
+    // is exactly the case where the purge matters most -- it means the
+    // tag -> key mapping in GCS didn't list the entry (a mapping write lost
+    // before it reached the store, or one made by a replica whose buffer never
+    // flushed), while the CDN is still holding the stale response under that
+    // surrogate key. Gating here turned a mapping gap into a silent no-purge.
+    // A purge for a tag with nothing cached under it is a no-op at the CDN.
     this.edgeCacheClearer.clearKeysInBackground(tags, `tag revalidation: ${tags.join(', ')}`);
 
     // Also clear by route paths for routes that may not have tags (e.g., ISR routes)
