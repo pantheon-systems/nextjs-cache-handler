@@ -115,12 +115,14 @@ describe('EdgeCacheClear', () => {
       const result = await clearer.clearPaths(['/blog', '/about']);
 
       expect(fetch).toHaveBeenCalledTimes(2);
+      // The leading slash is part of the cache path and is encoded with it:
+      // "/blog" -> "%2Fblog", not "blog".
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/blog`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('/blog')}`,
         expect.objectContaining({ method: 'DELETE' })
       );
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/about`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('/about')}`,
         expect.objectContaining({ method: 'DELETE' })
       );
       expect(result.success).toBe(true);
@@ -136,12 +138,34 @@ describe('EdgeCacheClear', () => {
       const clearer = new EdgeCacheClear();
       await clearer.clearPaths(['blog/post']);
 
-      // Single-encoded: blog/post -> blog%2Fpost (tenant-outbound-proxy adds its own
-      // encode pass on top of this to reach the gateway's expected two total passes).
+      // Normalised to "/blog/post", then single-encoded whole:
+      // "%2Fblog%2Fpost". tenant-outbound-proxy adds its own encode pass on top,
+      // which is what makes the gateway's value decode back to "/blog/post".
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('blog/post')}`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('/blog/post')}`,
         expect.any(Object)
       );
+    });
+
+    it('sends the leading slash for nested paths, in the same shape as the root path', async () => {
+      // Regression test. This used to strip the leading slash for nested paths
+      // (`cleanPath.substring(1)`) while keeping it for "/", so the same kind of
+      // value went out in two different shapes and nested purges addressed
+      // "blogs/my-post" instead of "/blogs/my-post" at the gateway.
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const clearer = new EdgeCacheClear();
+      await clearer.clearPaths(['/', '/nested/deep/path']);
+
+      const urls = vi.mocked(fetch).mock.calls.map((call) => String(call[0]));
+      const sent = urls.map((u) => decodeURIComponent(u.split('/paths/')[1]));
+
+      // Both decode back to a real, absolute cache path.
+      expect(sent).toEqual(['/', '/nested/deep/path']);
+      // And neither leaks a raw slash into the URL's own path structure.
+      for (const url of urls) {
+        expect(url.split('/paths/')[1]).not.toContain('/');
+      }
     });
 
     it('should single-encode root path / as %2F', async () => {
@@ -171,11 +195,11 @@ describe('EdgeCacheClear', () => {
       const clearer = new EdgeCacheClear();
       await clearer.clearPaths(['/日本語']);
 
-      // Exactly one encode pass client-side. Double-encoding here (the pre-fix behavior)
-      // would leave tenant-outbound-proxy's own encode pass producing 3 total passes
-      // reaching the gateway instead of the 2 its own tests assume.
+      // Exactly one encode pass client-side. Double-encoding here (the pre-fix
+      // behavior) would leave tenant-outbound-proxy's own encode pass producing 3
+      // total passes at the gateway instead of the 2 its own tests assume.
       expect(fetch).toHaveBeenCalledWith(
-        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('日本語')}`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent('/日本語')}`,
         expect.any(Object)
       );
     });
@@ -279,7 +303,7 @@ describe('EdgeCacheClear', () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/paths/single-path'),
+        expect.stringContaining(`/paths/${encodeURIComponent('/single-path')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });

@@ -255,7 +255,7 @@ describe('GcsCacheHandler', () => {
 
       // Verify edge cache was cleared for the route path (single-encoded)
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent('blogs/my-post')}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('/blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -293,7 +293,7 @@ describe('GcsCacheHandler', () => {
 
       // Should convert underscores to slashes and single-encode
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent('blogs/my-post')}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('/blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
