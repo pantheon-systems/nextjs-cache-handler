@@ -13,6 +13,11 @@ interface BuildMeta {
 
 const log = createLogger('UseCacheGcsHandler');
 
+// Guards the same cross-replica staleness risk the legacy singular
+// cacheHandler has, but for this separate 'use cache' handler. See the
+// matching comment in file.ts.
+const MANIFEST_SYNC_INTERVAL_MS = 2000;
+
 /**
  * Google Cloud Storage cache handler for Next.js 16 'use cache' directive.
  * Implements the cacheHandlers (plural) interface.
@@ -36,6 +41,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private tagTimestamps: Map<string, number> = new Map();
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
+  private lastSyncAt = 0;
 
   constructor() {
     const bucketName = process.env.CACHE_BUCKET;
@@ -116,6 +122,21 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       await this.initPromise;
       this.initPromise = null;
     }
+  }
+
+  /**
+   * Throttled re-sync of tag timestamps from GCS, called from the read path
+   * so cross-replica invalidations become visible without depending on
+   * Next.js's own refreshTags() call frequency. At most once per
+   * MANIFEST_SYNC_INTERVAL_MS per handler instance.
+   */
+  private async maybeSyncTagTimestamps(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastSyncAt < MANIFEST_SYNC_INTERVAL_MS) {
+      return;
+    }
+    this.lastSyncAt = now;
+    await this.loadTagTimestamps();
   }
 
   private async loadTagTimestamps(): Promise<void> {
@@ -199,6 +220,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     // a request racing the very first GET on a cold instance could read an
     // empty tagTimestamps map and treat a tag-invalidated entry as still fresh.
     await this.ensureInitialized();
+    await this.maybeSyncTagTimestamps();
 
     try {
       const gcsKey = this.getCacheKey(cacheKey);
@@ -302,6 +324,8 @@ export class UseCacheGcsHandler implements UseCacheHandler {
    * Return maximum revalidation timestamp for given tags.
    */
   async getExpiration(tags: string[]): Promise<number> {
+    await this.ensureInitialized();
+    await this.maybeSyncTagTimestamps();
     let maxTimestamp = 0;
 
     for (const tag of tags) {

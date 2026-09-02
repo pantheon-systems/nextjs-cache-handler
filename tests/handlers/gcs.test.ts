@@ -6,6 +6,7 @@ const mockFile = {
   download: vi.fn(),
   save: vi.fn(),
   delete: vi.fn(),
+  getMetadata: vi.fn(),
 };
 
 const mockBucket = {
@@ -51,6 +52,10 @@ describe('GcsCacheHandler', () => {
     mockFile.save.mockResolvedValue(undefined);
     mockFile.download.mockResolvedValue([Buffer.from('{}')]);
     mockFile.delete.mockResolvedValue(undefined);
+    // Distinct generation per call so the tags-manifest read never short-circuits
+    // on "unchanged" unless a test deliberately pins it.
+    let generation = 0;
+    mockFile.getMetadata.mockImplementation(() => Promise.resolve([{ generation: String(++generation) }]));
     mockBucket.getFiles.mockResolvedValue([[]]);
     mockBucket.file.mockReturnValue(mockFile);
   });
@@ -248,9 +253,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Verify edge cache was cleared for the route path (double-encoded)
+      // Verify edge cache was cleared for the route path (single-encoded)
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('/blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -286,9 +291,9 @@ describe('GcsCacheHandler', () => {
       // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Should convert underscores to slashes and double-encode
+      // Should convert underscores to slashes and single-encode
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent('/blogs/my-post')}`),
         expect.objectContaining({ method: 'DELETE' })
       );
     });
@@ -334,12 +339,158 @@ describe('GcsCacheHandler', () => {
       await expect(handler.revalidateTag('non-existent')).resolves.not.toThrow();
     });
 
+    it('persists the tag staleness update to the shared store (not just the in-memory tagsManifest)', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new GcsCacheHandler({} as any);
+      const saveCallsBefore = mockFile.save.mock.calls.length;
+
+      await handler.revalidateTag('shared-posts');
+
+      // revalidateTag's shared-manifest persistence (updateTagsManifest) is
+      // what makes the invalidation visible to another replica -- this is the
+      // write half of that fix; confirms it actually runs rather
+      // than only updating the process-local Map.
+      expect(mockFile.save.mock.calls.length).toBeGreaterThan(saveCallsBefore);
+    });
+
+    it('writes the shared manifest under a generation precondition so a concurrent replica cannot be clobbered', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      mockFile.getMetadata.mockResolvedValue([{ generation: '17' }]);
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.revalidateTag('posts');
+
+      const manifestSave = mockFile.save.mock.calls.find((call) => call[1]?.preconditionOpts !== undefined);
+      expect(manifestSave).toBeDefined();
+      expect(manifestSave![1].preconditionOpts).toEqual({ ifGenerationMatch: 17 });
+    });
+
+    it('re-reads and retries the manifest write when it loses a generation race (412)', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      mockFile.getMetadata.mockResolvedValue([{ generation: '5' }]);
+
+      const preconditionFailed = Object.assign(new Error('Precondition Failed'), { code: 412 });
+      let manifestSaves = 0;
+      mockFile.save.mockImplementation((_data: string, opts?: any) => {
+        if (opts?.preconditionOpts === undefined) {
+          return Promise.resolve(undefined);
+        }
+        manifestSaves++;
+        // Lose the race once, then succeed.
+        return manifestSaves === 1 ? Promise.reject(preconditionFailed) : Promise.resolve(undefined);
+      });
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.revalidateTag('posts');
+
+      expect(manifestSaves).toBe(2);
+    });
+
+    it('does not overwrite the shared manifest when it cannot be read first', async () => {
+      // A read failure that isn't a 404 must abort the write -- writing a record
+      // built from `{}` would drop every other replica's tags from the manifest.
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      mockFile.getMetadata.mockRejectedValue(Object.assign(new Error('500 Internal'), { code: 500 }));
+
+      const handler = new GcsCacheHandler({} as any);
+      // revalidateTag swallows and warns rather than failing the caller.
+      await expect(handler.revalidateTag('posts')).resolves.not.toThrow();
+
+      const manifestSave = mockFile.save.mock.calls.find((call) => call[1]?.preconditionOpts !== undefined);
+      expect(manifestSave).toBeUndefined();
+    });
+
+    it('creates the manifest with ifGenerationMatch: 0 when it does not exist yet', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      mockFile.getMetadata.mockRejectedValue(Object.assign(new Error('Not Found'), { code: 404 }));
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.revalidateTag('posts');
+
+      const manifestSave = mockFile.save.mock.calls.find((call) => call[1]?.preconditionOpts !== undefined);
+      expect(manifestSave![1].preconditionOpts).toEqual({ ifGenerationMatch: 0 });
+    });
+
+    it('skips re-downloading the manifest body when its GCS generation is unchanged', async () => {
+      // The manifest is pulled on the get() path for the life of the replica and
+      // grows with the number of distinct tags a site revalidates, so the
+      // steady-state cost must be one metadata call, not a full download.
+      mockFile.exists.mockResolvedValue([false]);
+      mockFile.getMetadata.mockResolvedValue([{ generation: '42' }]);
+      mockFile.download.mockResolvedValue([Buffer.from('{"some-tag":{"expired":1}}')]);
+
+      const handler = new GcsCacheHandler({} as any);
+
+      // First get(): cold instance, must transfer the body.
+      await handler.get('key-a');
+      const downloadsAfterFirst = mockFile.download.mock.calls.length;
+      expect(downloadsAfterFirst).toBeGreaterThan(0);
+
+      // Move past the throttle window; the generation is still 42.
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
+      await handler.get('key-b');
+      // Let the background refresh settle.
+      await new Promise((r) => setTimeout(r, 10));
+
+      const manifestDownloads = mockFile.download.mock.calls.length - downloadsAfterFirst;
+      // The only downloads in this window would be the cache entry itself,
+      // which misses (exists: false) and so never downloads at all.
+      expect(manifestDownloads).toBe(0);
+      // ...but the cheap metadata check did run.
+      expect(mockFile.getMetadata.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    it('does no shared-manifest I/O during the build phase', async () => {
+      // An unguarded blocking GCS call on a prerender path is what trips
+      // cacheComponents' "uncached data outside <Suspense>" -- and
+      // there is no other replica to inform during a build anyway.
+      process.env.NEXT_PHASE = 'phase-production-build';
+      try {
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+        const handler = new GcsCacheHandler({} as any);
+        await handler.revalidateTag('posts');
+
+        const manifestSave = mockFile.save.mock.calls.find((call) => call[1]?.preconditionOpts !== undefined);
+        expect(manifestSave).toBeUndefined();
+      } finally {
+        delete process.env.NEXT_PHASE;
+      }
+    });
+
     it('should trigger edge cache clear when configured', async () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
       const tagsMapping = { posts: ['key1'] };
       mockFile.exists.mockResolvedValue([true]);
       mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(tagsMapping))]);
+
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const handler = new GcsCacheHandler({} as any);
+      await handler.revalidateTag('posts');
+
+      // Wait for background edge cache clear
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(fetch).toHaveBeenCalled();
+    });
+
+    it('still clears the edge cache by tag when the tags mapping lists no keys', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+
+      // An empty mapping for the tag is exactly the case a lost/unflushed
+      // mapping write produces on another replica -- the CDN is still holding
+      // the stale response under that surrogate key, so the purge must run.
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
 
       vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
@@ -378,6 +529,10 @@ describe('GcsCacheHandler environment prefix', () => {
     mockFile.save.mockResolvedValue(undefined);
     mockFile.download.mockResolvedValue([Buffer.from('{}')]);
     mockFile.delete.mockResolvedValue(undefined);
+    // Distinct generation per call so the tags-manifest read never short-circuits
+    // on "unchanged" unless a test deliberately pins it.
+    let generation = 0;
+    mockFile.getMetadata.mockImplementation(() => Promise.resolve([{ generation: String(++generation) }]));
     mockBucket.getFiles.mockResolvedValue([[]]);
     mockBucket.file.mockReturnValue(mockFile);
   });
@@ -495,6 +650,10 @@ describe('GCS standalone functions environment prefix', () => {
     mockFile.save.mockResolvedValue(undefined);
     mockFile.download.mockResolvedValue([Buffer.from('{}')]);
     mockFile.delete.mockResolvedValue(undefined);
+    // Distinct generation per call so the tags-manifest read never short-circuits
+    // on "unchanged" unless a test deliberately pins it.
+    let generation = 0;
+    mockFile.getMetadata.mockImplementation(() => Promise.resolve([{ generation: String(++generation) }]));
     mockBucket.getFiles.mockResolvedValue([[]]);
     mockBucket.file.mockReturnValue(mockFile);
   });

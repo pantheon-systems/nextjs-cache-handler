@@ -229,6 +229,67 @@ describe('UseCacheFileHandler', () => {
     });
   });
 
+  describe('cross-replica propagation', () => {
+    // Regression test for the same class of bug fixed in the legacy
+    // singular cacheHandler: tagTimestamps is a process-local in-memory Map,
+    // so updateTags() on one replica used to be invisible to every other
+    // replica sharing the same cacheDir until *something* reloaded from disk
+    // -- which nothing on the read path did. Two separate UseCacheFileHandler
+    // *instances* pointed at the same cacheDir stand in for two OS-process
+    // replicas sharing one file-cache mount.
+    it("a second handler instance's get() picks up an updateTags() the first instance performed", async () => {
+      const handlerA = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      await handlerA.set('shared-key', Promise.resolve(createTestEntry({ tags: ['shared-tag'] })));
+      await new Promise((r) => setTimeout(r, 10));
+
+      const before = Date.now();
+      await handlerA.updateTags(['shared-tag'], [0]);
+
+      // Simulate a separate replica: same shared cacheDir, but this process
+      // never called updateTags, so its in-memory tagTimestamps is empty.
+      const handlerB = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      // A fresh instance's lastSyncAt starts at 0, so its first get() always
+      // syncs -- get() is what triggers the read-path pull in the real fix.
+      const entry = await handlerB.get('shared-key', []);
+      // The entry itself is now expired (that's the point), so get() returns
+      // undefined -- what matters is that B's OWN getExpiration() reflects A's
+      // update, not a stale read.
+      expect(entry).toBeUndefined();
+
+      const expiration = await handlerB.getExpiration(['shared-tag']);
+      expect(expiration).toBeGreaterThanOrEqual(before);
+    });
+
+    it('getExpiration() alone (no prior get()) also triggers the sync', async () => {
+      const handlerA = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      await handlerA.updateTags(['expiration-only-tag'], [0]);
+      const expiredAt = await handlerA.getExpiration(['expiration-only-tag']);
+
+      const handlerB = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      const synced = await handlerB.getExpiration(['expiration-only-tag']);
+      expect(synced).toBe(expiredAt);
+    });
+
+    it('never moves a tag timestamp backwards on sync', async () => {
+      const handlerA = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      await handlerA.updateTags(['monotonic-tag'], [0]);
+      const firstTimestamp = await handlerA.getExpiration(['monotonic-tag']);
+
+      // A second, later update from the same "replica" advances the timestamp.
+      await new Promise((r) => setTimeout(r, 5));
+      await handlerA.updateTags(['monotonic-tag'], [0]);
+      const secondTimestamp = await handlerA.getExpiration(['monotonic-tag']);
+      expect(secondTimestamp).toBeGreaterThan(firstTimestamp);
+
+      // A fresh handler syncing from disk must land on the LATEST value, not
+      // regress to an older one it might race against.
+      const handlerB = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      const synced = await handlerB.getExpiration(['monotonic-tag']);
+      expect(synced).toBe(secondTimestamp);
+    });
+  });
+
   describe('updateTags', () => {
     it('should invalidate cache entries with matching tags', async () => {
       const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });

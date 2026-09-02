@@ -1,18 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type {
+  CacheEntryType,
+  CacheStats,
+  CacheEntryInfo,
+  CacheHandlerValue,
+  FileSystemCacheContext,
+} from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
 import { safeJoin } from '../utils/path-safety.js';
+import { getTagsManifestRetentionMs, pruneTagsManifest, type TagsManifestRecord } from '../utils/tags-manifest-sync.js';
 
 const fileLog = createLogger('FileCacheHandler');
 
 const writeFile = promisify(fs.writeFile);
 const readFile = promisify(fs.readFile);
 const mkdir = promisify(fs.mkdir);
+const rename = promisify(fs.rename);
 
 /**
  * File-based cache handler for local development.
@@ -26,6 +34,7 @@ export class FileCacheHandler extends BaseCacheHandler {
   private readonly buildMetaFile: string;
   private readonly tagsDir: string;
   private readonly tagsMapFile: string;
+  private readonly tagsManifestFile: string;
   private readonly tagsBuffer: TagsBuffer;
 
   constructor(context: FileSystemCacheContext) {
@@ -39,6 +48,7 @@ export class FileCacheHandler extends BaseCacheHandler {
     this.buildMetaFile = path.join(process.cwd(), '.cache', 'build-meta.json');
     this.tagsDir = path.join(this.baseDir, 'tags');
     this.tagsMapFile = path.join(this.tagsDir, 'tags.json');
+    this.tagsManifestFile = path.join(this.tagsDir, 'manifest.json');
 
     // Create tags buffer for batched writes (improves performance)
     this.tagsBuffer = new TagsBuffer({
@@ -131,16 +141,73 @@ export class FileCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * Override to use buffered updates instead of immediate writes.
+   * Read the shared tags-manifest snapshot (tag staleness, not tag -> keys --
+   * see `updateTagsManifest`). Used by `BaseCacheHandler.maybeSyncTagsManifest()`
+   * to fold another replica's `revalidateTag()` into this process's own
+   * in-memory state.
+   *
+   * Always returns a record (never the "unchanged" null the GCS handler can
+   * return): this handler backs single-instance/dev deployments where the file
+   * is local, so there's no body-transfer cost worth optimising away.
    */
-  protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
+  protected async readTagsManifest(): Promise<TagsManifestRecord | null> {
+    try {
+      if (!fs.existsSync(this.tagsManifestFile)) {
+        return {};
+      }
+      const data = await readFile(this.tagsManifestFile, 'utf-8');
+      return JSON.parse(data);
+    } catch (error) {
+      this.log.warn('Error reading tags manifest:', error);
+      return {};
+    }
+  }
+
+  /**
+   * Read-modify-write the shared tags-manifest. Called directly (not buffered)
+   * from `revalidateTag()` -- see that method's own comment for why.
+   *
+   * Writes via a temp file + rename so a concurrent reader never observes a
+   * half-written JSON document. The read-modify-write itself isn't guarded by
+   * a lock the way the GCS handler's generation precondition guards its own:
+   * this handler serves the single-instance/dev case, where there is no second
+   * writer to race with.
+   */
+  protected async updateTagsManifest(mutate: (current: TagsManifestRecord) => TagsManifestRecord): Promise<void> {
+    try {
+      await mkdir(this.tagsDir, { recursive: true });
+
+      const current = (await this.readTagsManifest()) ?? {};
+      const { pruned, dropped } = pruneTagsManifest(mutate(current), getTagsManifestRetentionMs());
+      if (dropped > 0) {
+        this.log.debug(`Pruned ${dropped} tags-manifest entr${dropped === 1 ? 'y' : 'ies'} older than retention`);
+      }
+
+      const tmpFile = `${this.tagsManifestFile}.${process.pid}.tmp`;
+      await writeFile(tmpFile, JSON.stringify(pruned, null, 2), 'utf-8');
+      await rename(tmpFile, this.tagsManifestFile);
+    } catch (error) {
+      this.log.error('Error writing tags manifest:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Override to use buffered updates instead of immediate writes.
+   *
+   * Queue-and-return, same as the GCS handler (see the comment on its
+   * `updateTagsMapping`). Single-process anyway, and `readTagsMapping()`
+   * flushes the buffer before reading, so a queued mapping is already visible
+   * to this process's own `revalidateTag()`.
+   */
+  protected override updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
     if (isDelete) {
       this.tagsBuffer.deleteKey(cacheKey);
     } else if (tags.length > 0) {
       this.tagsBuffer.addTags(cacheKey, tags);
     }
-    // Updates are queued and will be flushed automatically
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
+    return Promise.resolve();
   }
 
   // ============================================================================
@@ -149,7 +216,8 @@ export class FileCacheHandler extends BaseCacheHandler {
 
   private getCacheFilePath(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    const dir = cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
+    const dir =
+      cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
     // safeJoin guarantees the resolved path stays within the cache directory,
     // in addition to the character sanitization applied to the key above.
     return safeJoin(dir, `${safeKey}.json`);
@@ -297,6 +365,7 @@ export async function clearSharedCache(): Promise<number> {
   const routeCacheDir = path.join(process.cwd(), '.next', 'cache', 'route-cache');
   const imageCacheDir = path.join(process.cwd(), '.next', 'cache', 'image-cache');
   const tagsFilePath = path.join(process.cwd(), '.next', 'cache', 'tags', 'tags.json');
+  const tagsManifestPath = path.join(process.cwd(), '.next', 'cache', 'tags', 'manifest.json');
 
   const staticRoutes = getStaticRoutes();
   let clearedCount = 0;
@@ -314,8 +383,9 @@ export async function clearSharedCache(): Promise<number> {
     // Clear image cache (content-derived, no build/static-route scoping needed)
     clearedCount += await clearFetchCache(imageCacheDir);
 
-    // Clear tags mapping
+    // Clear tags mapping and the shared tags-manifest (staleness state)
     await clearTagsMapping(tagsFilePath);
+    await clearTagsMapping(tagsManifestPath);
 
     fileLog.info(`Total cleared: ${clearedCount} cache entries`);
     return clearedCount;

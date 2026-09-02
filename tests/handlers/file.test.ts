@@ -94,12 +94,8 @@ describe('FileCacheHandler', () => {
 
       await handler.set('image-key', cacheValue as any, { cacheControl: { revalidate: 60 } } as any);
 
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))
-      ).toBe(true);
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))
-      ).toBe(false);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))).toBe(true);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))).toBe(false);
 
       const result = await handler.get('image-key', { kind: 'IMAGE', isFallback: false } as any);
       expect(result).not.toBeNull();
@@ -233,6 +229,167 @@ describe('FileCacheHandler', () => {
         expect(tagsManifest.get('profile-tag')?.expired).toBe(softExpired);
       });
     });
+
+    describe('cross-replica propagation', () => {
+      afterEach(() => {
+        tagsManifest.clear();
+      });
+
+      // Regression test for the cross-replica staleness bug: `tagsManifest`
+      // is a process-local in-memory Map, so a revalidateTag() handled by one
+      // replica used to be invisible to every other one sharing the same
+      // storage backend. Two separate FileCacheHandler *instances* pointed at
+      // the same tempDir stand in for two OS-process replicas sharing one
+      // GCS bucket -- `tagsManifest.clear()` between them simulates "a
+      // process that never called revalidateTag itself", which is exactly
+      // what a fresh replica's own in-memory Map looks like.
+      it("a second handler instance's get() picks up a revalidateTag() the first instance performed", async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.set('shared-key', { kind: 'FETCH' as const } as any, { tags: ['shared-tag'] });
+
+        const before = Date.now();
+        await handlerA.revalidateTag('shared-tag');
+
+        // Simulate a separate replica: same shared store, but this process
+        // never called revalidateTag, so its in-memory tagsManifest is empty
+        // for this tag.
+        tagsManifest.delete('shared-tag');
+        const handlerB = new FileCacheHandler({} as any);
+
+        // get() is what triggers the sync pull in the real handler.
+        const entry = await handlerB.get('shared-key', { fetchIdx: 0 } as any);
+        expect(entry).not.toBeNull();
+
+        const synced = tagsManifest.get('shared-tag');
+        expect(synced?.expired).toBeGreaterThanOrEqual(before);
+      });
+
+      it('does not require a second get() call to pick up the sync (first get() on a fresh instance always syncs)', async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.revalidateTag('immediate-sync-tag');
+        const expiredAt = tagsManifest.get('immediate-sync-tag')?.expired;
+
+        tagsManifest.delete('immediate-sync-tag');
+        const handlerB = new FileCacheHandler({} as any);
+
+        await handlerB.get('unrelated-key');
+
+        expect(tagsManifest.get('immediate-sync-tag')?.expired).toBe(expiredAt);
+      });
+
+      it('a soft revalidation (durations.expire) also propagates to another instance', async () => {
+        const handlerA = new FileCacheHandler({} as any);
+        await handlerA.revalidateTag('soft-shared-tag', { expire: 60 });
+        const staleAt = tagsManifest.get('soft-shared-tag')?.stale;
+
+        tagsManifest.delete('soft-shared-tag');
+        const handlerB = new FileCacheHandler({} as any);
+        await handlerB.get('unrelated-key-2');
+
+        expect(tagsManifest.get('soft-shared-tag')?.stale).toBe(staleAt);
+      });
+
+      it('BLOCKS the first sync on a cold instance', async () => {
+        // A fresh replica has no local knowledge of any invalidation, so this
+        // one request is worth holding: otherwise it could serve content it
+        // would have known was stale.
+        const coldHandler = new FileCacheHandler({} as any);
+
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        vi.spyOn(coldHandler as any, 'readTagsManifest').mockImplementation(async () => {
+          await gate;
+          return {};
+        });
+
+        const inFlight = coldHandler.get('cold-key');
+        const raced = await Promise.race([
+          inFlight.then(() => 'resolved'),
+          new Promise((r) => setTimeout(() => r('pending'), 30)),
+        ]);
+
+        expect(raced).toBe('pending');
+
+        release();
+        await inFlight;
+      });
+
+      it('does NOT block the request on refreshes after the first sync', async () => {
+        // The recurring pull used to block one request every sync interval on
+        // two GCS round trips, forever, on the hottest path in the handler.
+        const warmHandler = new FileCacheHandler({} as any);
+        await warmHandler.get('warm-up'); // first (blocking) sync happens here
+
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const readSpy = vi.spyOn(warmHandler as any, 'readTagsManifest').mockImplementation(async () => {
+          await gate;
+          return {};
+        });
+
+        // Jump past the throttle window so the next get() triggers a refresh.
+        vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10_000);
+
+        // Would hang here (and time the test out) if the refresh were awaited.
+        await warmHandler.get('warm-key');
+
+        expect(readSpy).toHaveBeenCalled();
+
+        release();
+      });
+
+      it('does no shared-manifest I/O during the build phase', async () => {
+        process.env.NEXT_PHASE = 'phase-production-build';
+        try {
+          const buildHandler = new FileCacheHandler({} as any);
+          const readSpy = vi.spyOn(buildHandler as any, 'readTagsManifest');
+          const updateSpy = vi.spyOn(buildHandler as any, 'updateTagsManifest');
+
+          await buildHandler.get('build-key');
+          await buildHandler.revalidateTag('build-tag');
+
+          expect(readSpy).not.toHaveBeenCalled();
+          expect(updateSpy).not.toHaveBeenCalled();
+        } finally {
+          delete process.env.NEXT_PHASE;
+        }
+      });
+
+      it('writes the manifest atomically, leaving no temp file behind', async () => {
+        const atomicHandler = new FileCacheHandler({} as any);
+        await atomicHandler.revalidateTag('atomic-tag');
+
+        const tagsDir = path.join(tempDir, '.next', 'cache', 'tags');
+        const leftovers = fs.readdirSync(tagsDir).filter((f) => f.includes('.tmp'));
+
+        expect(leftovers).toEqual([]);
+        // And the manifest is complete, parseable JSON (not a torn write).
+        const manifest = JSON.parse(fs.readFileSync(path.join(tagsDir, 'manifest.json'), 'utf-8'));
+        expect(manifest['atomic-tag']).toBeDefined();
+      });
+
+      it('prunes manifest entries older than the retention window on write', async () => {
+        const tagsDir = path.join(tempDir, '.next', 'cache', 'tags');
+        const ancient = Date.now() - 400 * 24 * 60 * 60 * 1000;
+        fs.writeFileSync(
+          path.join(tagsDir, 'manifest.json'),
+          JSON.stringify({ 'ancient-tag': { expired: ancient }, 'recent-tag': { expired: Date.now() - 1000 } }),
+          'utf-8'
+        );
+
+        const pruneHandler = new FileCacheHandler({} as any);
+        await pruneHandler.revalidateTag('new-tag');
+
+        const manifest = JSON.parse(fs.readFileSync(path.join(tagsDir, 'manifest.json'), 'utf-8'));
+        expect(manifest['ancient-tag']).toBeUndefined();
+        expect(manifest['recent-tag']).toBeDefined();
+        expect(manifest['new-tag']).toBeDefined();
+      });
+    });
   });
 
   describe('extractTagsFromDataHeaders fallback', () => {
@@ -300,7 +457,7 @@ describe('FileCacheHandler', () => {
       expect(result).not.toBeNull();
 
       // Tags should be deduplicated
-      const tagCount = result!.tags.filter(t => t === 'shared-tag').length;
+      const tagCount = result!.tags.filter((t) => t === 'shared-tag').length;
       expect(tagCount).toBe(1);
 
       // All unique tags should be present
