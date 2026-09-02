@@ -9,12 +9,6 @@ import { createLogger } from './logger.js';
 export interface TagsBufferConfig {
   /** Minimum interval between flushes in milliseconds. Default: 1000ms */
   flushIntervalMs?: number;
-  /**
-   * Upper bound on how long {@link TagsBuffer.awaitDurable} will wait for a
-   * queued update to reach storage before giving up and returning. Default:
-   * 5000ms. Set to 0 to wait indefinitely.
-   */
-  durabilityTimeoutMs?: number;
   /** Read the current tags mapping from storage */
   readTagsMapping: () => Promise<Record<string, string[]>>;
   /** Write the tags mapping to storage */
@@ -29,27 +23,12 @@ interface PendingUpdate {
   tags?: string[];
 }
 
-/** A promise plus its resolver, used to signal that a batch reached storage. */
-interface Durability {
-  promise: Promise<void>;
-  resolve: () => void;
-}
-
-function createDurability(): Durability {
-  let resolve!: () => void;
-  const promise = new Promise<void>((r) => {
-    resolve = r;
-  });
-  return { promise, resolve };
-}
-
 /**
  * Buffers tag mapping updates to avoid GCS rate limiting.
  * Collects updates in memory and flushes them at most once per second.
  */
 export class TagsBuffer {
   private readonly flushIntervalMs: number;
-  private readonly durabilityTimeoutMs: number;
   private readonly readTagsMapping: () => Promise<Record<string, string[]>>;
   private readonly writeTagsMapping: (tagsMapping: Record<string, string[]>) => Promise<void>;
   private readonly log: ReturnType<typeof createLogger>;
@@ -60,15 +39,8 @@ export class TagsBuffer {
   private isFlushing = false;
   private flushPromise: Promise<void> | null = null;
 
-  /**
-   * Resolves once the currently-queued batch has been written to storage.
-   * Null when nothing is pending (i.e. everything queued so far is durable).
-   */
-  private durability: Durability | null = null;
-
   constructor(config: TagsBufferConfig) {
     this.flushIntervalMs = config.flushIntervalMs ?? 1000;
-    this.durabilityTimeoutMs = config.durabilityTimeoutMs ?? 5000;
     this.readTagsMapping = config.readTagsMapping;
     this.writeTagsMapping = config.writeTagsMapping;
     this.log = createLogger(config.handlerName ?? 'TagsBuffer');
@@ -89,7 +61,6 @@ export class TagsBuffer {
       tags,
     });
 
-    this.ensureDurability();
     this.scheduleFlush();
   }
 
@@ -103,7 +74,6 @@ export class TagsBuffer {
       cacheKey,
     });
 
-    this.ensureDurability();
     this.scheduleFlush();
   }
 
@@ -119,54 +89,7 @@ export class TagsBuffer {
     }
 
     if (cacheKeys.length > 0) {
-      this.ensureDurability();
       this.scheduleFlush();
-    }
-  }
-
-  /**
-   * Wait until everything queued so far has actually been written to storage.
-   *
-   * This is the durability guarantee callers need before they can treat a
-   * queued tag mapping as visible to OTHER processes. `flush()` forces an
-   * immediate write and so defeats the once-per-interval coalescing this
-   * buffer exists to provide; `awaitDurable()` instead waits for the already
-   * scheduled flush, so GCS still sees at most one write per interval per
-   * object. When the buffer is idle (nothing pending, last flush long enough
-   * ago) the scheduled delay is 0 and this resolves after a single round trip.
-   *
-   * Never rejects: a storage failure is retried by the buffer itself, and the
-   * caller has already durably written the cache entry this mapping describes,
-   * so surfacing the error here would only mask an otherwise successful write.
-   * Bounded by `durabilityTimeoutMs` so a request can never hang on storage.
-   */
-  async awaitDurable(): Promise<void> {
-    const durability = this.durability;
-    if (!durability) {
-      // Nothing pending -- everything queued so far already reached storage.
-      return;
-    }
-
-    if (this.durabilityTimeoutMs <= 0) {
-      await durability.promise;
-      return;
-    }
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), this.durabilityTimeoutMs);
-    });
-
-    try {
-      const outcome = await Promise.race([durability.promise.then(() => 'durable' as const), timedOut]);
-      if (outcome === 'timeout') {
-        this.log.warn(
-          `Tag mapping did not reach storage within ${this.durabilityTimeoutMs}ms (pending: ${this.pendingCount}) -- ` +
-            'continuing; the buffer will keep retrying, but a revalidateTag() in this window may not see these keys'
-        );
-      }
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -204,27 +127,6 @@ export class TagsBuffer {
     return this.pendingUpdates.length;
   }
 
-  /**
-   * Re-attach the durability signal of a batch that failed to write. If newer
-   * enqueues already opened a signal, chain onto it so awaiters of the failed
-   * batch resolve when the retry carrying their updates succeeds.
-   */
-  private restoreDurability(durability: Durability): void {
-    const newer = this.durability;
-    if (newer) {
-      newer.promise.then(durability.resolve, durability.resolve);
-    } else {
-      this.durability = durability;
-    }
-  }
-
-  /** Open a durability signal for the current batch if one isn't already open. */
-  private ensureDurability(): void {
-    if (!this.durability) {
-      this.durability = createDurability();
-    }
-  }
-
   private scheduleFlush(): void {
     // If a timer is already scheduled, let it handle the flush
     if (this.flushTimer) {
@@ -249,11 +151,9 @@ export class TagsBuffer {
 
     this.isFlushing = true;
 
-    // Take all pending updates, and the durability signal that covers them
+    // Take all pending updates
     const updates = this.pendingUpdates;
     this.pendingUpdates = [];
-    const durability = this.durability;
-    this.durability = null;
 
     try {
       // Read current state
@@ -266,18 +166,10 @@ export class TagsBuffer {
       await this.writeTagsMapping(tagsMapping);
 
       this.lastFlushTime = Date.now();
-      durability?.resolve();
       this.log.debug(`Flushed ${updates.length} tag updates`);
     } catch (error) {
       // On failure, put updates back for retry
       this.pendingUpdates = [...updates, ...this.pendingUpdates];
-      // These updates are not durable yet, so keep their signal unresolved and
-      // attached to whichever batch will carry them. Enqueues that landed
-      // during this flush opened a newer signal; chain onto it so awaiters of
-      // the older one resolve when the retry that includes them succeeds.
-      if (durability) {
-        this.restoreDurability(durability);
-      }
       this.log.error('Error flushing tags, will retry:', error);
 
       // Schedule a retry with backoff
@@ -338,9 +230,5 @@ export class TagsBuffer {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    // Nothing will flush after this, so release anyone in awaitDurable()
-    // rather than making them wait out the full durability timeout.
-    this.durability?.resolve();
-    this.durability = null;
   }
 }

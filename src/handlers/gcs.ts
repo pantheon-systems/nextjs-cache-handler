@@ -286,29 +286,26 @@ export class GcsCacheHandler extends BaseCacheHandler {
 
   /**
    * Override to use buffered (rate-limit-coalesced) updates instead of
-   * immediate per-key writes.
+   * immediate per-key writes, so GCS sees at most one tags.json write per
+   * flush interval regardless of how many entries are being cached.
    *
-   * The queued mapping is then awaited to durability before returning. This
-   * matters because THIS process's buffer is the only thing that can flush it:
-   * `readTagsMapping()` flushes the local buffer before reading, but a
-   * `revalidateTag()` served by any OTHER replica reads straight from GCS and
-   * cannot see a mapping still sitting in this process's memory. If the
-   * mapping never lands -- the container is scaled down or terminated before
-   * the flush timer fires, which on Cloud Run is the normal end of an idle
-   * instance's life -- the cache entry stays in GCS permanently unreachable by
-   * tag, so `revalidateTag()` finds no keys for it and the CDN purge for that
-   * path never happens. Awaiting here closes that window without defeating the
-   * coalescing: `awaitDurable()` waits for the SCHEDULED flush, so GCS still
-   * sees at most one tags.json write per interval.
+   * Queue-and-return: the caller is not held up waiting for the mapping to
+   * reach GCS. A mapping still sitting in this process's buffer is invisible
+   * to a `revalidateTag()` served by another replica (which reads GCS
+   * directly), and is lost outright if the container is scaled down before the
+   * flush timer fires. That gap costs only the supplementary path purge:
+   * `onRevalidateComplete` purges the CDN by surrogate key from the tags
+   * themselves and is deliberately not gated on the tag -> key mapping, so a
+   * lost mapping can no longer cause a silent no-purge.
    */
-  protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
+  protected override updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
     if (isDelete) {
       this.tagsBuffer.deleteKey(cacheKey);
     } else if (tags.length > 0) {
       this.tagsBuffer.addTags(cacheKey, tags);
     }
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
-    await this.tagsBuffer.awaitDurable();
+    return Promise.resolve();
   }
 
   // ============================================================================
