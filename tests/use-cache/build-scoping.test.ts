@@ -6,8 +6,7 @@ import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 // Reproduces the "redeploy the same Multidev environment" scenario behind the
 // use-cache-metadata-route-handler sitemap/manifest.json regression: a route
 // cached during one build must not be silently served (or silently lost) once
-// a later build reuses the same persisted store. See
-// e2e-deploy-suite-findings.md #9 in the adapter repo for the original symptom.
+// a later build reuses the same persisted store.
 
 let mockBuildId = 'build-A';
 vi.mock('../../src/utils/build-detection.js', () => ({

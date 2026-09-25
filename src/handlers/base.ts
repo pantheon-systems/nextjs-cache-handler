@@ -13,9 +13,26 @@ import { serializeForStorage, deserializeFromStorage } from '../utils/serializat
 import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import {
+  mergeRemoteTagsManifest,
+  mergeManifestForWrite,
+  snapshotLocalTagsManifest,
+  type TagsManifestRecord,
+} from '../utils/tags-manifest-sync.js';
 
 // Global singleton to track if build invalidation has been checked for this process
 let buildInvalidationChecked = false;
+
+/**
+ * How often a replica pulls the shared tags-manifest snapshot into its own
+ * process-local `tagsManifest` Map (see `get()`/`maybeSyncTagsManifest()`
+ * below). This bounds how long a `revalidateTag()`/`updateTag()` call on one
+ * replica can take to become visible on another — without this sync, it would
+ * never become visible at all. Kept short enough that "on-demand" revalidation
+ * still feels close to immediate, long enough that it doesn't turn every
+ * `get()` into a network round trip.
+ */
+const MANIFEST_SYNC_INTERVAL_MS = 2000;
 
 /**
  * Minimal shape of Next.js's built-in FileSystemCache that we delegate to for
@@ -83,6 +100,20 @@ export abstract class BaseCacheHandler {
   // close. Cleared to null once awaited so later get()/set() calls short-circuit.
   private initPromise: Promise<void> | null = null;
 
+  // Throttles the shared-tags-manifest pull in get() to at most once per
+  // MANIFEST_SYNC_INTERVAL_MS. Tracked as an in-flight promise (like
+  // buildPrerenderFallbackPromise above) rather than a boolean so concurrent
+  // callers within the same window await the same read instead of each firing
+  // their own.
+  private manifestSyncPromise: Promise<void> | null = null;
+  private lastManifestSyncAt = 0;
+
+  // Whether this instance has completed at least one shared-manifest sync.
+  // The FIRST sync is awaited (a cold replica has no local knowledge at all, so
+  // it could otherwise serve content it would have known was invalidated);
+  // every later one runs in the background -- see maybeSyncTagsManifest().
+  private hasSyncedTagsManifest = false;
+
   constructor(context: FileSystemCacheContext, handlerName: string) {
     this.context = context;
     this.handlerName = handlerName;
@@ -111,6 +142,83 @@ export abstract class BaseCacheHandler {
   }
 
   /**
+   * Pulls the shared tags-manifest snapshot and merges it into this
+   * process's local `tagsManifest` Map, at most once per
+   * MANIFEST_SYNC_INTERVAL_MS. Failures are logged and swallowed -- a sync
+   * miss just means this replica stays unaware of a revalidation for another
+   * interval, not a request-affecting error.
+   *
+   * Only the FIRST sync on an instance is awaited. A cold replica has no local
+   * knowledge of any invalidation, so blocking that one request is worth it.
+   * After that, refreshes run in the background and the calling request is not
+   * held up: the merge is one-directional and idempotent, so awaiting it only
+   * tightens the visibility window by a single round trip -- and the
+   * MANIFEST_SYNC_INTERVAL_MS throttle already means an invalidation can be up
+   * to that interval late. Paying two blocking GCS round trips on one request
+   * every interval, forever, on the hottest path in the handler was not a good
+   * trade for that.
+   */
+  private async maybeSyncTagsManifest(): Promise<void> {
+    // Nothing to sync during the build: there are no other replicas, so the
+    // shared manifest cannot contain anything this process doesn't know. It
+    // also MUST not run here -- an unguarded blocking GCS read on the get()
+    // path is exactly the prerender stall that withBuildTimeout/
+    // BUILD_IO_TIMEOUT_MS exist to prevent (see gcs.ts readCacheEntry). The
+    // failure mode there is wall-clock blocking, not a thrown error, so
+    // catching it below would not have helped.
+    if (isBuildPhase()) {
+      return;
+    }
+
+    const inFlight = this.manifestSyncPromise;
+    if (inFlight) {
+      // Join the in-flight read only if we haven't got a baseline yet.
+      if (!this.hasSyncedTagsManifest) {
+        await inFlight;
+      }
+      return;
+    }
+
+    if (Date.now() - this.lastManifestSyncAt < MANIFEST_SYNC_INTERVAL_MS) {
+      return;
+    }
+
+    const sync = (async () => {
+      try {
+        const remote = await this.readTagsManifest();
+        // null means "unchanged since this instance last read it" -- nothing to
+        // merge, and no download was performed (see gcs.ts readTagsManifest).
+        if (remote !== null) {
+          const changed = mergeRemoteTagsManifest(remote);
+          if (changed > 0) {
+            this.log.debug(`Synced ${changed} tag(s) from shared tags-manifest`);
+          }
+        }
+      } catch (error) {
+        this.log.warn('Error syncing shared tags-manifest:', error);
+      } finally {
+        this.lastManifestSyncAt = Date.now();
+        this.hasSyncedTagsManifest = true;
+      }
+    })();
+
+    this.manifestSyncPromise = sync;
+    const settled = sync.finally(() => {
+      if (this.manifestSyncPromise === sync) {
+        this.manifestSyncPromise = null;
+      }
+    });
+
+    if (!this.hasSyncedTagsManifest) {
+      await settled;
+    } else {
+      // Background refresh. The body above already swallows every error, so
+      // this can't produce an unhandled rejection.
+      void settled;
+    }
+  }
+
+  /**
    * Initialize the handler. Should be called after construction.
    * Handles build invalidation check and tags mapping initialization.
    */
@@ -132,6 +240,36 @@ export abstract class BaseCacheHandler {
   protected abstract initializeTagsMapping(): Promise<void>;
   protected abstract readTagsMapping(): Promise<Record<string, string[]>>;
   protected abstract writeTagsMapping(tagsMapping: Record<string, string[]>): Promise<void>;
+
+  /**
+   * Shared-store persistence for tag staleness ({@link TagsManifestRecord}) --
+   * distinct from {@link readTagsMapping}/{@link writeTagsMapping}, which map
+   * tag -> cache keys. This is what makes `revalidateTag()` visible across
+   * replicas; see `maybeSyncTagsManifest()` and `revalidateTag()` below.
+   *
+   * Resolves to `null` when the shared snapshot has not changed since this
+   * instance last read it, so the caller can skip the merge and the
+   * implementation can skip transferring the (potentially large) body. Only
+   * valid for the sync path, whose merge is one-directional -- a read-modify-
+   * write must use {@link updateTagsManifest}, which always reads
+   * authoritatively.
+   */
+  protected abstract readTagsManifest(): Promise<TagsManifestRecord | null>;
+
+  /**
+   * Atomically read-modify-write the shared tags-manifest: `mutate` receives
+   * the current stored record and returns the record to store.
+   *
+   * Must be atomic with respect to other replicas. A plain read-then-write
+   * loses updates -- two replicas revalidating DIFFERENT tags inside the same
+   * round trip would each write a record missing the other's tag, and since
+   * nothing rewrites it afterwards the dropped invalidation is never seen by
+   * anyone else. Implementations use optimistic concurrency (GCS generation
+   * preconditions) and retry `mutate` against the fresher record on conflict,
+   * which is why `mutate` must be a pure function of its input and safe to
+   * call more than once.
+   */
+  protected abstract updateTagsManifest(mutate: (current: TagsManifestRecord) => TagsManifestRecord): Promise<void>;
 
   protected abstract readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null>;
   protected abstract writeCacheEntry(
@@ -327,6 +465,13 @@ export abstract class BaseCacheHandler {
     // before checkBuildInvalidation() (in initialize()) has had a chance to
     // wipe it.
     await this.ensureInitialized();
+
+    // Pull any tag revalidations another replica has recorded since our last
+    // sync into this process's own tagsManifest, so the areTagsExpired/
+    // areTagsStale checks Next's IncrementalCache runs right after this
+    // returns see them. Throttled, not per-request -- see
+    // MANIFEST_SYNC_INTERVAL_MS.
+    await this.maybeSyncTagsManifest();
 
     try {
       const cacheType = this.determineCacheType(ctx);
@@ -533,6 +678,36 @@ export abstract class BaseCacheHandler {
         tagsManifest.set(currentTag, updates);
       } else {
         tagsManifest.set(currentTag, { ...existingEntry, expired: now });
+      }
+    }
+
+    // Persist the same staleness update to the shared store so every OTHER
+    // replica's own get() eventually picks it up via maybeSyncTagsManifest()
+    // -- without this, only this process's own in-memory tagsManifest knows
+    // about the revalidation, and every other replica keeps serving the
+    // pre-revalidation value as fresh forever. Not buffered
+    // like updateTagsMapping()/TagsBuffer: revalidateTag() is a deliberate,
+    // comparatively rare call (unlike set(), which runs on every cache
+    // write), so a plain read-merge-write here is an acceptable cost and
+    // keeps the propagation delay to one round trip instead of up to a full
+    // buffer-flush interval on top of it.
+    //
+    // Done as an atomic read-modify-write (see updateTagsManifest): a plain
+    // read-then-write drops one of two concurrent revalidations of different
+    // tags, and nothing would ever rewrite the lost one.
+    //
+    // Skipped during the build for the same two reasons maybeSyncTagsManifest()
+    // skips it: there is no other replica to inform, and blocking GCS I/O on a
+    // prerender path is what trips cacheComponents' "uncached data outside
+    // <Suspense>". Nothing is lost by skipping -- an entry written
+    // later in the same build has a lastModified AFTER this invalidation, so
+    // the staleness wouldn't apply to it anyway.
+    if (!isBuildPhase()) {
+      try {
+        const localSnapshot = snapshotLocalTagsManifest(tagArray);
+        await this.updateTagsManifest((current) => mergeManifestForWrite(current, localSnapshot));
+      } catch (error) {
+        this.log.warn('Error persisting shared tags-manifest during revalidateTag:', error);
       }
     }
 

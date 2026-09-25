@@ -27,6 +27,16 @@ export interface UseCacheFileHandlerConfig {
  * - Single-instance deployments
  * - Testing
  */
+// Guards the same cross-replica staleness risk the legacy singular
+// cacheHandler has, but for this separate 'use cache' handler.
+// updateTags() on one replica only updates that
+// replica's own in-memory tagTimestamps Map immediately; every other replica
+// only picks it up when something reloads from disk. refreshTags() exists for
+// that, but relying solely on Next.js's own runtime to call it often enough is
+// not something this handler can guarantee -- so the read path also does its
+// own throttled re-sync, independent of whether refreshTags() ever fires.
+const MANIFEST_SYNC_INTERVAL_MS = 2000;
+
 export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
@@ -37,6 +47,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   // spuriously mismatch even within the same build.
   private readonly buildId: string = getBuildId();
   private tagTimestamps: Map<string, number> = new Map();
+  private lastSyncAt = 0;
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
     this.cacheDir = config.cacheDir ?? path.join(process.cwd(), '.next', 'cache', 'use-cache');
@@ -63,12 +74,36 @@ export class UseCacheFileHandler implements UseCacheHandler {
       if (fs.existsSync(this.tagsFile)) {
         const data = fs.readFileSync(this.tagsFile, 'utf-8');
         const parsed = JSON.parse(data);
-        this.tagTimestamps = new Map(Object.entries(parsed));
+        // Merge one-directionally: a tag's timestamp only ever advances. A
+        // stale read (or one that races a concurrent write) must never move a
+        // tag backwards toward "less recently invalidated" than what this
+        // process already knows.
+        for (const [tag, timestamp] of Object.entries(parsed) as [string, number][]) {
+          const existing = this.tagTimestamps.get(tag);
+          if (existing === undefined || timestamp > existing) {
+            this.tagTimestamps.set(tag, timestamp);
+          }
+        }
       }
     } catch (error) {
       log.warn('Error loading tag timestamps:', error);
-      this.tagTimestamps = new Map();
+      // Don't reset -- keep whatever this process already knew.
     }
+  }
+
+  /**
+   * Throttled re-sync of tag timestamps from disk, called from the read path
+   * so cross-replica invalidations become visible without depending on
+   * Next.js's own refreshTags() call frequency. At most once per
+   * MANIFEST_SYNC_INTERVAL_MS per handler instance.
+   */
+  private maybeSyncTagTimestamps(): void {
+    const now = Date.now();
+    if (now - this.lastSyncAt < MANIFEST_SYNC_INTERVAL_MS) {
+      return;
+    }
+    this.lastSyncAt = now;
+    this.loadTagTimestamps();
   }
 
   private saveTagTimestamps(): void {
@@ -115,6 +150,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
    */
   async get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined> {
     log.debug(`GET: ${cacheKey}`);
+    this.maybeSyncTagTimestamps();
 
     try {
       const filePath = this.getCacheFilePath(cacheKey);
@@ -206,6 +242,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
    * Return maximum revalidation timestamp for given tags.
    */
   async getExpiration(tags: string[]): Promise<number> {
+    this.maybeSyncTagTimestamps();
     let maxTimestamp = 0;
 
     for (const tag of tags) {

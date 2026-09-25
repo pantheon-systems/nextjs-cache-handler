@@ -329,6 +329,28 @@ describe('UseCacheGcsHandler', () => {
       expect(bothExpiration).toBe(secondTimestamp);
       expect(bothExpiration).toBeGreaterThan(firstTimestamp);
     });
+
+    // Same cross-replica staleness class as the legacy singular
+    // cacheHandler, in this separate 'use cache' GCS handler. A fresh handler instance's tags were
+    // loaded once at construction; without a re-sync on the read path, a tag
+    // invalidated by another replica AFTER this instance started would never
+    // become visible to it.
+    it("picks up a tag invalidation written after this instance's own initial load (cross-replica simulation)", async () => {
+      // Simulate this replica starting up before any invalidation exists.
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+
+      const handler = new UseCacheGcsHandler();
+      await new Promise((r) => setTimeout(r, 10)); // let constructor's initialize() finish
+
+      const before = Date.now();
+      // Simulate a DIFFERENT replica writing an invalidation to the shared
+      // GCS object after this instance already loaded its (empty) snapshot.
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ 'remote-tag': before }))]);
+
+      const expiration = await handler.getExpiration(['remote-tag']);
+      expect(expiration).toBeGreaterThanOrEqual(before);
+    });
   });
 
   describe('updateTags', () => {

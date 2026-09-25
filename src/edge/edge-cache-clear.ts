@@ -107,9 +107,31 @@ export class EdgeCacheClear {
     try {
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
       const cleanPath = normalizedPath.replace(/\/$/, '') || '/';
-      const pathSegment = cleanPath === '/' ? '/' : cleanPath.substring(1);
-      // Double-encode because the edge-cache-clearer expects URL-encoded values.
-      const encodedPathSegment = encodeURIComponent(encodeURIComponent(pathSegment));
+      // Encode the FULL path, leading slash included, exactly ONCE.
+      //
+      // Both halves of that matter, and both are dictated by what
+      // tenant-outbound-proxy's `DeleteCachePath` does with what we send:
+      //
+      // 1. Once, not twice. The proxy extracts our value via
+      //    `req.URL.EscapedPath()`, which preserves our encoding verbatim (it
+      //    does NOT decode), then adds exactly one `url.PathEscape()` pass of
+      //    its own before forwarding. So one pass from us is what makes the
+      //    gateway's value decode back to the real path; two passes leave a
+      //    literal "%2F" in it.
+      // 2. Leading slash included. A cache path at the gateway is "/blogs/post",
+      //    not "blogs/post". Stripping the slash for nested paths (while
+      //    keeping it for "/") sent two different shapes for the same kind of
+      //    value and made nested-path purges address the wrong key.
+      //
+      // `encodeURIComponent('/')` is "%2F", so the root path is unchanged by
+      // this — it was already the one case sending its leading slash.
+      //
+      // Keep this in sync with `clearSingleKey`, which must keep DOUBLE-encoding:
+      // the `/keys/{key}` route is single-segment on both the proxy and the
+      // gateway, and the proxy reads it with `req.PathValue()` (which decodes)
+      // and forwards it with no re-encode of its own. The asymmetry is
+      // deliberate.
+      const encodedPathSegment = encodeURIComponent(cleanPath);
       const url = `${this.baseUrl}/paths/${encodedPathSegment}`;
       edgeLog.debug(`Clearing path from edge cache: ${routePath} (encoded: ${encodedPathSegment}, url: ${url})`);
 
