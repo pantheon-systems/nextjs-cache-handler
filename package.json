@@ -63,7 +63,7 @@
   },
   "devDependencies": {
     "@types/node": "^22",
-    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/coverage-v8": "^5.0.1",
     "next": "^16.1.7",
     "prettier": "^3.0.0",
     "typescript": "^5.0.0",
