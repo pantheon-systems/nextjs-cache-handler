@@ -2,6 +2,10 @@
 
 ## 0.12.0
 
+### Changed
+
+- Bumped the `next` devDependency to `^16.3.6` (and the example app to `next@~16.3.6` with `react`/`react-dom@^19.3.0`) to test and confirm compatibility with Next.js 16.3.
+
 ### Fixed
 
 - `get` now returns `null` for a page, route handler or Pages Router entry that carries an expired tag, as Next.js's built-in `FileSystemCache.get` does. Entries whose tags are only stale are still returned, so `revalidateTag(tag, 'max')` keeps serving the last-good value while it regenerates. Before this, an immediate invalidation (`revalidateTag(tag, { expire: 0 })`, `updateTag` or `revalidatePath`) served stale content once on Next.js 16.2, and on 16.3 re-ran every cached scope on each affected route instead of only the tagged ones.
