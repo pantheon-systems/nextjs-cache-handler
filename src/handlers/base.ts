@@ -12,10 +12,13 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
-import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Global singleton to track if build invalidation has been checked for this process
 let buildInvalidationChecked = false;
+
+/** Entry kinds that Next.js's FileSystemCache drops when one of their tags has expired. */
+const ROUTE_KINDS = new Set(['APP_PAGE', 'APP_ROUTE', 'PAGES']);
 
 /**
  * Minimal shape of Next.js's built-in FileSystemCache that we delegate to for
@@ -312,6 +315,21 @@ export abstract class BaseCacheHandler {
     return tags;
   }
 
+  /**
+   * Whether a page, route handler or Pages Router entry carries a tag whose
+   * expiry has passed. Fetch entries are left to Next.js, which checks them itself.
+   */
+  private hasExpiredRouteTags(entry: CacheHandlerValue): boolean {
+    const value = entry.value as { kind?: string; headers?: Record<string, unknown> } | null;
+    if (!value || !ROUTE_KINDS.has(value.kind ?? '')) {
+      return false;
+    }
+
+    const header = value.headers?.['x-next-cache-tags'];
+    const tags = new Set([...(entry.tags ?? []), ...(typeof header === 'string' ? header.split(',') : [])]);
+    return tags.size > 0 && areTagsExpired([...tags], entry.lastModified);
+  }
+
   // ============================================================================
   // CacheHandler interface implementation
   // ============================================================================
@@ -355,6 +373,14 @@ export abstract class BaseCacheHandler {
         }
 
         this.log.debug(`MISS: ${cacheKey} (${cacheType})`);
+        return null;
+      }
+
+      // revalidateTag keeps entries so a stale one can be served while it
+      // regenerates. An expired one must not be: Next.js 16.2 serves it as stale
+      // anyway, and 16.3 re-renders the whole route. FileSystemCache returns null.
+      if (this.hasExpiredRouteTags(entry)) {
+        this.log.debug(`MISS: ${cacheKey} (${cacheType}, expired tag)`);
         return null;
       }
 
@@ -503,15 +529,10 @@ export abstract class BaseCacheHandler {
       affectedKeys.push(...cacheKeysForTag);
     }
 
-    // Update Next.js's shared tagsManifest so the staleness checks the
-    // IncrementalCache wrapper runs on every subsequent get() (areTagsStale /
-    // areTagsExpired) recognise this tag as invalidated. We deliberately do
-    // NOT delete the underlying stored entries here (unlike Next's own
-    // built-in FileSystemCache.revalidateTag, which also never deletes
-    // anything): the last-good value must stay servable so Next can serve it
-    // once while revalidating in the background, and — for cacheComponents
-    // (PPR) routes — so a dynamic request can still find the cached postponed
-    // state to resume from instead of being forced into a full fresh render.
+    // Record the invalidation in Next.js's shared tagsManifest instead of
+    // deleting entries, as FileSystemCache does. A stale entry stays servable
+    // while it regenerates, and PPR routes can resume from it; get() drops one
+    // whose tag has expired.
     //
     // `durations.expire` (present when the caller passed a cacheLife profile,
     // e.g. `revalidateTag(tag, 'minutes')`) sets a FUTURE expiry, which keeps

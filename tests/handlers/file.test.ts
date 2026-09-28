@@ -235,6 +235,76 @@ describe('FileCacheHandler', () => {
     });
   });
 
+  describe('route entries with an expired tag', () => {
+    // areTagsExpired only counts an expiry later than the entry's lastModified.
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const page = (tags: string) => ({
+      kind: 'APP_PAGE' as const,
+      html: '<html></html>',
+      headers: { 'x-next-cache-tags': tags },
+    });
+
+    afterEach(() => {
+      tagsManifest.clear();
+    });
+
+    it('returns null for a page whose header tag was expired immediately', async () => {
+      await handler.set('/expired-page', page('_N_T_/expired-page,posts') as any, { tags: [] });
+      await tick();
+      await handler.revalidateTag('posts');
+
+      expect(await handler.get('/expired-page')).toBeNull();
+    });
+
+    it('returns null after revalidateTag with { expire: 0 }', async () => {
+      await handler.set('/expire-zero', page('posts') as any, { tags: [] });
+      await tick();
+      await handler.revalidateTag('posts', { expire: 0 });
+
+      expect(await handler.get('/expire-zero')).toBeNull();
+    });
+
+    it('returns null when the expired tag came only from ctx.tags', async () => {
+      await handler.set('/ctx-tags', { kind: 'APP_ROUTE' as const, body: 'ok' } as any, { tags: ['posts'] });
+      await tick();
+      await handler.revalidateTag('posts');
+
+      expect(await handler.get('/ctx-tags')).toBeNull();
+    });
+
+    it('keeps returning a page whose tag is only stale', async () => {
+      await handler.set('/stale-page', page('posts') as any, { tags: [] });
+      await tick();
+      await handler.revalidateTag('posts', { expire: 3600 });
+
+      expect(await handler.get('/stale-page')).not.toBeNull();
+    });
+
+    it('keeps returning a page whose expired tag it does not carry', async () => {
+      await handler.set('/other-page', page('comments') as any, { tags: [] });
+      await tick();
+      await handler.revalidateTag('posts');
+
+      expect(await handler.get('/other-page')).not.toBeNull();
+    });
+
+    it('returns a page written after its tag expired', async () => {
+      await handler.revalidateTag('posts');
+      await tick();
+      await handler.set('/rewritten-page', page('posts') as any, { tags: [] });
+
+      expect(await handler.get('/rewritten-page')).not.toBeNull();
+    });
+
+    it('leaves fetch entries to Next.js, even with an expired tag', async () => {
+      await handler.set('fetch-key', { kind: 'FETCH' as const } as any, { tags: ['posts'] });
+      await tick();
+      await handler.revalidateTag('posts');
+
+      expect(await handler.get('fetch-key', { fetchIdx: 0 } as any)).not.toBeNull();
+    });
+  });
+
   describe('extractTagsFromDataHeaders fallback', () => {
     it('should extract tags from data.headers when ctx.tags is empty (APP_PAGE)', async () => {
       const cacheValue = {
@@ -404,13 +474,14 @@ describe('FileCacheHandler', () => {
       expect(tagsMapping['term-5']).toContain('/blogs');
       expect(tagsMapping['term-5']).toContain('/blogs/my-post');
 
-      // Revalidating post-100 must not throw, and — since staleness is tracked
-      // via tagsManifest rather than deletion — both pages stay retrievable so
-      // Next can still serve them once while it regenerates in the background.
+      // An immediate expiry of post-100 hides both pages that carry it, as
+      // FileSystemCache does. A stale-only revalidation keeps them; see
+      // 'route entries with an expired tag'.
       await expect(handler.revalidateTag('post-100')).resolves.not.toThrow();
 
-      expect(await handler.get('/blogs')).not.toBeNull();
-      expect(await handler.get('/blogs/my-post')).not.toBeNull();
+      expect(await handler.get('/blogs')).toBeNull();
+      expect(await handler.get('/blogs/my-post')).toBeNull();
+      tagsManifest.clear();
     });
   });
 
