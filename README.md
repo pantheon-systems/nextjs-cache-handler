@@ -103,6 +103,7 @@ interface CacheHandlerConfig {
 | `CACHE_BUCKET` | GCS bucket name for storing cache | Required for GCS handler |
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
+| `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
 
 ## API Reference
 
@@ -254,6 +255,50 @@ await cacheHandler.set('post-1', data, { tags: ['posts', 'blog'] });
 await cacheHandler.revalidateTag('posts');
 // All entries tagged with 'posts' are invalidated
 ```
+
+### How the mapping is written to GCS
+
+GCS allows roughly one write per second per object name, and the mapping is a
+single object (`cache/tags/tags.json`) shared by every server process. The GCS
+handler therefore:
+
+- keeps one write buffer per process, not per handler instance (Next.js
+  constructs a cache handler for every request), and writes the mapping at most
+  once per `CACHE_TAGS_FLUSH_INTERVAL_MS`, flushing from inside the request that
+  made the interval elapse, so it does not depend on background timers;
+- skips the write entirely when the mapping did not change (for example an ISR
+  regeneration of an already-mapped page);
+- writes with an `ifGenerationMatch` precondition, so concurrent processes merge
+  their updates instead of overwriting each other, and re-reads on a conflict;
+- never writes on `revalidateTag()`: reads overlay the process's pending updates
+  on the stored mapping;
+- on a failed write (including `429 rateLimitExceeded`) keeps the updates queued
+  and retries with exponential backoff (up to 60s). It logs one warning when a
+  failure streak starts and one when it recovers. After 10 consecutive failures
+  the batch is dropped with an error.
+
+A freshly cached page can therefore be absent from the mapping for up to the
+flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
+instances still logs `429` warnings during cold-cache bursts; lower it (minimum
+`1000`) if the mapping lag matters more than write headroom.
+
+Two situations still lose pending updates, and a lost update means a later
+`revalidateTag()` will not purge the CDN for that page: 10 consecutive failed
+writes (about 6 minutes at the default interval, logged as an error), and a
+process exiting with updates still queued. Next.js exits on `SIGTERM` before the
+handler can flush. If your app sets `NEXT_MANUAL_SIG_HANDLE` and handles the
+signal itself, call `flushSharedTagsMapping()` from this package before exiting.
+Call it from process-level code such as a custom `server.js`, which shares the
+module instance Next.js loaded the cache handler into. Code that Next.js bundles
+(route handlers, `instrumentation.ts`) may get its own copy of the package with
+an empty buffer registry, so a call from there flushes nothing. The function
+returns the number of buffers it flushed. A `0` from a shutdown hook that should
+have had pending updates means it ran in the wrong module instance.
+
+The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
+synchronously on `updateTags()` so other instances see revalidations promptly,
+but serializes concurrent calls, merges with the stored timestamps under the
+same generation precondition, and backs off on failure.
 
 ## Edge Cache Clearing
 

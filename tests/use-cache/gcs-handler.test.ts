@@ -5,6 +5,7 @@ import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 const mockFile = {
   exists: vi.fn(),
   download: vi.fn(),
+  getMetadata: vi.fn(),
   save: vi.fn(),
   delete: vi.fn(),
 };
@@ -23,6 +24,7 @@ vi.mock('@google-cloud/storage', () => {
       };
     },
     Bucket: vi.fn(),
+    RETRYABLE_ERR_FN_DEFAULT: () => true,
   };
 });
 
@@ -71,6 +73,7 @@ describe('UseCacheGcsHandler', () => {
     // Reset mock implementations
     mockFile.exists.mockResolvedValue([false]);
     mockFile.save.mockResolvedValue(undefined);
+    mockFile.getMetadata.mockResolvedValue([{ generation: '1' }]);
     mockFile.download.mockResolvedValue([Buffer.from('{}')]);
     mockFile.delete.mockResolvedValue(undefined);
     mockBucket.getFiles.mockResolvedValue([[]]);
@@ -340,11 +343,10 @@ describe('UseCacheGcsHandler', () => {
 
       await handler.updateTags(['blog'], [0]);
 
-      // Verify save was called with tag timestamps
-      expect(mockFile.save).toHaveBeenCalled();
-      const savedData = JSON.parse(mockFile.save.mock.calls[0][0]);
-      expect(savedData).toHaveProperty('blog');
-      expect(typeof savedData.blog).toBe('number');
+      // Verify save was called with tag timestamps (build meta may be saved concurrently)
+      const saved = mockFile.save.mock.calls.map(([data]) => JSON.parse(data as string)).find((d) => 'blog' in d);
+      expect(saved).toBeDefined();
+      expect(typeof saved.blog).toBe('number');
     });
 
     it('should handle empty tags array', async () => {
@@ -530,5 +532,128 @@ describe('UseCacheGcsHandler', () => {
       // Key should be sanitized
       expect(mockBucket.file).toHaveBeenCalledWith('use-cache/_api_cache_test_param_value.json');
     });
+  });
+});
+
+describe('UseCacheGcsHandler tag timestamp persistence', () => {
+  let originalCacheBucket: string | undefined;
+
+  /** save() calls that wrote the tag timestamps (not an entry or build meta). */
+  function timestampSaves() {
+    return mockFile.save.mock.calls.filter(([data]) => {
+      const parsed = JSON.parse(data as string);
+      return !('buildId' in parsed) && !('value' in parsed);
+    });
+  }
+
+  beforeEach(() => {
+    originalCacheBucket = process.env.CACHE_BUCKET;
+    process.env.CACHE_BUCKET = 'test-bucket';
+    delete process.env.OUTBOUND_PROXY_ENDPOINT;
+
+    vi.clearAllMocks();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    mockFile.exists.mockResolvedValue([true]);
+    mockFile.save.mockResolvedValue(undefined);
+    mockFile.getMetadata.mockResolvedValue([{ generation: '1' }]);
+    mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+    mockFile.delete.mockResolvedValue(undefined);
+    mockBucket.getFiles.mockResolvedValue([[]]);
+    mockBucket.file.mockReturnValue(mockFile);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    if (originalCacheBucket !== undefined) {
+      process.env.CACHE_BUCKET = originalCacheBucket;
+    } else {
+      delete process.env.CACHE_BUCKET;
+    }
+  });
+
+  it('writes with the generation it read as a precondition', async () => {
+    mockFile.getMetadata.mockResolvedValue([{ generation: '9' }]);
+
+    const handler = new UseCacheGcsHandler();
+    await handler.updateTags(['blog'], [0]);
+
+    expect(mockBucket.file).toHaveBeenCalledWith('use-cache/_tags.json', { generation: '9' });
+    const [, options] = timestampSaves()[0];
+    expect(options).toMatchObject({ resumable: false, preconditionOpts: { ifGenerationMatch: '9' } });
+  });
+
+  it('merges newer stored timestamps instead of overwriting them', async () => {
+    const future = Date.now() + 100_000;
+    mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ other: future, blog: 5 }))]);
+
+    const handler = new UseCacheGcsHandler();
+    await handler.updateTags(['blog'], [0]);
+
+    const saved = JSON.parse(timestampSaves()[0][0] as string);
+    expect(saved.other).toBe(future);
+    expect(saved.blog).toBeGreaterThan(5);
+    expect(await handler.getExpiration(['other'])).toBe(future);
+  });
+
+  it('re-reads and retries after a 412', async () => {
+    mockFile.getMetadata.mockResolvedValueOnce([{ generation: '1' }]).mockResolvedValueOnce([{ generation: '2' }]);
+    let attempts = 0;
+    mockFile.save.mockImplementation(async (data: string) => {
+      const parsed = JSON.parse(data);
+      if ('buildId' in parsed || 'value' in parsed) return;
+      if (attempts++ === 0) {
+        throw Object.assign(new Error('Precondition Failed'), { code: 412 });
+      }
+    });
+
+    const handler = new UseCacheGcsHandler();
+    await handler.updateTags(['blog'], [0]);
+
+    const saves = timestampSaves();
+    expect(saves).toHaveLength(2);
+    expect(saves[1][1]).toMatchObject({ preconditionOpts: { ifGenerationMatch: '2' } });
+  });
+
+  it('coalesces concurrent updateTags calls into serialized writes', async () => {
+    const handler = new UseCacheGcsHandler();
+    await Promise.all([handler.updateTags(['a'], [0]), handler.updateTags(['b'], [0]), handler.updateTags(['c'], [0])]);
+
+    const saves = timestampSaves();
+    expect(saves.length).toBeGreaterThanOrEqual(1);
+    expect(saves.length).toBeLessThanOrEqual(2);
+    const last = JSON.parse(saves[saves.length - 1][0] as string);
+    expect(Object.keys(last).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('backs off after a failed write and retries in the background', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    mockFile.save.mockImplementation(async (data: string) => {
+      const parsed = JSON.parse(data);
+      if ('buildId' in parsed || 'value' in parsed) return;
+      if (attempts++ === 0) {
+        throw Object.assign(new Error('rateLimitExceeded'), { code: 429 });
+      }
+    });
+
+    const handler = new UseCacheGcsHandler();
+    await handler.updateTags(['blog'], [0]);
+    expect(timestampSaves()).toHaveLength(1);
+    expect(console.warn).toHaveBeenCalledTimes(1);
+
+    // Still backing off: the next update stays in memory, no write.
+    await handler.updateTags(['news'], [0]);
+    expect(timestampSaves()).toHaveLength(1);
+    expect(await handler.getExpiration(['news'])).toBeGreaterThan(0);
+
+    // Backoff after one failure is at most 2s.
+    await vi.advanceTimersByTimeAsync(2100);
+
+    const saves = timestampSaves();
+    expect(saves).toHaveLength(2);
+    expect(Object.keys(JSON.parse(saves[1][0] as string)).sort()).toEqual(['blog', 'news']);
   });
 });

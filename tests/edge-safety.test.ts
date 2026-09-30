@@ -10,6 +10,7 @@ import {
   clearSharedCache,
   clearEdgeCache,
   clearEdgeCachePaths,
+  flushSharedTagsMapping,
 } from '../src/index.edge.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));

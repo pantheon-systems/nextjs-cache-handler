@@ -7,6 +7,7 @@ import {
   getGcsSharedCacheStats,
   clearFileSharedCache,
   clearGcsSharedCache,
+  flushGcsTagsMapping,
   UseCacheFileHandler,
   UseCacheGcsHandler,
 } from './handlers/index.js';
@@ -149,6 +150,29 @@ export async function clearEdgeCache(): Promise<CacheClearResult | null> {
   const clearer = createEdgeCacheClearer();
   if (!clearer) return null;
   return clearer.nukeCache();
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+/**
+ * Write pending tag-mapping updates to GCS now. The GCS handler batches them
+ * (see CACHE_TAGS_FLUSH_INTERVAL_MS), and Next.js exits on SIGTERM before the
+ * handler can flush. If you set NEXT_MANUAL_SIG_HANDLE and handle SIGTERM
+ * yourself, call this before exiting.
+ *
+ * Call it from process-level code (a custom server), not from code Next.js
+ * bundles: a bundled copy of this package has its own, empty buffer registry.
+ *
+ * @returns the number of buffers flushed; 0 for the file handler or when this
+ *   module instance holds no buffers.
+ */
+export async function flushSharedTagsMapping(): Promise<number> {
+  if (!process.env.CACHE_BUCKET) {
+    return 0;
+  }
+  return flushGcsTagsMapping();
 }
 
 // ============================================================================
