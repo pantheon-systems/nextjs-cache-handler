@@ -114,7 +114,7 @@ export async function clearEdgeCache(): Promise<CacheClearResult | null> {
   return null;
 }
 
-export async function flushSharedTagsMapping(): Promise<number> {
+export async function flushSharedTagsMapping(_options?: { timeoutMs?: number }): Promise<number> {
   // Edge routes never write to the shared cache; nothing to flush.
   return 0;
 }

@@ -8,6 +8,7 @@ import {
   clearFileSharedCache,
   clearGcsSharedCache,
   flushGcsTagsMapping,
+  type FlushTagsMappingOptions,
   UseCacheFileHandler,
   UseCacheGcsHandler,
 } from './handlers/index.js';
@@ -165,14 +166,17 @@ export async function clearEdgeCache(): Promise<CacheClearResult | null> {
  * Call it from process-level code (a custom server), not from code Next.js
  * bundles: a bundled copy of this package has its own, empty buffer registry.
  *
+ * Retries a failed write until `timeoutMs` (default 8000 ms): several
+ * instances shutting down together take turns on the shared object.
+ *
  * @returns the number of buffers flushed; 0 for the file handler or when this
  *   module instance holds no buffers.
  */
-export async function flushSharedTagsMapping(): Promise<number> {
+export async function flushSharedTagsMapping(options?: FlushTagsMappingOptions): Promise<number> {
   if (!process.env.CACHE_BUCKET) {
     return 0;
   }
-  return flushGcsTagsMapping();
+  return flushGcsTagsMapping(options);
 }
 
 // ============================================================================
@@ -218,6 +222,7 @@ export type {
 } from './types.js';
 
 export type { CacheClearResult } from './edge/edge-cache-clear.js';
+export type { FlushTagsMappingOptions } from './handlers/gcs.js';
 
 export type {
   // Use cache types (Next.js 16)

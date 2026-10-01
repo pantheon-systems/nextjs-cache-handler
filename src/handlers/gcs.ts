@@ -51,19 +51,58 @@ async function readTagsSnapshot(bucket: Bucket, tagsMapKey: string): Promise<Tag
   return { mapping: value ?? {}, generation };
 }
 
+export interface FlushTagsMappingOptions {
+  /**
+   * How long to keep retrying a failed flush (the shared object accepts one
+   * write per second, so several instances shutting down together take turns).
+   * Default 8000 ms, inside Cloud Run's 10 s SIGTERM grace period.
+   */
+  timeoutMs?: number;
+}
+
 /**
- * Write every pending tag-mapping update in this process now. Never rejects.
- * Only sees buffers in this module instance (a copy bundled by Next has its own).
+ * Write every pending tag-mapping update in this process now, retrying until
+ * `timeoutMs`. Next.js exits on SIGTERM itself, so the handler cannot hook
+ * shutdown; an app that sets NEXT_MANUAL_SIG_HANDLE and handles the signal can
+ * call this before exiting so the last interval's updates are not lost. Never
+ * rejects.
  *
- * @returns the number of buffers that had pending updates and were flushed.
+ * Only sees buffers in this module instance. Code bundled by Next (routes,
+ * instrumentation) may carry its own copy of the package and see none; call it
+ * from process-level code such as a custom server.
+ *
+ * @returns the number of buffers that had pending updates and were fully flushed.
  */
-export async function flushGcsTagsMapping(): Promise<number> {
+export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {}): Promise<number> {
+  const deadline = Date.now() + (options.timeoutMs ?? 8000);
   const pending = [...sharedTagsBuffers.values()].filter((buffer) => buffer.hasPending);
   if (sharedTagsBuffers.size === 0) {
     gcsLog.debug('flushGcsTagsMapping: no tag buffers in this module instance (nothing to flush)');
   }
-  await Promise.all(pending.map((buffer) => buffer.flush()));
-  return pending.length;
+
+  const droppedBefore = new Map(pending.map((buffer) => [buffer, buffer.droppedUpdates]));
+  await Promise.all(
+    pending.map(async (buffer) => {
+      while (buffer.hasPending) {
+        await buffer.flush();
+        if (!buffer.hasPending) {
+          return;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          gcsLog.warn(
+            `flushGcsTagsMapping: ${buffer.pendingCount} tag update(s) still pending at the deadline; ` +
+              `they are lost if the process exits now`
+          );
+          return;
+        }
+        // The object takes one write per second; retrying faster only adds 429s.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 1000 + Math.random() * 500)));
+      }
+    })
+  );
+
+  return pending.filter((buffer) => !buffer.hasPending && buffer.droppedUpdates === droppedBefore.get(buffer)).length;
 }
 
 /**
