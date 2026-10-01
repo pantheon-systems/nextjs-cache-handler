@@ -29,10 +29,21 @@ export interface TagsBufferConfig {
   handlerName?: string;
   /** Longest delay between retries after failures. Default: 60s */
   maxBackoffMs?: number;
-  /** Consecutive failed flushes before the pending batch is dropped. Default: 10 */
-  maxConsecutiveFailures?: number;
+  /**
+   * How long updates may stay pending through failed flushes before the batch
+   * is dropped (with an error log). Default: 10 minutes. Age-based rather than
+   * attempt-based so a fast retry loop (e.g. a shutdown flush) cannot trip it.
+   */
+  maxPendingAgeMs?: number;
   /** How many 412 conflicts a single flush re-reads and retries through. Default: 3 */
   maxPreconditionRetries?: number;
+  /**
+   * Fraction by which each interval is randomly lengthened (0 to 1). Default: 0.25.
+   * Processes that start together would otherwise flush the shared object in the
+   * same second forever; upward-only jitter keeps the "at most once per interval"
+   * guarantee while spreading them out.
+   */
+  intervalJitter?: number;
 }
 
 interface PendingBatch {
@@ -55,8 +66,9 @@ export function resolveTagsFlushIntervalMs(raw: string | undefined = process.env
 export class TagsBuffer {
   private readonly flushIntervalMs: number;
   private readonly maxBackoffMs: number;
-  private readonly maxConsecutiveFailures: number;
+  private readonly maxPendingAgeMs: number;
   private readonly maxPreconditionRetries: number;
+  private readonly intervalJitter: number;
   private readonly readTagsMapping: TagsBufferConfig['readTagsMapping'];
   private readonly writeTagsMapping: TagsBufferConfig['writeTagsMapping'];
   private readonly log: ReturnType<typeof createLogger>;
@@ -68,17 +80,26 @@ export class TagsBuffer {
   /** Earliest time the next flush may start (interval pacing or failure backoff). */
   private nextFlushTime = 0;
   private consecutiveFailures = 0;
+  /** When the oldest currently-pending update was queued. */
+  private oldestPendingSince = 0;
+  private droppedUpdatesTotal = 0;
 
   constructor(config: TagsBufferConfig) {
     this.flushIntervalMs = config.flushIntervalMs ?? DEFAULT_TAGS_FLUSH_INTERVAL_MS;
     this.maxBackoffMs = config.maxBackoffMs ?? 60_000;
-    this.maxConsecutiveFailures = config.maxConsecutiveFailures ?? 10;
+    this.maxPendingAgeMs = config.maxPendingAgeMs ?? 600_000;
     this.maxPreconditionRetries = config.maxPreconditionRetries ?? 3;
+    this.intervalJitter = Math.min(1, Math.max(0, config.intervalJitter ?? 0.25));
     this.readTagsMapping = config.readTagsMapping;
     this.writeTagsMapping = config.writeTagsMapping;
     this.log = createLogger(config.handlerName ?? 'TagsBuffer');
     // Let the first flush collect a full interval's worth of updates.
-    this.nextFlushTime = Date.now() + this.flushIntervalMs;
+    this.nextFlushTime = Date.now() + this.nextInterval();
+  }
+
+  /** The configured interval, lengthened by up to `intervalJitter`. */
+  private nextInterval(): number {
+    return Math.round(this.flushIntervalMs * (1 + this.intervalJitter * Math.random()));
   }
 
   /** Queue a tag addition for a cache key. */
@@ -87,6 +108,7 @@ export class TagsBuffer {
       return;
     }
 
+    this.markPending();
     let set = this.pending.adds.get(cacheKey);
     if (!set) {
       set = new Set();
@@ -101,12 +123,16 @@ export class TagsBuffer {
 
   /** Queue a cache key's removal from every tag. */
   deleteKey(cacheKey: string): void {
+    this.markPending();
     this.pending.deletes.add(cacheKey);
     this.scheduleFlush();
   }
 
   /** Queue several cache keys for removal from every tag. */
   deleteKeys(cacheKeys: string[]): void {
+    if (cacheKeys.length > 0) {
+      this.markPending();
+    }
     for (const cacheKey of cacheKeys) {
       this.pending.deletes.add(cacheKey);
     }
@@ -122,6 +148,17 @@ export class TagsBuffer {
 
   get hasPending(): boolean {
     return this.pendingCount > 0;
+  }
+
+  /** Total updates dropped after exceeding maxPendingAgeMs (see onFlushFailure). */
+  get droppedUpdates(): number {
+    return this.droppedUpdatesTotal;
+  }
+
+  private markPending(): void {
+    if (!this.hasPending) {
+      this.oldestPendingSince = Date.now();
+    }
   }
 
   /**
@@ -200,6 +237,7 @@ export class TagsBuffer {
 
   private async doFlush(): Promise<void> {
     const batch = this.pending;
+    const batchSince = this.oldestPendingSince;
     this.pending = { adds: new Map(), deletes: new Set() };
     const batchSize = batch.adds.size + batch.deletes.size;
 
@@ -228,6 +266,7 @@ export class TagsBuffer {
       this.onFlushSuccess(batchSize, changed);
     } catch (error) {
       this.restorePending(batch);
+      this.oldestPendingSince = this.hasPending ? Math.min(batchSince, this.oldestPendingSince || batchSince) : 0;
       this.onFlushFailure(error);
     }
   }
@@ -235,7 +274,7 @@ export class TagsBuffer {
   private onFlushSuccess(batchSize: number, changed: boolean): void {
     const now = Date.now();
     this.lastFlushTime = now;
-    this.nextFlushTime = now + this.flushIntervalMs;
+    this.nextFlushTime = now + this.nextInterval();
 
     if (this.consecutiveFailures > 0) {
       this.log.warn(`Tags mapping write recovered after ${this.consecutiveFailures} failed attempt(s)`);
@@ -252,13 +291,16 @@ export class TagsBuffer {
     const code = getErrorStatusCode(error);
     const reason = code === 429 ? 'rate limited (429)' : code ? `HTTP ${code}` : 'error';
 
-    if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+    const pendingForMs = Date.now() - this.oldestPendingSince;
+    if (pendingForMs > this.maxPendingAgeMs) {
       const dropped = this.pendingCount;
       this.pending = { adds: new Map(), deletes: new Set() };
+      this.droppedUpdatesTotal += dropped;
       this.consecutiveFailures = 0;
-      this.nextFlushTime = Date.now() + this.flushIntervalMs;
+      this.oldestPendingSince = 0;
+      this.nextFlushTime = Date.now() + this.nextInterval();
       this.log.error(
-        `Dropping ${dropped} pending tag update(s) after ${this.maxConsecutiveFailures} consecutive failed writes ` +
+        `Dropping ${dropped} pending tag update(s): writes have failed for ${Math.round(pendingForMs / 1000)}s ` +
           `(last: ${reason}). Revalidating tags may not purge the CDN for the affected pages.`,
         error
       );
