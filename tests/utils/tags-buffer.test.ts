@@ -40,6 +40,7 @@ describe('TagsBuffer', () => {
       readTagsMapping: mockRead,
       writeTagsMapping: mockWrite,
       handlerName: 'TestBuffer',
+      intervalJitter: 0, // timing tests below assume exact intervals
       ...extra,
     });
     return buffer;
@@ -372,26 +373,88 @@ describe('TagsBuffer', () => {
       expect(vi.mocked(console.warn).mock.calls[1][0]).toContain('recovered');
     });
 
-    it('should drop the batch after too many consecutive failures', async () => {
+    it('should drop the batch once updates have been pending longer than maxPendingAgeMs', async () => {
       mockWrite.mockRejectedValue(httpError(429));
 
-      const buf = createBuffer(1000, { maxConsecutiveFailures: 3 });
+      const buf = createBuffer(1000, { maxPendingAgeMs: 5000 });
       buf.addTags('key1', ['tag1']);
 
-      await buf.flush();
-      await buf.flush();
+      // Many fast failures within the age limit: nothing dropped (attempt count is irrelevant).
+      for (let i = 0; i < 15; i++) {
+        await buf.flush();
+      }
       expect(buf.pendingCount).toBe(1);
+      expect(buf.droppedUpdates).toBe(0);
+      expect(console.error).not.toHaveBeenCalled();
 
+      vi.setSystemTime(Date.now() + 5001);
       await buf.flush();
       expect(buf.pendingCount).toBe(0);
+      expect(buf.droppedUpdates).toBe(1);
       expect(console.error).toHaveBeenCalledTimes(1);
       expect(vi.mocked(console.error).mock.calls[0][0]).toContain('Dropping 1 pending tag update(s)');
 
-      // A later flush starts a fresh streak
+      // A later flush starts fresh
       mockWrite.mockResolvedValue(undefined);
       buf.addTags('key2', ['tag2']);
       await buf.flush();
       expect(buf.pendingCount).toBe(0);
+      expect(buf.droppedUpdates).toBe(1);
+    });
+
+    it('should measure pending age from the oldest update, across failed flushes and new adds', async () => {
+      mockWrite.mockRejectedValue(httpError(429));
+
+      const buf = createBuffer(1000, { maxPendingAgeMs: 5000 });
+      buf.addTags('key1', ['tag1']);
+      await buf.flush(); // fails, key1 restored
+
+      vi.setSystemTime(Date.now() + 3000);
+      buf.addTags('key2', ['tag2']); // newer update must not reset the age
+      await buf.flush();
+      expect(buf.pendingCount).toBe(2);
+
+      vi.setSystemTime(Date.now() + 2500); // key1 now pending for 5.5s
+      await buf.flush();
+      expect(buf.pendingCount).toBe(0);
+      expect(buf.droppedUpdates).toBe(2);
+    });
+  });
+
+  describe('interval jitter', () => {
+    it('lengthens the interval by up to the configured fraction, never shortens it', async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(1);
+      const buf = createBuffer(1000, { intervalJitter: 0.25 });
+      buf.addTags('key1', ['tag1']);
+
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(mockWrite).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mockWrite).toHaveBeenCalledTimes(1);
+
+      // The next interval was drawn when that flush finished (still random=1 -> 1250ms).
+      vi.mocked(Math.random).mockReturnValue(0);
+      buf.addTags('key2', ['tag2']);
+      await vi.advanceTimersByTimeAsync(1100); // t=2400: next slot is 1250+1250=2500
+      expect(mockWrite).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(mockWrite).toHaveBeenCalledTimes(2);
+
+      // Now random=0 applies: exactly the configured interval.
+      buf.addTags('key3', ['tag3']);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mockWrite).toHaveBeenCalledTimes(3);
+    });
+
+    it('defaults to 25% upward jitter', async () => {
+      vi.spyOn(Math, 'random').mockReturnValue(1);
+      buffer = new TagsBuffer({ flushIntervalMs: 1000, readTagsMapping: mockRead, writeTagsMapping: mockWrite });
+      buffer.addTags('key1', ['tag1']);
+
+      await vi.advanceTimersByTimeAsync(1240);
+      expect(mockWrite).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(mockWrite).toHaveBeenCalledTimes(1);
     });
   });
 

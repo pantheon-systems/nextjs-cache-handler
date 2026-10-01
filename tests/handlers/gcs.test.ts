@@ -443,12 +443,14 @@ describe('GcsCacheHandler environment prefix', () => {
   it('should prefix tags mapping for multidev', async () => {
     process.env.PANTHEON_ENVIRONMENT = 'pr-42';
     vi.useFakeTimers();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0); // no interval jitter
     try {
       const handler = new GcsCacheHandler({} as any);
       await handler.set('key', { kind: 'FETCH' as const } as any, { tags: ['tag1'] });
       await vi.advanceTimersByTimeAsync(DEFAULT_TAGS_FLUSH_INTERVAL_MS + 100);
     } finally {
       vi.useRealTimers();
+      random.mockRestore();
     }
 
     expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/cache/tags/tags.json');
@@ -710,6 +712,7 @@ describe('GcsCacheHandler tags mapping writes', () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(Math, 'random').mockReturnValue(0); // no interval jitter: tests advance exact intervals
 
     mockFile.exists.mockResolvedValue([true]);
     mockFile.save.mockResolvedValue(undefined);
@@ -874,6 +877,44 @@ describe('GcsCacheHandler tags mapping writes', () => {
     // Nothing pending any more: reports 0 and writes nothing.
     expect(await flushGcsTagsMapping()).toBe(0);
     expect(tagsMappingSaves()).toHaveLength(1);
+  });
+
+  it('flushGcsTagsMapping keeps retrying a rate-limited write until the deadline', async () => {
+    let tagsAttempts = 0;
+    mockFile.save.mockImplementation(async (data: string) => {
+      const parsed = JSON.parse(data);
+      if ('lastModified' in parsed || 'buildId' in parsed) return;
+      if (tagsAttempts++ < 2) {
+        throw Object.assign(new Error('rateLimitExceeded'), { code: 429 });
+      }
+    });
+
+    const handler = new GcsCacheHandler({} as any);
+    await setWithTags(handler, 'key1', ['posts']);
+
+    const flushing = flushGcsTagsMapping({ timeoutMs: 8000 });
+    await vi.advanceTimersByTimeAsync(3500); // two ~1s retry waits
+    expect(await flushing).toBe(1);
+    expect(tagsMappingSaves()).toHaveLength(3);
+  });
+
+  it('flushGcsTagsMapping gives up at the deadline and warns about what is still pending', async () => {
+    mockFile.save.mockImplementation(async (data: string) => {
+      const parsed = JSON.parse(data);
+      if ('lastModified' in parsed || 'buildId' in parsed) return;
+      throw Object.assign(new Error('rateLimitExceeded'), { code: 429 });
+    });
+
+    const handler = new GcsCacheHandler({} as any);
+    await setWithTags(handler, 'key1', ['posts']);
+
+    const flushing = flushGcsTagsMapping({ timeoutMs: 2500 });
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(await flushing).toBe(0);
+    const warned = vi
+      .mocked(console.warn)
+      .mock.calls.some(([m]) => String(m).includes('still pending at the deadline'));
+    expect(warned).toBe(true);
   });
 
   it('uses a separate storage client for the tags mapping that does not retry 429s itself', async () => {
