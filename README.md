@@ -264,8 +264,9 @@ handler therefore:
 
 - keeps one write buffer per process, not per handler instance (Next.js
   constructs a cache handler for every request), and writes the mapping at most
-  once per `CACHE_TAGS_FLUSH_INTERVAL_MS`, flushing from inside the request that
-  made the interval elapse, so it does not depend on background timers;
+  once per `CACHE_TAGS_FLUSH_INTERVAL_MS` (plus up to 25% random jitter, so
+  instances that start together spread out), flushing from inside the request
+  that made the interval elapse, so it does not depend on background timers;
 - skips the write entirely when the mapping did not change (for example an ISR
   regeneration of an already-mapped page);
 - writes with an `ifGenerationMatch` precondition, so concurrent processes merge
@@ -274,8 +275,8 @@ handler therefore:
   on the stored mapping;
 - on a failed write (including `429 rateLimitExceeded`) keeps the updates queued
   and retries with exponential backoff (up to 60s). It logs one warning when a
-  failure streak starts and one when it recovers. After 10 consecutive failures
-  the batch is dropped with an error.
+  failure streak starts and one when it recovers. If updates have been pending
+  for more than 10 minutes of failed writes, the batch is dropped with an error.
 
 A freshly cached page can therefore be absent from the mapping for up to the
 flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
@@ -283,11 +284,18 @@ instances still logs `429` warnings during cold-cache bursts; lower it (minimum
 `1000`) if the mapping lag matters more than write headroom.
 
 Two situations still lose pending updates, and a lost update means a later
-`revalidateTag()` will not purge the CDN for that page: 10 consecutive failed
-writes (about 6 minutes at the default interval, logged as an error), and a
-process exiting with updates still queued. Next.js exits on `SIGTERM` before the
+`revalidateTag()` will not purge the CDN for that page: writes failing for
+more than 10 minutes (the pending batch is then dropped, logged as an error), and a
+process exiting with updates still queued. The shared object accepts one write per
+second in total, so a service that runs more than about 10 instances through a
+cold-cache event will see updates lag and, if many instances stop within the same
+few seconds, some of them exit with updates pending. Raise the flush interval, or
+keep max instances near that figure, for such sites. Next.js exits on `SIGTERM` before the
 handler can flush. If your app sets `NEXT_MANUAL_SIG_HANDLE` and handles the
 signal itself, call `flushSharedTagsMapping()` from this package before exiting.
+It retries a failed write until a deadline (`{ timeoutMs }`, default 8000 ms, inside
+Cloud Run's 10 s grace period), since several instances shutting down together take
+turns on the shared object.
 Call it from process-level code such as a custom `server.js`, which shares the
 module instance Next.js loaded the cache handler into. Code that Next.js bundles
 (route handlers, `instrumentation.ts`) may get its own copy of the package with

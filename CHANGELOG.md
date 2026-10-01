@@ -15,7 +15,9 @@
 - New optional `CACHE_TAGS_FLUSH_INTERVAL_MS` (default `5000`, minimum `1000`) controls how often each process writes the tag mapping. The previous fixed interval was `1000`.
 - The tag mapping and tag timestamps are no longer pretty-printed, and the tag mapping is no longer created on handler start (the first flush creates it with `ifGenerationMatch: 0`). This also removes the `exists()` call every request made on the mapping before its first cache operation.
 - All small JSON writes (cache entries, build meta, tag mapping, tag timestamps) use `resumable: false`, one HTTP round trip instead of two.
-- New `flushSharedTagsMapping()` export writes pending tag-mapping updates immediately and returns how many buffers it flushed, for apps that handle `SIGTERM` themselves via `NEXT_MANUAL_SIG_HANDLE`. Call it from process-level code (a custom server), not from code Next.js bundles.
+- New `flushSharedTagsMapping({ timeoutMs? })` export writes pending tag-mapping updates immediately, retrying a failed write until the deadline (default 8000 ms) because several instances shutting down together take turns on the shared object, and returns how many buffers were fully flushed. For apps that handle `SIGTERM` themselves via `NEXT_MANUAL_SIG_HANDLE`. Call it from process-level code (a custom server), not from code Next.js bundles.
+- The tag-mapping flush interval carries upward-only random jitter of up to 25% (`TagsBuffer` option `intervalJitter`), so processes that start together do not keep writing the shared object in the same second.
+- Pending tag updates are dropped only after they have been pending for more than 10 minutes of failed writes (`TagsBuffer` option `maxPendingAgeMs`), not after a fixed number of attempts.
 - `GcsCacheHandler.writeTagsMapping()` (protected, unused since updates go through the buffer) now throws instead of performing an unsafe whole-map write.
 - `TagsBuffer`'s `readTagsMapping`/`writeTagsMapping` callbacks now carry the object generation (`{ mapping, generation }` / `(mapping, generation)`). Only relevant if you construct `TagsBuffer` directly.
 
