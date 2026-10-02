@@ -1,10 +1,23 @@
-import { Bucket, Storage } from '@google-cloud/storage';
+import type { Bucket } from '@google-cloud/storage';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 import { getCacheGenerationId } from '../../utils/build-detection.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../../edge/edge-cache-clear.js';
+import {
+  getSharedStorage,
+  readJsonObject,
+  writeJsonObject,
+  isPreconditionFailure,
+  getErrorStatusCode,
+} from '../../utils/gcs-json-object.js';
+
+type TagTimestamps = Record<string, number>;
+
+const MAX_PRECONDITION_RETRIES = 3;
+const PERSIST_BASE_BACKOFF_MS = 1000;
+const PERSIST_MAX_BACKOFF_MS = 60_000;
 
 interface BuildMeta {
   buildId: string;
@@ -23,6 +36,7 @@ const log = createLogger('UseCacheGcsHandler');
  */
 export class UseCacheGcsHandler implements UseCacheHandler {
   private readonly bucket: Bucket;
+  private readonly tagsBucket: Bucket;
   private readonly cachePrefix: string;
   private readonly tagsKey: string;
   // Resolved once per instance, not per call: getCacheGenerationId()'s last-resort
@@ -38,14 +52,23 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
 
+  // Serialized, generation-checked persistence of tagTimestamps (see persistTagTimestamps).
+  private persistPromise: Promise<boolean> | null = null;
+  private persistDirty = false;
+  private persistBlockedUntil = 0;
+  private persistFailures = 0;
+  private persistRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor() {
     const bucketName = process.env.CACHE_BUCKET;
     if (!bucketName) {
       throw new Error('CACHE_BUCKET environment variable is required for GCS cache handler');
     }
 
-    const storage = new Storage();
-    this.bucket = storage.bucket(bucketName);
+    // Two clients on purpose: unconditional entry writes disable retries on
+    // their client's shared state, which must not leak into tag writes.
+    this.bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
+    this.tagsBucket = getSharedStorage(bucketName, 'tags').bucket(bucketName);
 
     const envPrefix = getEnvironmentPrefix();
     this.cachePrefix = `${envPrefix}use-cache/`;
@@ -105,6 +128,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     try {
       await file.save(JSON.stringify({ buildId: this.buildId, timestamp: Date.now() }), {
+        resumable: false,
         metadata: { contentType: 'application/json' },
       });
     } catch (error) {
@@ -133,30 +157,112 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       }
 
       const [data] = await file.download();
-      const parsed = JSON.parse(data.toString());
-      // Merge with existing in-memory state (local updates take precedence)
-      const loadedTimestamps = new Map<string, number>(Object.entries(parsed));
-      for (const [tag, timestamp] of loadedTimestamps) {
-        const existing = this.tagTimestamps.get(tag);
-        if (!existing || timestamp > existing) {
-          this.tagTimestamps.set(tag, timestamp);
-        }
-      }
+      this.mergeTagTimestamps(JSON.parse(data.toString()));
     } catch (error) {
       log.warn('Error loading tag timestamps:', error);
       // Don't reset - keep existing in-memory state
     }
   }
 
-  private async saveTagTimestamps(): Promise<void> {
-    try {
-      const obj = Object.fromEntries(this.tagTimestamps);
-      const file = this.bucket.file(this.tagsKey);
-      await file.save(JSON.stringify(obj, null, 2), {
-        metadata: { contentType: 'application/json' },
+  /** Merge stored timestamps into memory, keeping the newer value per tag. */
+  private mergeTagTimestamps(stored: TagTimestamps): void {
+    for (const [tag, timestamp] of Object.entries(stored)) {
+      const existing = this.tagTimestamps.get(tag);
+      if (!existing || timestamp > existing) {
+        this.tagTimestamps.set(tag, timestamp);
+      }
+    }
+  }
+
+  /**
+   * Persist tagTimestamps. Stays synchronous with updateTags() (other instances
+   * read it via refreshTags()), but serialized so bursts coalesce into one write,
+   * and generation-checked so instances merge. Failures retry in the background.
+   */
+  private async persistTagTimestamps(): Promise<void> {
+    this.persistDirty = true;
+
+    for (;;) {
+      if (this.persistPromise) {
+        await this.persistPromise;
+        if (!this.persistDirty) {
+          return;
+        }
+        continue;
+      }
+
+      if (!this.persistDirty || Date.now() < this.persistBlockedUntil) {
+        return;
+      }
+
+      this.persistPromise = this.doPersistTagTimestamps().finally(() => {
+        this.persistPromise = null;
       });
+      const ok = await this.persistPromise;
+      if (!ok) {
+        return;
+      }
+    }
+  }
+
+  private async doPersistTagTimestamps(): Promise<boolean> {
+    this.persistDirty = false;
+
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const { value: stored, generation } = await readJsonObject<TagTimestamps>(this.tagsBucket, this.tagsKey);
+        if (stored) {
+          this.mergeTagTimestamps(stored);
+        }
+
+        const merged = Object.fromEntries(this.tagTimestamps);
+        if (stored && sameTimestamps(stored, merged)) {
+          break;
+        }
+
+        try {
+          await writeJsonObject(this.tagsBucket, this.tagsKey, merged, generation);
+          break;
+        } catch (error) {
+          if (isPreconditionFailure(error) && attempt < MAX_PRECONDITION_RETRIES) {
+            log.debug(`Tag timestamps changed underneath us (generation ${generation}), re-reading`);
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (this.persistFailures > 0) {
+        log.warn(`Tag timestamps write recovered after ${this.persistFailures} failed attempt(s)`);
+        this.persistFailures = 0;
+      }
+      return true;
     } catch (error) {
-      log.error('Error saving tag timestamps:', error);
+      this.persistDirty = true;
+      this.persistFailures++;
+
+      const base = Math.min(PERSIST_BASE_BACKOFF_MS * 2 ** this.persistFailures, PERSIST_MAX_BACKOFF_MS);
+      const delay = Math.round(base * (0.75 + Math.random() * 0.25));
+      this.persistBlockedUntil = Date.now() + delay;
+
+      const code = getErrorStatusCode(error);
+      const reason = code === 429 ? 'rate limited (429)' : code ? `HTTP ${code}` : 'error';
+      if (this.persistFailures === 1) {
+        log.warn(`Tag timestamps write failed (${reason}); retrying in ${delay}ms`, error);
+      } else {
+        log.debug(
+          `Tag timestamps write failed again (${reason}, attempt ${this.persistFailures}), retrying in ${delay}ms`
+        );
+      }
+
+      if (!this.persistRetryTimer) {
+        this.persistRetryTimer = setTimeout(() => {
+          this.persistRetryTimer = null;
+          this.persistTagTimestamps().catch((e) => log.error('Tag timestamps retry failed:', e));
+        }, delay);
+        this.persistRetryTimer.unref?.();
+      }
+      return false;
     }
   }
 
@@ -281,6 +387,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       const file = this.bucket.file(gcsKey);
 
       await file.save(JSON.stringify(withBuildId, null, 2), {
+        resumable: false,
         metadata: { contentType: 'application/json' },
       });
 
@@ -338,7 +445,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       this.tagTimestamps.set(tag, now);
     }
 
-    await this.saveTagTimestamps();
+    await this.persistTagTimestamps();
     log.debug(`Updated ${tags.length} tag timestamps`);
   }
 
@@ -416,6 +523,14 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       keys,
     };
   }
+}
+
+function sameTimestamps(a: TagTimestamps, b: TagTimestamps): boolean {
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) {
+    return false;
+  }
+  return aKeys.every((tag) => a[tag] === b[tag]);
 }
 
 export default UseCacheGcsHandler;

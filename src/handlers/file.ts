@@ -1,7 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type {
+  CacheEntryType,
+  CacheStats,
+  CacheEntryInfo,
+  CacheHandlerValue,
+  FileSystemCacheContext,
+} from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
@@ -43,7 +49,8 @@ export class FileCacheHandler extends BaseCacheHandler {
     // Create tags buffer for batched writes (improves performance)
     this.tagsBuffer = new TagsBuffer({
       flushIntervalMs: 100, // File system can handle faster flushes than GCS
-      readTagsMapping: () => Promise.resolve(this.readTagsMappingDirect()),
+      // No generations on the local file system: nothing to precondition on.
+      readTagsMapping: () => Promise.resolve({ mapping: this.readTagsMappingDirect(), generation: 0 }),
       writeTagsMapping: (mapping) => {
         this.writeTagsMappingDirect(mapping);
         return Promise.resolve();
@@ -149,7 +156,8 @@ export class FileCacheHandler extends BaseCacheHandler {
 
   private getCacheFilePath(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    const dir = cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
+    const dir =
+      cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
     // safeJoin guarantees the resolved path stays within the cache directory,
     // in addition to the character sanitization applied to the key above.
     return safeJoin(dir, `${safeKey}.json`);

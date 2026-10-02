@@ -1,13 +1,121 @@
-import { Bucket, Storage } from '@google-cloud/storage';
-import type { CacheEntryType, CacheStats, CacheEntryInfo, CacheHandlerValue, FileSystemCacheContext } from '../types.js';
+import type { Bucket } from '@google-cloud/storage';
+import type {
+  CacheEntryType,
+  CacheStats,
+  CacheEntryInfo,
+  CacheHandlerValue,
+  FileSystemCacheContext,
+} from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
-import { TagsBuffer } from '../utils/tags-buffer.js';
+import {
+  TagsBuffer,
+  resolveTagsFlushIntervalMs,
+  type TagsMapping,
+  type TagsMappingSnapshot,
+} from '../utils/tags-buffer.js';
+import {
+  getSharedStorage,
+  readJsonObject,
+  writeJsonObject,
+  resetSharedStorageForTests,
+} from '../utils/gcs-json-object.js';
 import { createLogger } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
+
+// One buffer per (bucket, tags object) per process. Next.js constructs a new
+// cache handler for every request (IncrementalCache is request-scoped), so
+// state that paces writes to a shared object cannot live on the handler.
+const sharedTagsBuffers = new Map<string, TagsBuffer>();
+
+function getSharedTagsBuffer(bucketName: string, tagsBucket: Bucket, tagsMapKey: string): TagsBuffer {
+  const key = `${bucketName}/${tagsMapKey}`;
+  let buffer = sharedTagsBuffers.get(key);
+  if (!buffer) {
+    buffer = new TagsBuffer({
+      flushIntervalMs: resolveTagsFlushIntervalMs(),
+      readTagsMapping: () => readTagsSnapshot(tagsBucket, tagsMapKey),
+      writeTagsMapping: (mapping, generation) => writeJsonObject(tagsBucket, tagsMapKey, mapping, generation),
+      handlerName: 'GcsCacheHandler',
+    });
+    sharedTagsBuffers.set(key, buffer);
+  }
+  return buffer;
+}
+
+async function readTagsSnapshot(bucket: Bucket, tagsMapKey: string): Promise<TagsMappingSnapshot> {
+  const { value, generation } = await readJsonObject<TagsMapping>(bucket, tagsMapKey);
+  return { mapping: value ?? {}, generation };
+}
+
+export interface FlushTagsMappingOptions {
+  /**
+   * How long to keep retrying a failed flush (the shared object accepts one
+   * write per second, so several instances shutting down together take turns).
+   * Default 8000 ms, inside Cloud Run's 10 s SIGTERM grace period.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Write every pending tag-mapping update in this process now, retrying until
+ * `timeoutMs`. Next.js exits on SIGTERM itself, so the handler cannot hook
+ * shutdown; an app that sets NEXT_MANUAL_SIG_HANDLE and handles the signal can
+ * call this before exiting so the last interval's updates are not lost. Never
+ * rejects.
+ *
+ * Only sees buffers in this module instance. Code bundled by Next (routes,
+ * instrumentation) may carry its own copy of the package and see none; call it
+ * from process-level code such as a custom server.
+ *
+ * @returns the number of buffers that had pending updates and were fully flushed.
+ */
+export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {}): Promise<number> {
+  const deadline = Date.now() + (options.timeoutMs ?? 8000);
+  const pending = [...sharedTagsBuffers.values()].filter((buffer) => buffer.hasPending);
+  if (sharedTagsBuffers.size === 0) {
+    gcsLog.debug('flushGcsTagsMapping: no tag buffers in this module instance (nothing to flush)');
+  }
+
+  const droppedBefore = new Map(pending.map((buffer) => [buffer, buffer.droppedUpdates]));
+  await Promise.all(
+    pending.map(async (buffer) => {
+      while (buffer.hasPending) {
+        await buffer.flush();
+        if (!buffer.hasPending) {
+          return;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          gcsLog.warn(
+            `flushGcsTagsMapping: ${buffer.pendingCount} tag update(s) still pending at the deadline; ` +
+              `they are lost if the process exits now`
+          );
+          return;
+        }
+        // The object takes one write per second; retrying faster only adds 429s.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 1000 + Math.random() * 500)));
+      }
+    })
+  );
+
+  return pending.filter((buffer) => !buffer.hasPending && buffer.droppedUpdates === droppedBefore.get(buffer)).length;
+}
+
+/**
+ * Drop the process-wide tag buffers and storage clients.
+ * @internal Test hook.
+ */
+export function resetGcsSharedState(): void {
+  for (const buffer of sharedTagsBuffers.values()) {
+    buffer.destroy();
+  }
+  sharedTagsBuffers.clear();
+  resetSharedStorageForTests();
+}
 
 /**
  * Google Cloud Storage cache handler for production/Pantheon environments.
@@ -15,6 +123,7 @@ const gcsLog = createLogger('GcsCacheHandler');
  */
 export class GcsCacheHandler extends BaseCacheHandler {
   private readonly bucket: Bucket;
+  private readonly tagsBucket: Bucket;
   private readonly fetchCachePrefix: string;
   private readonly routeCachePrefix: string;
   private readonly imageCachePrefix: string;
@@ -32,8 +141,10 @@ export class GcsCacheHandler extends BaseCacheHandler {
       throw new Error('CACHE_BUCKET environment variable is required for GCS cache handler');
     }
 
-    const storage = new Storage();
-    this.bucket = storage.bucket(bucketName);
+    // Two clients on purpose: unconditional entry writes disable retries on
+    // their client's shared state, which must not leak into tag-map writes.
+    this.bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
+    this.tagsBucket = getSharedStorage(bucketName, 'tags').bucket(bucketName);
 
     const envPrefix = getEnvironmentPrefix();
     this.fetchCachePrefix = `${envPrefix}fetch-cache/`;
@@ -45,13 +156,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
 
     this.edgeCacheClearer = createEdgeCacheClearer();
 
-    // Create tags buffer for rate-limited writes
-    this.tagsBuffer = new TagsBuffer({
-      flushIntervalMs: 1000, // GCS rate limit is 1 write/second per object
-      readTagsMapping: () => this.readTagsMappingDirect(),
-      writeTagsMapping: (mapping) => this.writeTagsMapping(mapping),
-      handlerName: 'GcsCacheHandler',
-    });
+    this.tagsBuffer = getSharedTagsBuffer(bucketName, this.tagsBucket, this.tagsMapKey);
 
     // Initialize asynchronously (constructors can't be async) -- stored via
     // setInitPromise() so get()/set() can await it before touching the store.
@@ -63,69 +168,41 @@ export class GcsCacheHandler extends BaseCacheHandler {
   // ============================================================================
 
   protected async initializeTagsMapping(): Promise<void> {
-    try {
-      const file = this.bucket.file(this.tagsMapKey);
-      const [exists] = await file.exists();
-
-      if (!exists) {
-        await file.save(JSON.stringify({}), {
-          metadata: { contentType: 'application/json' },
-        });
-      }
-    } catch (error) {
-      this.log.error('Error initializing tags mapping:', error);
-      // Don't throw - tags mapping will be created on first write
-    }
+    // Nothing to create up front. The first flush writes the object with an
+    // `ifGenerationMatch: 0` precondition, so racing processes cannot clobber it.
   }
 
   /**
-   * Read tags mapping, flushing any pending updates first to ensure accuracy.
+   * Stored mapping with this process's pending updates overlaid. Does not
+   * write: a read (every revalidateTag) must not count against the object's
+   * write rate.
    */
   protected async readTagsMapping(): Promise<Record<string, string[]>> {
-    // Flush pending updates before reading to ensure we have accurate data
-    await this.tagsBuffer.flush();
-    return this.readTagsMappingDirect();
-  }
-
-  /**
-   * Direct read from GCS without flushing buffer.
-   * Used internally by the buffer.
-   */
-  private async readTagsMappingDirect(): Promise<Record<string, string[]>> {
+    let stored: TagsMapping = {};
     try {
-      const file = this.bucket.file(this.tagsMapKey);
-      const [exists] = await file.exists();
-
-      if (!exists) {
-        return {};
-      }
-
-      const [data] = await file.download();
-      return JSON.parse(data.toString());
+      stored = (await readTagsSnapshot(this.tagsBucket, this.tagsMapKey)).mapping;
     } catch (error) {
-      this.log.warn('Error reading tags mapping:', error);
-      return {};
+      this.log.error(
+        'Error reading tags mapping; this revalidation will not purge the CDN for entries stored by other processes:',
+        error
+      );
     }
+    return this.tagsBuffer.overlay(stored);
   }
 
   /**
-   * Write tags mapping directly to GCS.
-   * Used by the buffer for batched writes.
+   * Not supported: a whole-map write built from an earlier read cannot be made
+   * safe against concurrent flushes. Exists only because BaseCacheHandler
+   * declares it; updateTagsMapping is overridden so nothing reaches it.
    */
-  protected async writeTagsMapping(tagsMapping: Record<string, string[]>): Promise<void> {
-    try {
-      const file = this.bucket.file(this.tagsMapKey);
-      await file.save(JSON.stringify(tagsMapping, null, 2), {
-        metadata: { contentType: 'application/json' },
-      });
-    } catch (error) {
-      this.log.error('Error writing tags mapping:', error);
-      throw error; // Re-throw so buffer can retry
-    }
+  protected async writeTagsMapping(_tagsMapping: Record<string, string[]>): Promise<void> {
+    throw new Error('GcsCacheHandler.writeTagsMapping is not supported; tag updates go through the shared TagsBuffer');
   }
 
   /**
-   * Override to use buffered updates instead of immediate writes.
+   * Queue the update; flush inline when the interval has elapsed. Awaiting
+   * here (inside the request that produced the update) is deliberate: Cloud
+   * Run may not grant CPU to background timers between requests.
    */
   protected override async updateTagsMapping(cacheKey: string, tags: string[], isDelete = false): Promise<void> {
     if (isDelete) {
@@ -133,8 +210,12 @@ export class GcsCacheHandler extends BaseCacheHandler {
     } else if (tags.length > 0) {
       this.tagsBuffer.addTags(cacheKey, tags);
     }
-    // Updates are queued and will be flushed automatically
     this.log.debug(`Queued tags update for ${cacheKey} (pending: ${this.tagsBuffer.pendingCount})`);
+
+    const dueFlush = this.tagsBuffer.flushIfDue();
+    if (dueFlush) {
+      await dueFlush;
+    }
   }
 
   // ============================================================================
@@ -144,7 +225,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private getCacheKey(cacheKey: string, cacheType: CacheEntryType): string {
     const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
     const prefix =
-      cacheType === 'fetch' ? this.fetchCachePrefix : cacheType === 'image' ? this.imageCachePrefix : this.routeCachePrefix;
+      cacheType === 'fetch'
+        ? this.fetchCachePrefix
+        : cacheType === 'image'
+          ? this.imageCachePrefix
+          : this.routeCachePrefix;
     return `${prefix}${safeKey}.json`;
   }
 
@@ -179,6 +264,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const serializedData = this.serializeForStorage({ [cacheKey]: cacheValue });
 
       await file.save(JSON.stringify(serializedData[cacheKey], null, 2), {
+        resumable: false,
         metadata: { contentType: 'application/json' },
       });
     } catch (error) {
@@ -199,6 +285,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   protected async writeBuildMeta(meta: BuildMeta): Promise<void> {
     const file = this.bucket.file(this.buildMetaKey);
     await file.save(JSON.stringify(meta), {
+      resumable: false,
       metadata: { contentType: 'application/json' },
     });
   }
@@ -315,7 +402,7 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
     return { size: 0, keys: [], entries: [] };
   }
 
-  const storage = new Storage();
+  const storage = getSharedStorage(bucketName, 'entries');
   const bucket = storage.bucket(bucketName);
 
   const envPrefix = getEnvironmentPrefix();
@@ -404,7 +491,7 @@ export async function clearSharedCache(): Promise<number> {
     return 0;
   }
 
-  const storage = new Storage();
+  const storage = getSharedStorage(bucketName, 'entries');
   const bucket = storage.bucket(bucketName);
 
   const envPrefix = getEnvironmentPrefix();

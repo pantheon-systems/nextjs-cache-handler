@@ -32,6 +32,7 @@ vi.mock('@google-cloud/storage', () => ({
     return { bucket: () => mockBucket };
   },
   Bucket: vi.fn(),
+  RETRYABLE_ERR_FN_DEFAULT: () => true,
 }));
 
 // Mock fetch for edge cache clearing (used by the "clears the edge cache on

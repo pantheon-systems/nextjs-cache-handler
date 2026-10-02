@@ -1,12 +1,28 @@
 # Changelog
 
-## 0.12.1
+## 0.13.0
 
 ### Fixed
 
+- GCS tag-mapping writes (`cache/tags/tags.json`) no longer exceed GCS's one-write-per-second-per-object limit under load. Next.js constructs a cache handler per request, so the write buffer was per request rather than per process, and concurrent buffers overwrote each other's tag entries. The GCS handler now shares one buffer per process, writes with an `ifGenerationMatch` precondition (re-reading and re-applying on conflict), skips writes that would not change the mapping, no longer writes on `revalidateTag()` (pending updates are overlaid on the read instead), and retries failed writes with capped exponential backoff instead of every two seconds forever. Failures log one warning per streak instead of one error per attempt.
+- A failed read of the tag mapping no longer wipes it. Any transport or parse error used to be treated as an empty map, and the pending updates were written over the real one. Transport errors now fail the flush and the updates stay queued. An unparseable map is replaced under a generation precondition, with a warning.
+- Storage clients are shared per process and split by purpose: one for unconditional cache-entry and build-meta writes, one for the conditional tag-map and tag-timestamp writes. The client library disables retries on its shared state for unconditional uploads, so sharing one client could strip retries from the conditional writes. The tags client does not retry 429s itself. The handler's paced backoff handles rate limits.
+- The build-invalidation check on a cold start now runs once per process even when several handlers are constructed concurrently (the check is memoized as a promise instead of a flag set after an await).
+- `UseCacheGcsHandler.updateTags()` serializes concurrent writes of `use-cache/_tags.json`, merges with the stored timestamps under a generation precondition instead of overwriting them, and backs off after a failure.
 - A redeploy that changes the Next.js deployment ID (`deploymentId` in `next.config`, or `NEXT_DEPLOYMENT_ID`) now invalidates the route/ISR cache and the `use cache` entries, and purges the CDN. Next writes a constant `BUILD_ID` whenever a deployment ID is set, so the build-ID comparison never saw a new build. Build-scoped invalidation is now keyed on the build ID plus the deployment ID (`<BUILD_ID>:<deploymentId>`), read from `NEXT_DEPLOYMENT_ID` or `.next/routes-manifest.json`. Matches Vercel, whose ISR cache is scoped per deployment.
 
   **Upgrade behaviour:** sites with no deployment ID are unaffected (the key is exactly the old `BUILD_ID`, so no invalidation on upgrade). Sites with a deployment ID invalidate once on the first startup after upgrading.
+
+### Changed
+
+- New optional `CACHE_TAGS_FLUSH_INTERVAL_MS` (default `5000`, minimum `1000`) controls how often each process writes the tag mapping. The previous fixed interval was `1000`.
+- The tag mapping and tag timestamps are no longer pretty-printed, and the tag mapping is no longer created on handler start (the first flush creates it with `ifGenerationMatch: 0`). This also removes the `exists()` call every request made on the mapping before its first cache operation.
+- All small JSON writes (cache entries, build meta, tag mapping, tag timestamps) use `resumable: false`, one HTTP round trip instead of two.
+- New `flushSharedTagsMapping({ timeoutMs? })` export writes pending tag-mapping updates immediately, retrying a failed write until the deadline (default 8000 ms) because several instances shutting down together take turns on the shared object, and returns how many buffers were fully flushed. For apps that handle `SIGTERM` themselves via `NEXT_MANUAL_SIG_HANDLE`. Call it from process-level code (a custom server), not from code Next.js bundles.
+- The tag-mapping flush interval carries upward-only random jitter of up to 25% (`TagsBuffer` option `intervalJitter`), so processes that start together do not keep writing the shared object in the same second.
+- Pending tag updates are dropped only after they have been pending for more than 10 minutes of failed writes (`TagsBuffer` option `maxPendingAgeMs`), not after a fixed number of attempts.
+- `GcsCacheHandler.writeTagsMapping()` (protected, unused since updates go through the buffer) now throws instead of performing an unsafe whole-map write.
+- `TagsBuffer`'s `readTagsMapping`/`writeTagsMapping` callbacks now carry the object generation (`{ mapping, generation }` / `(mapping, generation)`). Only relevant if you construct `TagsBuffer` directly.
 
 ### Added
 
