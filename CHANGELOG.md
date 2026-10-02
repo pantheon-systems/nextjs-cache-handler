@@ -9,6 +9,9 @@
 - Storage clients are shared per process and split by purpose: one for unconditional cache-entry and build-meta writes, one for the conditional tag-map and tag-timestamp writes. The client library disables retries on its shared state for unconditional uploads, so sharing one client could strip retries from the conditional writes. The tags client does not retry 429s itself. The handler's paced backoff handles rate limits.
 - The build-invalidation check on a cold start now runs once per process even when several handlers are constructed concurrently (the check is memoized as a promise instead of a flag set after an await).
 - `UseCacheGcsHandler.updateTags()` serializes concurrent writes of `use-cache/_tags.json`, merges with the stored timestamps under a generation precondition instead of overwriting them, and backs off after a failure.
+- A redeploy that changes the Next.js deployment ID (`deploymentId` in `next.config`, or `NEXT_DEPLOYMENT_ID`) now invalidates the route/ISR cache and the `use cache` entries, and purges the CDN. Next writes a constant `BUILD_ID` whenever a deployment ID is set, so the build-ID comparison never saw a new build. Build-scoped invalidation is now keyed on the build ID plus the deployment ID (`<BUILD_ID>:<deploymentId>`), read from `NEXT_DEPLOYMENT_ID` or `.next/routes-manifest.json`. Matches Vercel, whose ISR cache is scoped per deployment.
+
+  **Upgrade behaviour:** sites with no deployment ID are unaffected (the key is exactly the old `BUILD_ID`, so no invalidation on upgrade). Sites with a deployment ID invalidate once on the first startup after upgrading.
 
 ### Changed
 
@@ -20,6 +23,10 @@
 - Pending tag updates are dropped only after they have been pending for more than 10 minutes of failed writes (`TagsBuffer` option `maxPendingAgeMs`), not after a fixed number of attempts.
 - `GcsCacheHandler.writeTagsMapping()` (protected, unused since updates go through the buffer) now throws instead of performing an unsafe whole-map write.
 - `TagsBuffer`'s `readTagsMapping`/`writeTagsMapping` callbacks now carry the object generation (`{ mapping, generation }` / `(mapping, generation)`). Only relevant if you construct `TagsBuffer` directly.
+
+### Added
+
+- `getCacheGenerationId()` exported from the utils. `getBuildId()` is unchanged and still returns the plain `BUILD_ID`.
 
 ## 0.12.0
 

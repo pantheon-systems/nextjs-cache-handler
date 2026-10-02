@@ -10,8 +10,10 @@ import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 // e2e-deploy-suite-findings.md #9 in the adapter repo for the original symptom.
 
 let mockBuildId = 'build-A';
+let mockDeploymentId = '';
 vi.mock('../../src/utils/build-detection.js', () => ({
   getBuildId: () => mockBuildId,
+  getCacheGenerationId: () => (mockDeploymentId ? `${mockBuildId}:${mockDeploymentId}` : mockBuildId),
   isBuildPhase: () => false,
 }));
 
@@ -75,6 +77,7 @@ describe('use-cache build scoping', () => {
         fs.rmSync(testCacheDir, { recursive: true, force: true });
       }
       mockBuildId = 'build-A';
+      mockDeploymentId = '';
     });
 
     afterEach(() => {
@@ -102,6 +105,17 @@ describe('use-cache build scoping', () => {
 
       const entry = await handlerB.get('sitemap', []);
       expect(entry).toBeUndefined();
+    });
+
+    it('misses after the deployment ID changes even though the build ID is unchanged', async () => {
+      mockBuildId = 'build-TfctsWXpff2fKS';
+      mockDeploymentId = 'dpl-1';
+      const handlerA = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      await handlerA.set('sitemap', Promise.resolve(createTestEntry('dpl-1-entry')));
+
+      mockDeploymentId = 'dpl-2';
+      const handlerB = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      expect(await handlerB.get('sitemap', [])).toBeUndefined();
     });
 
     it('serves the fresh entry the new build writes for the same key (the regression case)', async () => {
@@ -141,6 +155,7 @@ describe('use-cache build scoping', () => {
     beforeEach(() => {
       process.env.CACHE_BUCKET = 'test-bucket';
       mockBuildId = 'build-A';
+      mockDeploymentId = '';
       store = {};
 
       vi.clearAllMocks();
@@ -169,6 +184,17 @@ describe('use-cache build scoping', () => {
 
       const entry = await handlerB.get('sitemap', []);
       expect(entry).toBeUndefined();
+    });
+
+    it('misses after the deployment ID changes even though the build ID is unchanged', async () => {
+      mockBuildId = 'build-TfctsWXpff2fKS';
+      mockDeploymentId = 'dpl-1';
+      const handlerA = new UseCacheGcsHandler();
+      await handlerA.set('sitemap', Promise.resolve(createTestEntry('dpl-1-entry')));
+
+      mockDeploymentId = 'dpl-2';
+      const handlerB = new UseCacheGcsHandler();
+      expect(await handlerB.get('sitemap', [])).toBeUndefined();
     });
 
     it('serves the fresh entry the new build writes for the same key (the regression case)', async () => {

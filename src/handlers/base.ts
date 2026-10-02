@@ -10,7 +10,7 @@ import type {
   SerializedCacheData,
 } from '../types.js';
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
-import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
+import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
@@ -204,7 +204,8 @@ export abstract class BaseCacheHandler {
   // ============================================================================
 
   private async checkBuildInvalidation(): Promise<void> {
-    const currentBuildId = getBuildId();
+    // `buildId` holds the generation ID (build ID + deployment ID).
+    const currentBuildId = getCacheGenerationId();
 
     try {
       const buildMeta = await this.readBuildMeta();

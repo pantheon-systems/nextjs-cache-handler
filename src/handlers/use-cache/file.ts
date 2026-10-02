@@ -4,7 +4,7 @@ import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo }
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
-import { getBuildId } from '../../utils/build-detection.js';
+import { getCacheGenerationId } from '../../utils/build-detection.js';
 const log = createLogger('UseCacheFileHandler');
 
 /**
@@ -30,12 +30,13 @@ export interface UseCacheFileHandlerConfig {
 export class UseCacheFileHandler implements UseCacheHandler {
   private readonly cacheDir: string;
   private readonly tagsFile: string;
-  // Resolved once per instance, not per call: getBuildId()'s last-resort
+  // Resolved once per instance, not per call: getCacheGenerationId()'s last-resort
   // fallback (no .next/BUILD_ID or build-manifest.json present) is
   // `fallback-${Date.now()}`, which is NOT stable across separate calls --
   // comparing a fresh get()-time value against a fresh set()-time value would
   // spuriously mismatch even within the same build.
-  private readonly buildId: string = getBuildId();
+  // Holds the generation ID; the `buildId`/`__buildId` field names are kept.
+  private readonly buildId: string = getCacheGenerationId();
   private tagTimestamps: Map<string, number> = new Map();
 
   constructor(config: UseCacheFileHandlerConfig = {}) {
