@@ -14,8 +14,8 @@ import { getBuildId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
-// Global singleton to track if build invalidation has been checked for this process
-let buildInvalidationChecked = false;
+// Process-wide, in-flight-or-finished build invalidation check (see initialize()).
+let buildInvalidationPromise: Promise<void> | null = null;
 
 /** Entry kinds that Next.js's FileSystemCache drops when one of their tags has expired. */
 const ROUTE_KINDS = new Set(['APP_PAGE', 'APP_ROUTE', 'PAGES']);
@@ -52,7 +52,7 @@ function loadFileSystemCacheCtor(): Promise<FileSystemCacheCtor | null> {
  * @internal
  */
 export function resetBuildInvalidationCheck(): void {
-  buildInvalidationChecked = false;
+  buildInvalidationPromise = null;
 }
 
 export interface BuildMeta {
@@ -120,11 +120,16 @@ export abstract class BaseCacheHandler {
   protected async initialize(): Promise<void> {
     await this.initializeTagsMapping();
 
-    // Only check build invalidation once per process
+    // Only check build invalidation once per process. Memoized as a promise
+    // (not a flag set after the await) so handlers constructed concurrently on
+    // a cold start all wait for the one check instead of each running it.
     // Skip during build phase to avoid race conditions with parallel workers
-    if (!buildInvalidationChecked && !isBuildPhase()) {
-      await this.checkBuildInvalidation();
-      buildInvalidationChecked = true;
+    if (!isBuildPhase()) {
+      buildInvalidationPromise ??= this.checkBuildInvalidation().catch((error) => {
+        buildInvalidationPromise = null; // let the next handler retry
+        throw error;
+      });
+      await buildInvalidationPromise;
     }
   }
 

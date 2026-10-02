@@ -12,6 +12,8 @@ export {
   GcsCacheHandler,
   getSharedCacheStats as getGcsSharedCacheStats,
   clearSharedCache as clearGcsSharedCache,
+  flushGcsTagsMapping,
+  type FlushTagsMappingOptions,
 } from './gcs.js';
 
 // ============================================================================
