@@ -8,6 +8,8 @@ export class FakeBucket {
   private nextGeneration = 1;
   /** Fail the next N writes to a key with this status code. */
   readonly failWrites = new Map<string, { code: number; times: number }>();
+  /** Successful writes per key. */
+  readonly writes = new Map<string, number>();
 
   file(name: string, options?: { generation?: string | number }) {
     const error = (code: number) => Object.assign(new Error(`HTTP ${code}`), { code });
@@ -41,6 +43,7 @@ export class FakeBucket {
           if (String(current) !== String(expected)) throw error(412);
         }
         this.objects.set(name, { data, generation: this.nextGeneration++ });
+        this.writes.set(name, (this.writes.get(name) ?? 0) + 1);
       },
       delete: async () => {
         this.objects.delete(name);

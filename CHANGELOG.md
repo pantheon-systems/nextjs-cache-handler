@@ -18,11 +18,14 @@
 - Regenerating a Pages Router page also purges its `/_next/data/<buildId>/…json` data route, which client-side navigations fetch and the CDN caches.
 - CDN purges use the served URL on sites with `trailingSlash: true` (`/tags/`, not `/tags`) or a `basePath`.
 - `clearSharedCache()` keeps the cached entries of fully static routes again on Next.js 16.3.8+, whose route keys no longer matched the static-route list.
+- Every handler instance finds the build output. Next.js 16.3.8 constructs some instances without `serverDistDir` (seen with the handler bundled through `transpilePackages`); those now read `.next/server` under the working directory, so `revalidateTag()` on them also purges build-time prerenders.
 
 ### Changed
 
 - New optional `CACHE_TAGS_REFRESH_INTERVAL_MS` (default `1000`, minimum `100`): how often each process reads revalidations made by other processes.
-- `revalidateTag()` waits until the revalidation is stored in GCS (retrying for up to 5 s) before reading the tags mapping.
+- `revalidateTag()` stores the revalidation in GCS before reading the tags mapping (batching revalidations that arrive within 250 ms into one write, and retrying a failed write for up to 5 s), purges the CDN, then purges it again once every instance has applied the revalidation (two refresh intervals, 2 s by default). A server action that revalidates responds that much later. A revalidation that could not be stored is retried on later cache reads and at `flushSharedTagsMapping()`, and its second purge runs once it is stored.
+- A cache read waits at most 2 s for revalidations from other instances before serving with what the instance already knows.
+- At each deploy, the first instance of the new build prunes `revalidations.json` to the revalidations made since the previous build, deleting first the `fetch`/`unstable_cache` entries listed under the pruned tags (the only entries that survive a deploy and can be older). `build-meta.json` gains `builtAt`, so pruning starts at the second deploy after upgrading.
 
 ## 0.13.0
 

@@ -1,8 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { loadBuildPrerenderTags, resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
+import {
+  loadBuildPrerenderTags,
+  loadBuildTime,
+  resetBuildPrerenderTagsForTests,
+} from '../../src/utils/build-prerender-tags.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
 
 describe('loadBuildPrerenderTags', () => {
@@ -52,7 +56,30 @@ describe('loadBuildPrerenderTags', () => {
 
   it('returns an empty index without a build output', async () => {
     expect(await loadBuildPrerenderTags(serverDistDir)).toEqual({});
-    expect(await loadBuildPrerenderTags(undefined)).toEqual({});
+  });
+
+  it('reports when the prerenders were written, less a margin', async () => {
+    writeBuildOutput(serverDistDir, {
+      '/a': { key: 'a', tags: ['t'] },
+      '/b': { key: 'b', tags: ['t'] },
+    });
+    const older = new Date('2026-10-01T10:00:00Z');
+    fs.utimesSync(path.join(serverDistDir, 'app', 'a.meta'), older, older);
+
+    expect(await loadBuildTime(serverDistDir)).toBe(older.getTime() - 60_000);
+  });
+
+  it('reports no build time without App Router prerenders', async () => {
+    expect(await loadBuildTime(serverDistDir)).toBeNull();
+  });
+
+  it('falls back to .next/server under the working directory without a serverDistDir', async () => {
+    writeBuildOutput(serverDistDir, { '/a': { key: 'a', tags: ['t'] } });
+    vi.spyOn(process, 'cwd').mockReturnValue(tempDir);
+
+    expect(await loadBuildPrerenderTags(undefined)).toEqual({ t: ['/a'] });
+    expect(await loadBuildTime(undefined)).not.toBeNull();
+    vi.restoreAllMocks();
   });
 
   it('reads the build output once per process', async () => {

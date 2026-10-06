@@ -113,7 +113,7 @@ describe('GcsCacheHandler', () => {
 
       // The first flush creates the object with an ifGenerationMatch: 0 precondition instead.
       expect(mockBucket.file).not.toHaveBeenCalledWith('cache/tags/tags.json');
-      expect(mockFile.save).not.toHaveBeenCalled();
+      expect(tagsMappingSaves()).toHaveLength(0);
     });
   });
 
@@ -814,7 +814,10 @@ describe('GcsCacheHandler tags mapping writes', () => {
 
     const handler = new GcsCacheHandler({} as any);
     await setWithTags(handler, 'key2', ['posts']);
-    await handler.revalidateTag('posts');
+    // revalidateTag() waits for its batching window and second CDN purge.
+    const revalidated = handler.revalidateTag('posts');
+    await vi.advanceTimersByTimeAsync(1000);
+    await revalidated;
 
     expect(mockFile.getMetadata).toHaveBeenCalled();
     expect(tagsMappingSaves()).toHaveLength(0);
@@ -826,8 +829,9 @@ describe('GcsCacheHandler tags mapping writes', () => {
 
     const handler = new GcsCacheHandler({} as any);
     await setWithTags(handler, '/blogs/new', ['posts']);
-    await handler.revalidateTag('posts');
-    await vi.advanceTimersByTimeAsync(10);
+    const revalidated = handler.revalidateTag('posts');
+    await vi.advanceTimersByTimeAsync(1000);
+    await revalidated;
 
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/new'))}`),

@@ -30,7 +30,7 @@ import { writeBuildOutput } from '../helpers/build-output.js';
 
 vi.stubGlobal('fetch', vi.fn());
 
-/** The edge purges sent through the outbound proxy, decoded. */
+/** The edge purges sent through the outbound proxy, decoded (paths and keys deduplicated). */
 function sentPurges(): { paths: string[]; keys: string[]; nukes: number } {
   const urls = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
   const decode = (segment: string) => decodeURIComponent(decodeURIComponent(segment));
@@ -38,10 +38,8 @@ function sentPurges(): { paths: string[]; keys: string[]; nukes: number } {
     urls.filter((u) => u.includes(marker)).map((u) => decode(u.slice(u.indexOf(marker) + marker.length)));
   return {
     // The wire form drops the leading slash (except for `/`); edge-cache-clearer restores it.
-    paths: after('/cache/paths/')
-      .map((p) => (p.startsWith('/') ? p : `/${p}`))
-      .sort(),
-    keys: after('/cache/keys/').sort(),
+    paths: [...new Set(after('/cache/paths/').map((p) => (p.startsWith('/') ? p : `/${p}`)))].sort(),
+    keys: [...new Set(after('/cache/keys/'))].sort(),
     nukes: urls.filter((u) => u.endsWith('/rest/v0alpha1/cache')).length,
   };
 }
@@ -147,7 +145,8 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
       await newHandler().revalidateTag('_N_T_/layout');
       await settle();
 
-      expect(sentPurges()).toMatchObject({ paths: [], nukes: 1 });
+      // Once now, once after every instance has applied the revalidation.
+      expect(sentPurges()).toMatchObject({ paths: [], nukes: 2 });
     });
 
     it('purges the concrete pages of a dynamic route, not the pattern', async () => {

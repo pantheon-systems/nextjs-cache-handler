@@ -12,7 +12,7 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
-import { loadBuildPrerenderTags } from '../utils/build-prerender-tags.js';
+import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
 import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
@@ -60,6 +60,8 @@ export function resetBuildInvalidationCheck(): void {
 export interface BuildMeta {
   buildId: string;
   timestamp: number;
+  /** When the build's prerenders were written (see loadBuildTime); absent before 0.13.1. */
+  builtAt?: number;
 }
 
 /**
@@ -208,6 +210,8 @@ export abstract class BaseCacheHandler {
   private async checkBuildInvalidation(): Promise<void> {
     // `buildId` holds the generation ID (build ID + deployment ID).
     const currentBuildId = getCacheGenerationId();
+    const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
+    const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
 
     try {
       const buildMeta = await this.readBuildMeta();
@@ -216,19 +220,22 @@ export abstract class BaseCacheHandler {
         this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
 
         await this.invalidateRouteCache();
+        await this.onNewGeneration(buildMeta);
 
-        await this.writeBuildMeta({
-          buildId: currentBuildId,
-          timestamp: Date.now(),
-        });
+        await this.writeBuildMeta(currentMeta);
       }
     } catch {
       // No previous build metadata - first run, just save current build ID
-      await this.writeBuildMeta({
-        buildId: currentBuildId,
-        timestamp: Date.now(),
-      });
+      await this.writeBuildMeta(currentMeta);
     }
+  }
+
+  /**
+   * Called once a new build (generation) replaces `previous`, after the route
+   * cache is invalidated. Default: nothing.
+   */
+  protected async onNewGeneration(_previous: BuildMeta): Promise<void> {
+    // Default implementation does nothing
   }
 
   // ============================================================================
@@ -552,7 +559,7 @@ export abstract class BaseCacheHandler {
 
     // Published before the tags map is read: an instance flushing a key after
     // that read then sees the revalidation and purges the key itself.
-    await this.publishRevalidations(revalidations);
+    const published = await this.publishRevalidations(revalidations);
 
     let tagsMapping: Record<string, string[]>;
     try {
@@ -580,14 +587,14 @@ export abstract class BaseCacheHandler {
     this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
-    await this.onRevalidateComplete(tagArray, affectedKeys);
+    await this.onRevalidateComplete(tagArray, affectedKeys, published);
   }
 
   /**
    * Hook called after revalidation is complete.
    * Subclasses can override to perform additional cleanup.
    */
-  protected async onRevalidateComplete(_tags: string[], _affectedKeys: string[]): Promise<void> {
+  protected async onRevalidateComplete(_tags: string[], _affectedKeys: string[], _published = true): Promise<void> {
     // Default implementation does nothing
   }
 
@@ -600,9 +607,12 @@ export abstract class BaseCacheHandler {
     // Default implementation does nothing
   }
 
-  /** Share revalidations with other instances. Default: this process only. */
-  protected async publishRevalidations(_revalidations: SharedRevalidationMap): Promise<void> {
-    // Default implementation does nothing
+  /**
+   * Share revalidations with other instances. Resolves false if they could not
+   * be stored yet. Default: this process only.
+   */
+  protected async publishRevalidations(_revalidations: SharedRevalidationMap): Promise<boolean> {
+    return true;
   }
 
   /** Apply revalidations made by other instances to tagsManifest. Default: none. */

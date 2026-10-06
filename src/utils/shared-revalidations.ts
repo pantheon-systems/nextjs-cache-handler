@@ -35,7 +35,11 @@ export interface SharedRevalidationsConfig {
   refreshIntervalMs?: number;
   /** How long record() keeps retrying a failed write. Default 5000 ms. */
   recordTimeoutMs?: number;
+  /** How long a write waits so near-simultaneous revalidations share it. Default 250 ms. */
+  batchWindowMs?: number;
 }
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Tag revalidations shared by every instance through one GCS object, applied
@@ -44,8 +48,10 @@ export interface SharedRevalidationsConfig {
  * revalidations this process made.
  */
 export class SharedRevalidations {
-  private readonly refreshIntervalMs: number;
+  readonly refreshIntervalMs: number;
   private readonly recordTimeoutMs: number;
+  private readonly batchWindowMs: number;
+  private storedCallbacks: { tags: string[]; callback: () => void }[] = [];
   private readonly known = new Map<string, SharedRevalidation>();
   private readonly unwritten = new Map<string, SharedRevalidation>();
   private version = 0;
@@ -63,6 +69,24 @@ export class SharedRevalidations {
   ) {
     this.refreshIntervalMs = config.refreshIntervalMs ?? resolveTagsRefreshIntervalMs();
     this.recordTimeoutMs = config.recordTimeoutMs ?? 5000;
+    this.batchWindowMs = config.batchWindowMs ?? 250;
+  }
+
+  /** Whether revalidations are waiting to be stored (an earlier record() gave up). */
+  get hasUnwritten(): boolean {
+    return this.unwritten.size > 0;
+  }
+
+  /**
+   * Run `callback` once none of `tags` is waiting to be stored: now if they
+   * are stored, otherwise after the retry that stores them.
+   */
+  whenStored(tags: string[], callback: () => void): void {
+    if (tags.some((tag) => this.unwritten.has(tag))) {
+      this.storedCallbacks.push({ tags, callback });
+    } else {
+      callback();
+    }
   }
 
   /**
@@ -79,9 +103,13 @@ export class SharedRevalidations {
     const deadline = Date.now() + this.recordTimeoutMs;
 
     while (this.writtenVersion < mine) {
-      this.writing ??= this.writeOnce().finally(() => {
-        this.writing = null;
-      });
+      // The window lets revalidations from the same moment (Next calls once per
+      // cacheLife profile, in parallel) and from other requests share a write.
+      this.writing ??= delay(this.batchWindowMs)
+        .then(() => this.writeOnce())
+        .finally(() => {
+          this.writing = null;
+        });
       if (await this.writing) {
         continue;
       }
@@ -93,7 +121,7 @@ export class SharedRevalidations {
         return false;
       }
       // The object takes about one write per second.
-      await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 1000 + Math.random() * 500)));
+      await delay(Math.min(remaining, 1000 + Math.random() * 500));
     }
     return true;
   }
@@ -112,6 +140,52 @@ export class SharedRevalidations {
     if (this.unwritten.size > 0 && !this.writing) {
       // Retry entries an earlier record() gave up on.
       this.record({}).catch(() => {});
+    }
+  }
+
+  /**
+   * Remove stored revalidations older than `cutoff`, after `beforeRemove` has
+   * handled what they still affect (it receives their tags; if it throws,
+   * nothing is removed). Removing last means a reader that has not seen the
+   * outcome of `beforeRemove` still sees the revalidation. Safe to run from
+   * several instances at once. Returns the number of revalidations removed.
+   */
+  async prune(cutoff: number, beforeRemove: (tags: string[]) => Promise<void>): Promise<number> {
+    const { value: initial } = await readJsonObject<SharedRevalidationMap>(this.bucket, this.key);
+    const stale = Object.entries(initial ?? {})
+      .filter(([, entry]) => !isRevalidation(entry) || entry.at < cutoff)
+      .map(([tag]) => tag);
+    if (stale.length === 0) {
+      return 0;
+    }
+
+    await beforeRemove(stale);
+
+    for (let attempt = 0; ; attempt++) {
+      const { value: stored, generation } = await readJsonObject<SharedRevalidationMap>(this.bucket, this.key);
+      const kept: SharedRevalidationMap = {};
+      let removed = 0;
+      for (const [tag, entry] of Object.entries(stored ?? {})) {
+        // A tag revalidated again since the first read is kept.
+        if (stale.includes(tag) && (!isRevalidation(entry) || entry.at < cutoff)) {
+          removed++;
+        } else {
+          kept[tag] = entry;
+        }
+      }
+      if (removed === 0) {
+        return 0;
+      }
+      try {
+        await writeJsonObject(this.bucket, this.key, kept, generation);
+        log.info(`Pruned ${removed} revalidation(s) older than the previous build`);
+        return removed;
+      } catch (error) {
+        if (isPreconditionFailure(error) && attempt < MAX_PRECONDITION_RETRIES) {
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
@@ -166,7 +240,7 @@ export class SharedRevalidations {
         const merged: SharedRevalidationMap = { ...stored };
         let changed = false;
         for (const [tag, entry] of batch) {
-          if (!merged[tag] || merged[tag].at < entry.at) {
+          if (!isRevalidation(merged[tag]) || merged[tag].at < entry.at) {
             merged[tag] = entry;
             changed = true;
           }
@@ -191,6 +265,7 @@ export class SharedRevalidations {
         }
       }
       this.writtenVersion = Math.max(this.writtenVersion, snapshotVersion);
+      this.runStoredCallbacks();
       return true;
     } catch (error) {
       const code = getErrorStatusCode(error);
@@ -199,11 +274,23 @@ export class SharedRevalidations {
     }
   }
 
+  private runStoredCallbacks(): void {
+    const ready = this.storedCallbacks.filter(({ tags }) => !tags.some((tag) => this.unwritten.has(tag)));
+    this.storedCallbacks = this.storedCallbacks.filter((entry) => !ready.includes(entry));
+    for (const { callback } of ready) {
+      try {
+        callback();
+      } catch (error) {
+        log.error('Error after storing revalidations:', error);
+      }
+    }
+  }
+
   /** Keep the latest revalidation per tag and mirror it into tagsManifest. */
   private learn(entries: SharedRevalidationMap): void {
     for (const [tag, entry] of Object.entries(entries)) {
       const current = this.known.get(tag);
-      if (current && current.at >= entry.at) {
+      if (!isRevalidation(entry) || (current && current.at >= entry.at)) {
         continue;
       }
       this.known.set(tag, entry);
@@ -213,6 +300,11 @@ export class SharedRevalidations {
       });
     }
   }
+}
+
+/** Stored data is read back from GCS, so check its shape before trusting it. */
+function isRevalidation(value: unknown): value is SharedRevalidation {
+  return typeof value === 'object' && value !== null && typeof (value as SharedRevalidation).at === 'number';
 }
 
 const stores = new Map<string, SharedRevalidations>();
@@ -226,6 +318,23 @@ export function getSharedRevalidations(bucketName: string, bucket: Bucket, key: 
     stores.set(id, store);
   }
   return store;
+}
+
+/**
+ * Store revalidations an earlier record() gave up on, for shutdown. Returns
+ * whether every store has nothing left to write.
+ */
+export async function flushSharedRevalidations(timeoutMs: number): Promise<boolean> {
+  const pending = [...stores.values()].filter((store) => store.hasUnwritten);
+  const deadline = Date.now() + timeoutMs;
+  await Promise.all(
+    pending.map(async (store) => {
+      while (store.hasUnwritten && Date.now() < deadline) {
+        await store.record({});
+      }
+    })
+  );
+  return pending.every((store) => !store.hasUnwritten);
 }
 
 /** @internal Test hook. */
