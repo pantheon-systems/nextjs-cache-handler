@@ -296,7 +296,7 @@ describe('GcsCacheHandler', () => {
       expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/paths/'), expect.anything());
     });
 
-    it('should handle route cache keys with underscores (encoded paths)', async () => {
+    it('should purge / when the root page regenerates (cache key /index)', async () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
       mockFile.exists.mockResolvedValue([true]);
@@ -304,17 +304,16 @@ describe('GcsCacheHandler', () => {
       vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
       const handler = new GcsCacheHandler({} as any);
-      // Some cache keys use underscores to encode path separators
-      await handler.set('_blogs_my-post', { kind: 'APP_PAGE' as const } as any, { tags: [] });
+      // IncrementalCache stores `/` under `/index` (normalizePagePath).
+      await handler.set('/index', { kind: 'APP_PAGE' as const } as any, { tags: [] });
 
-      // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Should convert underscores to slashes and double-encode
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('/'))}`),
         expect.objectContaining({ method: 'DELETE' })
       );
+      expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/paths/index'), expect.anything());
     });
 
     it('should not clear edge cache when edge clearer is not configured', async () => {

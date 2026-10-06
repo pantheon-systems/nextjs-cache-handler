@@ -23,6 +23,7 @@ import {
 } from '../utils/gcs-json-object.js';
 import { createLogger } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
+import { cacheKeyToPurgePath, implicitTagsToPurgePaths } from '../utils/route-paths.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -334,17 +335,35 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // for tag invalidation, so it must be cleared immediately whenever a tag
     // is revalidated, even though the origin's own stored entry is intentionally
     // kept servable in the interim (see BaseCacheHandler.revalidateTag).
-    if (affectedKeys.length === 0 || !this.edgeCacheClearer) {
+    if (!this.edgeCacheClearer) {
       return;
     }
 
-    // Clear by tags/keys
+    // Sent even when no keys were found: they only match once responses carry
+    // the tags as Surrogate-Key, which the tenant router turns into purge keys.
     this.edgeCacheClearer.clearKeysInBackground(tags, `tag revalidation: ${tags.join(', ')}`);
 
-    // Also clear by route paths for routes that may not have tags (e.g., ISR routes)
-    const routePaths = this.extractRoutePaths(affectedKeys);
-    if (routePaths.length > 0) {
-      this.edgeCacheClearer.clearPathsInBackground(routePaths, `path revalidation: ${routePaths.join(', ')}`);
+    const implicit = implicitTagsToPurgePaths(tags);
+    if (implicit.purgeAll) {
+      this.edgeCacheClearer.nukeCacheInBackground(`root layout revalidation: ${tags.join(', ')}`);
+      return;
+    }
+
+    // revalidatePath's own path is purged even when the tags map has no key for it.
+    const routePaths = new Set(implicit.paths);
+    for (const key of affectedKeys) {
+      const routePath = cacheKeyToPurgePath(key);
+      if (routePath) {
+        routePaths.add(routePath);
+      } else if (key.startsWith('/')) {
+        this.log.debug(`Not purging shell pattern ${key}: it matches no URL`);
+      }
+    }
+
+    if (routePaths.size > 0) {
+      const paths = [...routePaths];
+      this.log.debug(`Purging edge paths for tags ${tags.join(', ')}: ${paths.join(', ')}`);
+      this.edgeCacheClearer.clearPathsInBackground(paths, `path revalidation: ${paths.join(', ')}`);
     }
   }
 
@@ -357,34 +376,13 @@ export class GcsCacheHandler extends BaseCacheHandler {
       return;
     }
 
-    const routePath = this.cacheKeyToRoutePath(cacheKey);
+    const routePath = cacheKeyToPurgePath(cacheKey);
+    if (!routePath) {
+      this.log.debug(`Not purging ${cacheKey}: it matches no URL`);
+      return;
+    }
+    this.log.debug(`Purging edge path for ISR update of ${cacheKey}: ${routePath}`);
     this.edgeCacheClearer.clearPathInBackground(routePath, `ISR route update: ${routePath}`);
-  }
-
-  private cacheKeyToRoutePath(cacheKey: string): string {
-    // Cache keys may be encoded (e.g., underscores for slashes)
-    // Convert to a proper path format
-    if (cacheKey.startsWith('/')) {
-      return cacheKey;
-    }
-
-    // Handle encoded paths (underscores represent slashes in some cases)
-    if (cacheKey.startsWith('_')) {
-      return cacheKey.replace(/_/g, '/');
-    }
-
-    return `/${cacheKey}`;
-  }
-
-  private extractRoutePaths(keys: string[]): string[] {
-    return keys
-      .filter((key) => key.startsWith('/') || key.startsWith('_'))
-      .map((key) => {
-        if (key.startsWith('_')) {
-          return key.replace(/_/g, '/');
-        }
-        return key.startsWith('/') ? key : `/${key}`;
-      });
   }
 }
 

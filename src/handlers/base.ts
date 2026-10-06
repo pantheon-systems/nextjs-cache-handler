@@ -12,6 +12,7 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
+import { loadBuildPrerenderTags } from '../utils/build-prerender-tags.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
@@ -523,8 +524,11 @@ export abstract class BaseCacheHandler {
       tagsMapping = {};
     }
 
+    // Build prerenders never pass through set(), so their keys come from the build output.
+    const buildTags = isBuildPhase() ? {} : await loadBuildPrerenderTags(this.context?.serverDistDir);
+
     for (const currentTag of tagArray) {
-      const cacheKeysForTag = tagsMapping[currentTag] || [];
+      const cacheKeysForTag = [...new Set([...(tagsMapping[currentTag] ?? []), ...(buildTags[currentTag] ?? [])])];
 
       if (cacheKeysForTag.length === 0) {
         this.log.debug(`No cache entries found for tag: ${currentTag}`);
