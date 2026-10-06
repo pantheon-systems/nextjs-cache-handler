@@ -11,10 +11,11 @@ import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 let mockBuildId = 'build-A';
 let mockDeploymentId = '';
+let mockBuildPhase = false;
 vi.mock('../../src/utils/build-detection.js', () => ({
   getBuildId: () => mockBuildId,
   getCacheGenerationId: () => (mockDeploymentId ? `${mockBuildId}:${mockDeploymentId}` : mockBuildId),
-  isBuildPhase: () => false,
+  isBuildPhase: () => mockBuildPhase,
 }));
 
 const mockFile = {
@@ -147,6 +148,56 @@ describe('use-cache build scoping', () => {
       expect(entry).toBeDefined();
       expect(await readValue(entry!)).toBe('legacy-entry');
     });
+
+    describe('during next build', () => {
+      afterEach(() => {
+        mockBuildPhase = false;
+      });
+
+      it('does not persist entries, so the runtime renders fresh', async () => {
+        mockBuildPhase = true;
+        const build = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        await build.set('page-sentinel', Promise.resolve(createTestEntry('buildtime')));
+        expect(fs.existsSync(path.join(testCacheDir, 'page-sentinel.json'))).toBe(false);
+
+        mockBuildPhase = false;
+        const runtime = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        expect(await runtime.get('page-sentinel', [])).toBeUndefined();
+      });
+
+      it('misses without reading or deleting entries the live revision uses', async () => {
+        const live = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        await live.set('sitemap', Promise.resolve(createTestEntry('live')));
+
+        mockBuildPhase = true;
+        mockBuildId = 'build-B';
+        const build = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        expect(await build.get('sitemap', [])).toBeUndefined();
+        expect(fs.existsSync(path.join(testCacheDir, 'sitemap.json'))).toBe(true);
+      });
+
+      it('cancels the unread stream of the discarded entry', async () => {
+        mockBuildPhase = true;
+        const entry = createTestEntry('buildtime');
+        const cancel = vi.spyOn(entry.value, 'cancel');
+        await new UseCacheFileHandler({ cacheDir: testCacheDir }).set('k', Promise.resolve(entry));
+        expect(cancel).toHaveBeenCalled();
+      });
+
+      it('resolves set() even when the pending entry rejects', async () => {
+        mockBuildPhase = true;
+        const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        await expect(handler.set('k', Promise.reject(new Error('render failed')))).resolves.toBeUndefined();
+      });
+
+      it('persists and serves entries again once the build phase is over', async () => {
+        const runtime = new UseCacheFileHandler({ cacheDir: testCacheDir });
+        await runtime.set('page-sentinel', Promise.resolve(createTestEntry('runtime')));
+        const entry = await runtime.get('page-sentinel', []);
+        expect(entry).toBeDefined();
+        expect(await readValue(entry!)).toBe('runtime');
+      });
+    });
   });
 
   describe('UseCacheGcsHandler (simulating a Multidev redeploy)', () => {
@@ -252,6 +303,67 @@ describe('use-cache build scoping', () => {
         await handlerA2.get('sitemap', []);
 
         expect(fetch).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('during next build', () => {
+      afterEach(() => {
+        mockBuildPhase = false;
+        delete process.env.OUTBOUND_PROXY_ENDPOINT;
+      });
+
+      it('does not persist entries, so the runtime renders fresh (use-cache-private)', async () => {
+        mockBuildId = 'build-TfctsWXpff2fKS';
+        mockDeploymentId = 'dpl-1';
+
+        mockBuildPhase = true;
+        const build = new UseCacheGcsHandler();
+        await build.set('page-sentinel', Promise.resolve(createTestEntry('buildtime')));
+        expect(Object.keys(store).some((k) => k.endsWith('page-sentinel.json'))).toBe(false);
+
+        mockBuildPhase = false;
+        const runtime = new UseCacheGcsHandler();
+        expect(await runtime.get('page-sentinel', [])).toBeUndefined();
+      });
+
+      it('misses without reading or deleting entries the live revision uses', async () => {
+        const live = new UseCacheGcsHandler();
+        await live.set('sitemap', Promise.resolve(createTestEntry('live')));
+        const liveKeys = Object.keys(store);
+
+        mockBuildPhase = true;
+        mockBuildId = 'build-B';
+        const build = new UseCacheGcsHandler();
+        expect(await build.get('sitemap', [])).toBeUndefined();
+        expect(Object.keys(store)).toEqual(liveKeys);
+      });
+
+      it('leaves build meta and the CDN to the runtime that serves the build', async () => {
+        const live = new UseCacheGcsHandler();
+        await live.get('sitemap', []);
+        const metaKey = Object.keys(store).find((k) => k.endsWith('_build-meta.json'))!;
+        const liveMeta = store[metaKey];
+
+        process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+        vi.mocked(fetch).mockClear();
+        vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+        mockBuildPhase = true;
+        mockBuildId = 'build-B';
+        const build = new UseCacheGcsHandler();
+        await build.set('sitemap', Promise.resolve(createTestEntry('buildtime')));
+        expect(store[metaKey]).toBe(liveMeta);
+        expect(fetch).not.toHaveBeenCalled();
+
+        // The new revision's first runtime handler detects the build and purges.
+        mockBuildPhase = false;
+        const runtime = new UseCacheGcsHandler();
+        await runtime.get('sitemap', []);
+        expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+        expect(fetch).toHaveBeenCalledWith(
+          'http://proxy.example.com:8080/rest/v0alpha1/cache',
+          expect.objectContaining({ method: 'DELETE' })
+        );
       });
     });
   });

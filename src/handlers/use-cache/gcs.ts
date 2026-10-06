@@ -1,9 +1,9 @@
 import type { Bucket } from '@google-cloud/storage';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
-import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
+import { serializeUseCacheEntry, deserializeUseCacheEntry, discardEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
-import { getCacheGenerationId } from '../../utils/build-detection.js';
+import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../../edge/edge-cache-clear.js';
 import {
   getSharedStorage,
@@ -92,7 +92,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     // without it, a page rendered via 'use cache' can keep being served stale
     // from the CDN edge indefinitely after a redeploy, since nothing else in
     // this handler ever tells Fastly to drop its copy.
-    await this.checkBuildInvalidation();
+    // Not during `next build`: the new generation is recorded, and the CDN
+    // purged, by the runtime that serves it (as in the route handler).
+    if (!isBuildPhase()) {
+      await this.checkBuildInvalidation();
+    }
     this.initialized = true;
   }
 
@@ -302,6 +306,13 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   async get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined> {
     log.debug(`GET: ${cacheKey}`);
 
+    // A build reads nothing, like Next's per-process default handler. This
+    // also keeps it from deleting entries the live revision still serves.
+    if (isBuildPhase()) {
+      log.debug(`MISS: ${cacheKey} (build phase)`);
+      return undefined;
+    }
+
     // Tag timestamps are loaded asynchronously in the constructor; without this,
     // a request racing the very first GET on a cold instance could read an
     // empty tagTimestamps map and treat a tag-invalidated entry as still fresh.
@@ -366,6 +377,14 @@ export class UseCacheGcsHandler implements UseCacheHandler {
    */
   async set(cacheKey: string, pendingEntry: Promise<UseCacheEntry>): Promise<void> {
     log.debug(`SET: ${cacheKey}`);
+
+    // Build-time results must not reach runtime reads: Next serves them through
+    // prerender output, and a dynamic route expects a fresh render.
+    if (isBuildPhase()) {
+      log.debug(`SKIP: ${cacheKey} (build phase)`);
+      await discardEntry(pendingEntry);
+      return;
+    }
 
     await this.ensureInitialized();
 

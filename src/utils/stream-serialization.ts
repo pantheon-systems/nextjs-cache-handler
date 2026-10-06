@@ -107,3 +107,16 @@ export function deserializeUseCacheEntry(stored: SerializedUseCacheEntry): UseCa
     revalidate: stored.revalidate,
   };
 }
+
+/**
+ * Waits for an entry a handler won't store and cancels its unread stream, so
+ * the data Next buffered for it can be released. Never throws.
+ */
+export async function discardEntry(pendingEntry: Promise<UseCacheEntry>): Promise<void> {
+  try {
+    const entry = await pendingEntry;
+    await entry.value?.cancel();
+  } catch {
+    // Nothing left to release
+  }
+}

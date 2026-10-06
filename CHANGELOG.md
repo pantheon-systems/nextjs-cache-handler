@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.1
+
+### Fixed
+
+- `use cache` results computed during `next build` are no longer served at runtime. Next calls the `use cache` handlers while it prerenders, including for routes it then treats as dynamic, and the GCS (and shared file) store kept those entries under the runtime's generation ID, so a dynamic page could render a build-time value (`app-dir/use-cache-private` showed `buildtime` instead of `runtime`). During the build phase the `use cache` handlers now neither persist nor read entries. Build-time values still reach the runtime through Next's prerender output.
+- The GCS `use cache` handler no longer runs its build-invalidation check during `next build`. The build used to record the new generation in `_build-meta.json` and purge the CDN before the new revision was serving, so the runtime saw a matching generation and never purged. The runtime that serves the build now does both, as the route handler already did.
+- A build no longer deletes `use cache` entries that the live revision is still serving (a build-phase read used to delete any entry with a different generation).
+
 ## 0.13.0
 
 ### Fixed

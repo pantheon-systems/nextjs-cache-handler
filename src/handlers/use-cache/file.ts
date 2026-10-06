@@ -1,10 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
-import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
+import { serializeUseCacheEntry, deserializeUseCacheEntry, discardEntry } from '../../utils/stream-serialization.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
-import { getCacheGenerationId } from '../../utils/build-detection.js';
+import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
 const log = createLogger('UseCacheFileHandler');
 
 /**
@@ -117,6 +117,12 @@ export class UseCacheFileHandler implements UseCacheHandler {
   async get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined> {
     log.debug(`GET: ${cacheKey}`);
 
+    // A build reads nothing -- see the matching comment in the GCS handler.
+    if (isBuildPhase()) {
+      log.debug(`MISS: ${cacheKey} (build phase)`);
+      return undefined;
+    }
+
     try {
       const filePath = this.getCacheFilePath(cacheKey);
 
@@ -169,6 +175,13 @@ export class UseCacheFileHandler implements UseCacheHandler {
    */
   async set(cacheKey: string, pendingEntry: Promise<UseCacheEntry>): Promise<void> {
     log.debug(`SET: ${cacheKey}`);
+
+    // Build-time results must not reach runtime reads -- see the GCS handler.
+    if (isBuildPhase()) {
+      log.debug(`SKIP: ${cacheKey} (build phase)`);
+      await discardEntry(pendingEntry);
+      return;
+    }
 
     try {
       // CRITICAL: Await the pending entry
