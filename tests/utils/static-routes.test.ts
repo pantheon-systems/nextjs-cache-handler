@@ -106,6 +106,28 @@ describe('static-routes', () => {
       expect(result.size).toBe(0);
     });
 
+    it("also matches a static route's Next 16.3.8+ key from its .meta file", () => {
+      const key = '/route-cache/APP_PAGE/c6377dd9ce6a1c2cd100eb4344e843eb4639b9ed26f84643f77680e9eb454c4b/$/index';
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((p) => {
+        if (String(p).endsWith('prerender-manifest.json')) {
+          return JSON.stringify({ routes: { '/': { initialRevalidateSeconds: false } } });
+        }
+        if (String(p) === path.join(process.cwd(), '.next', 'server', 'app', 'index.meta')) {
+          return JSON.stringify({ routeCache: { key } });
+        }
+        throw new Error('ENOENT');
+      });
+
+      const result = getStaticRoutes();
+
+      expect(result.has('_index')).toBe(true);
+      // How the handlers name the stored object (non-alphanumerics become `_`).
+      expect(
+        result.has('_route-cache_APP_PAGE_c6377dd9ce6a1c2cd100eb4344e843eb4639b9ed26f84643f77680e9eb454c4b___index')
+      ).toBe(true);
+    });
+
     it('should read from correct manifest path', () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
 

@@ -7,6 +7,25 @@
 - `use cache` results computed during `next build` are no longer served at runtime. Next calls the `use cache` handlers while it prerenders, including for routes it then treats as dynamic, and the GCS (and shared file) store kept those entries under the runtime's generation ID, so a dynamic page could render a build-time value (`app-dir/use-cache-private` showed `buildtime` instead of `runtime`). During the build phase the `use cache` handlers now neither persist nor read entries. Build-time values still reach the runtime through Next's prerender output.
 - The GCS `use cache` handler no longer runs its build-invalidation check during `next build`. The build used to record the new generation in `_build-meta.json` and purge the CDN before the new revision was serving, so the runtime saw a matching generation and never purged. The runtime that serves the build now does both, as the route handler already did.
 - A build no longer deletes `use cache` entries that the live revision is still serving (a build-phase read used to delete any entry with a different generation).
+- CDN path purges target the page's URL on Next.js 16.3.8+, which keys route cache entries as `/route-cache/<kind>/<hash>/$<path>`. The GCS handler purged that key as if it were a path, so neither ISR regeneration (including Pages Router `res.revalidate()`) nor `revalidateTag()`/`revalidatePath()` cleared the CDN.
+- The root page's cache key (`/index`) now purges `/`, not `/index`.
+- `revalidateTag()` and `revalidatePath()` now purge pages prerendered at build. Those pages are served from the build output and never pass through `set()`, so the tag mapping had no keys for them until they regenerated (never, for a fully static page). Each process now indexes their tags from `prerender-manifest.json` and the `.meta` files, with no writes to shared storage.
+- `revalidatePath()` purges its own path even when no cache key is recorded for it, using the `_N_T_` tag (including the `/page` and `/layout` type forms). `revalidatePath('/', 'layout')` purges the whole site.
+- Tag (key) purges are sent even when no cache keys are found. They clear nothing today, but match once responses carry tags as `Surrogate-Key`.
+- Partial-fallback shell keys (such as `/prefix/c/[two]`) are no longer purged as paths, as they match no URL. The `_`-prefixed key handling is removed: route keys always start with `/`.
+- A revalidation made on one instance now applies on every instance. Next.js records revalidations in a per-process manifest, so an instance that did not receive the `revalidateTag()` kept serving the old page, and the CDN cached it again after the purge. Revalidations are now stored in `cache/tags/revalidations.json` and applied by each instance before it serves from the cache.
+- A page cached on one instance shortly before its tag is revalidated on another is now purged. The revalidating instance read a tags mapping that did not have the key yet; the instance that flushes the key now purges it when one of its tags was revalidated after it was cached.
+- Regenerating a Pages Router page also purges its `/_next/data/<buildId>/…json` data route, which client-side navigations fetch and the CDN caches.
+- CDN purges use the served URL on sites with `trailingSlash: true` (`/tags/`, not `/tags`) or a `basePath`.
+- `clearSharedCache()` keeps the cached entries of fully static routes again on Next.js 16.3.8+, whose route keys no longer matched the static-route list.
+- Every handler instance finds the build output. Next.js 16.3.8 constructs some instances without `serverDistDir` (seen with the handler bundled through `transpilePackages`); those now read `.next/server` under the working directory, so `revalidateTag()` on them also purges build-time prerenders.
+
+### Changed
+
+- New optional `CACHE_TAGS_REFRESH_INTERVAL_MS` (default `1000`, minimum `100`): how often each process reads revalidations made by other processes.
+- `revalidateTag()` stores the revalidation in GCS before reading the tags mapping (batching revalidations that arrive within 250 ms into one write, and retrying a failed write for up to 5 s), purges the CDN, then purges it again once every instance has applied the revalidation (two refresh intervals, 2 s by default). A server action that revalidates responds that much later. A revalidation that could not be stored is retried on later cache reads and at `flushSharedTagsMapping()`, and its second purge runs once it is stored.
+- A cache read waits at most 2 s for revalidations from other instances before serving with what the instance already knows.
+- At each deploy, the first instance of the new build prunes `revalidations.json` to the revalidations made since the previous build, deleting first the `fetch`/`unstable_cache` entries listed under the pruned tags (the only entries that survive a deploy and can be older). `build-meta.json` gains `builtAt`, so pruning starts at the second deploy after upgrading.
 
 ## 0.13.0
 

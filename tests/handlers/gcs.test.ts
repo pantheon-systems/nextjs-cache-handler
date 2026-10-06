@@ -44,11 +44,11 @@ import {
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { DEFAULT_TAGS_FLUSH_INTERVAL_MS } from '../../src/utils/tags-buffer.js';
 
-/** save() calls that wrote the tags mapping (not a cache entry or build meta). */
+/** save() calls that wrote the tags mapping (tag -> keys), not an entry, build meta or revalidations. */
 function tagsMappingSaves() {
   return mockFile.save.mock.calls.filter(([data]) => {
     const parsed = JSON.parse(data as string);
-    return !('lastModified' in parsed) && !('buildId' in parsed);
+    return !('lastModified' in parsed) && !('buildId' in parsed) && Object.values(parsed).every(Array.isArray);
   });
 }
 
@@ -113,7 +113,7 @@ describe('GcsCacheHandler', () => {
 
       // The first flush creates the object with an ifGenerationMatch: 0 precondition instead.
       expect(mockBucket.file).not.toHaveBeenCalledWith('cache/tags/tags.json');
-      expect(mockFile.save).not.toHaveBeenCalled();
+      expect(tagsMappingSaves()).toHaveLength(0);
     });
   });
 
@@ -296,7 +296,7 @@ describe('GcsCacheHandler', () => {
       expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/paths/'), expect.anything());
     });
 
-    it('should handle route cache keys with underscores (encoded paths)', async () => {
+    it('should purge / when the root page regenerates (cache key /index)', async () => {
       process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
 
       mockFile.exists.mockResolvedValue([true]);
@@ -304,17 +304,16 @@ describe('GcsCacheHandler', () => {
       vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
       const handler = new GcsCacheHandler({} as any);
-      // Some cache keys use underscores to encode path separators
-      await handler.set('_blogs_my-post', { kind: 'APP_PAGE' as const } as any, { tags: [] });
+      // IncrementalCache stores `/` under `/index` (normalizePagePath).
+      await handler.set('/index', { kind: 'APP_PAGE' as const } as any, { tags: [] });
 
-      // Wait for background edge cache clear
       await new Promise((r) => setTimeout(r, 50));
 
-      // Should convert underscores to slashes and double-encode
       expect(fetch).toHaveBeenCalledWith(
-        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/my-post'))}`),
+        expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('/'))}`),
         expect.objectContaining({ method: 'DELETE' })
       );
+      expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/paths/index'), expect.anything());
     });
 
     it('should not clear edge cache when edge clearer is not configured', async () => {
@@ -815,7 +814,10 @@ describe('GcsCacheHandler tags mapping writes', () => {
 
     const handler = new GcsCacheHandler({} as any);
     await setWithTags(handler, 'key2', ['posts']);
-    await handler.revalidateTag('posts');
+    // revalidateTag() waits for its batching window and second CDN purge.
+    const revalidated = handler.revalidateTag('posts');
+    await vi.advanceTimersByTimeAsync(1000);
+    await revalidated;
 
     expect(mockFile.getMetadata).toHaveBeenCalled();
     expect(tagsMappingSaves()).toHaveLength(0);
@@ -827,8 +829,9 @@ describe('GcsCacheHandler tags mapping writes', () => {
 
     const handler = new GcsCacheHandler({} as any);
     await setWithTags(handler, '/blogs/new', ['posts']);
-    await handler.revalidateTag('posts');
-    await vi.advanceTimersByTimeAsync(10);
+    const revalidated = handler.revalidateTag('posts');
+    await vi.advanceTimersByTimeAsync(1000);
+    await revalidated;
 
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining(`/paths/${encodeURIComponent(encodeURIComponent('blogs/new'))}`),

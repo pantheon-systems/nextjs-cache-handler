@@ -104,6 +104,7 @@ interface CacheHandlerConfig {
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
+| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` purges the CDN a second time two intervals after storing a revalidation. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
 
@@ -279,7 +280,10 @@ handler therefore:
   for more than 10 minutes of failed writes, the batch is dropped with an error.
 
 A freshly cached page can therefore be absent from the mapping for up to the
-flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
+flush interval. A `revalidateTag()` on another process in that window cannot
+purge it, so the process that flushes the key does: after each flush it purges
+the keys whose tags were revalidated after they were cached. The CDN can then
+serve such a page stale for up to one flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
 instances still logs `429` warnings during cold-cache bursts; lower it (minimum
 `1000`) if the mapping lag matters more than write headroom.
 
@@ -302,6 +306,85 @@ module instance Next.js loaded the cache handler into. Code that Next.js bundles
 an empty buffer registry, so a call from there flushes nothing. The function
 returns the number of buffers it flushed. A `0` from a shutdown hook that should
 have had pending updates means it ran in the wrong module instance.
+
+### Revalidations across processes
+
+Next.js records a revalidation in a per-process manifest, and checks cached
+pages, route handlers and `fetch` entries against it. The GCS handler also
+stores each revalidation in `cache/tags/revalidations.json`, and every process
+applies the stored ones to its own manifest before serving from the cache,
+reading the object at most once per `CACHE_TAGS_REFRESH_INTERVAL_MS` (a read
+waits at most 2 s for it, then serves with what the process already knows).
+
+`revalidateTag()` and `revalidatePath()` therefore:
+
+1. store the revalidation (waiting up to 250 ms so revalidations from the same
+   moment share one write, then retrying a failed write for up to 5 s);
+2. purge the CDN;
+3. wait until every process has applied it (two refresh intervals, 2 s by
+   default) and purge the CDN again, so a process that had not refreshed yet
+   cannot put the old page back in the CDN.
+
+A server action that revalidates responds after step 3. A route handler
+responds first; Next.js finishes the revalidation after the response. If the
+revalidation could not be stored within 5 s, it is retried on later cache
+reads and the second purge runs once it is stored; `flushSharedTagsMapping()`
+also stores such revalidations at shutdown.
+
+### How long revalidations are kept
+
+`revalidations.json` holds one entry per revalidated tag. At each deploy, the
+first process of the new build removes the entries older than the previous
+build: by then only `fetch()` and `unstable_cache` entries can be older than
+those revalidations (the route cache is cleared on a deploy, and `use cache`
+entries belong to their build), so it first deletes the fetch entries the tags
+mapping lists under those tags. The object therefore holds roughly the
+revalidations made since the previous deploy. Each build records when its
+prerenders were written (`builtAt` in `build-meta.json`, less a minute's
+margin), so the first deploy after upgrading prunes nothing; pruning starts at
+the one after. A fetch entry missing from the tags mapping (one whose mapping
+update was lost) is not deleted and is served again once its revalidation is
+pruned.
+
+### Batching revalidations
+
+The revalidations object accepts about one write per second across all
+processes. Next.js gathers every `revalidateTag()` and `revalidatePath()` call
+made while handling one request and passes them to the handler together, one
+call per cacheLife profile, so they share a write. Revalidations that reach a
+process within 250 ms of each other share one too. A CMS that sends one webhook
+per changed item, many per second, makes processes take turns on the object
+and delays each revalidation; send the changed items in one request instead:
+
+```ts
+// app/api/revalidate/route.ts
+import { revalidateTag } from 'next/cache';
+
+export async function POST(request: Request) {
+  // Verify the webhook's signature or shared secret first.
+  const { tags } = (await request.json()) as { tags: string[] };
+  for (const tag of tags) {
+    revalidateTag(tag, 'max');
+  }
+  return Response.json({ revalidated: tags.length });
+}
+```
+
+### File handler
+
+The file handler (local development, or `type: 'file'`) keeps revalidations in
+its own process: it does not share them through `.next/cache`, and it does not
+purge the CDN. Several processes sharing one `.next/cache` directory can each 
+serve an entry another process revalidated until they regenerate it. Use the 
+GCS handler for more than one process.
+
+### CDN purge paths
+
+Path purges use the URL the page is served at: with `basePath`, with the slash
+`trailingSlash: true` adds, and, for a Pages Router page, also its
+`/_next/data/<buildId>/…json` data route. Both settings are read from the
+build output (`required-server-files.json` and `BUILD_ID`).
+`clearEdgeCachePaths()` still drops a trailing slash from the paths you pass.
 
 The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
 synchronously on `updateTags()` so other instances see revalidations promptly,

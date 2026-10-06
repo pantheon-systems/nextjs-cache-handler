@@ -12,17 +12,29 @@ import { getStaticRoutes } from '../utils/static-routes.js';
 import {
   TagsBuffer,
   resolveTagsFlushIntervalMs,
+  type FlushedKey,
   type TagsMapping,
   type TagsMappingSnapshot,
 } from '../utils/tags-buffer.js';
 import {
   getSharedStorage,
+  isNotFound,
   readJsonObject,
   writeJsonObject,
   resetSharedStorageForTests,
 } from '../utils/gcs-json-object.js';
 import { createLogger } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
+import { cacheKeyToPurgePath, implicitTagsToPurgePaths } from '../utils/route-paths.js';
+import {
+  flushSharedRevalidations,
+  getSharedRevalidations,
+  resetSharedRevalidationsForTests,
+  type SharedRevalidations,
+  type SharedRevalidationMap,
+} from '../utils/shared-revalidations.js';
+import { loadSiteUrlConfig, pagesDataRoute, toPublicPath, type SiteUrlConfig } from '../utils/site-urls.js';
+import { isBuildPhase } from '../utils/build-detection.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -31,7 +43,12 @@ const gcsLog = createLogger('GcsCacheHandler');
 // state that paces writes to a shared object cannot live on the handler.
 const sharedTagsBuffers = new Map<string, TagsBuffer>();
 
-function getSharedTagsBuffer(bucketName: string, tagsBucket: Bucket, tagsMapKey: string): TagsBuffer {
+function getSharedTagsBuffer(
+  bucketName: string,
+  tagsBucket: Bucket,
+  tagsMapKey: string,
+  onFlushed: (added: FlushedKey[]) => Promise<void>
+): TagsBuffer {
   const key = `${bucketName}/${tagsMapKey}`;
   let buffer = sharedTagsBuffers.get(key);
   if (!buffer) {
@@ -40,10 +57,76 @@ function getSharedTagsBuffer(bucketName: string, tagsBucket: Bucket, tagsMapKey:
       readTagsMapping: () => readTagsSnapshot(tagsBucket, tagsMapKey),
       writeTagsMapping: (mapping, generation) => writeJsonObject(tagsBucket, tagsMapKey, mapping, generation),
       handlerName: 'GcsCacheHandler',
+      onFlushed,
     });
     sharedTagsBuffers.set(key, buffer);
   }
   return buffer;
+}
+
+// Clock skew between instances; purging a key twice is harmless.
+const MISSED_REVALIDATION_SKEW_MS = 2000;
+
+// After a revalidation is stored, every instance applies it at its next cache
+// read once the refresh interval has passed; the margin covers that read's GCS
+// round trip (up to 1 s, less with a shorter interval).
+const MAX_APPLY_MARGIN_MS = 1000;
+
+// How long a cache read waits for revalidations from other instances before
+// serving with what this process already knows (the refresh still completes).
+const REFRESH_WAIT_MS = 2000;
+
+/** How long after a revalidation is stored every instance has applied it. */
+const applyDelayMs = (revalidations: SharedRevalidations) =>
+  revalidations.refreshIntervalMs + Math.min(MAX_APPLY_MARGIN_MS, revalidations.refreshIntervalMs);
+
+// Deletes in flight at once during the deploy hand-over (onNewGeneration).
+const FETCH_DELETE_BATCH_SIZE = 50;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Purge keys this process just made visible in the tags map whose tags were
+ * revalidated after they were added. A revalidateTag on another instance read
+ * the map before they landed, so it could not purge them.
+ */
+async function purgeMissedRevalidations(
+  added: FlushedKey[],
+  revalidations: SharedRevalidations,
+  clearer: EdgeCacheClear | null,
+  site: SiteUrlConfig
+): Promise<void> {
+  if (!clearer) {
+    return;
+  }
+  await revalidations.refresh(true);
+
+  const paths = new Set<string>();
+  for (const { cacheKey, tags, addedAt } of added) {
+    const missed = tags.some((tag) => (revalidations.get(tag)?.at ?? 0) > addedAt - MISSED_REVALIDATION_SKEW_MS);
+    const routePath = missed ? cacheKeyToPurgePath(cacheKey) : null;
+    if (routePath) {
+      paths.add(toPublicPath(routePath, site));
+    }
+  }
+  if (paths.size === 0) {
+    return;
+  }
+  const list = [...paths];
+  gcsLog.debug(`Purging edge paths revalidated before their keys were flushed: ${list.join(', ')}`);
+  clearer.clearPathsInBackground(list, `revalidated before flush: ${list.join(', ')}`);
+
+  // Purge again once every instance serves the revalidated entry, so one that
+  // has not refreshed yet cannot put the old page back in the CDN. A timer, not
+  // awaited, so the flush does not hold up the request that triggered it.
+  const latest = Math.max(...added.flatMap(({ tags }) => tags.map((tag) => revalidations.get(tag)?.at ?? 0)));
+  const wait = latest + applyDelayMs(revalidations) - Date.now();
+  if (wait > 0) {
+    setTimeout(
+      () => clearer.clearPathsInBackground(list, `revalidated before flush, re-purge: ${list.join(', ')}`),
+      wait
+    );
+  }
 }
 
 async function readTagsSnapshot(bucket: Bucket, tagsMapKey: string): Promise<TagsMappingSnapshot> {
@@ -80,6 +163,9 @@ export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {})
     gcsLog.debug('flushGcsTagsMapping: no tag buffers in this module instance (nothing to flush)');
   }
 
+  // Revalidations an earlier write gave up on, so other instances still learn them.
+  const revalidationsStored = flushSharedRevalidations(Math.max(0, deadline - Date.now()));
+
   const droppedBefore = new Map(pending.map((buffer) => [buffer, buffer.droppedUpdates]));
   await Promise.all(
     pending.map(async (buffer) => {
@@ -102,6 +188,7 @@ export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {})
     })
   );
 
+  await revalidationsStored;
   return pending.filter((buffer) => !buffer.hasPending && buffer.droppedUpdates === droppedBefore.get(buffer)).length;
 }
 
@@ -114,6 +201,7 @@ export function resetGcsSharedState(): void {
     buffer.destroy();
   }
   sharedTagsBuffers.clear();
+  resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
 }
 
@@ -132,6 +220,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private readonly tagsMapKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
   private readonly tagsBuffer: TagsBuffer;
+  private readonly revalidations: SharedRevalidations;
+  private readonly site: SiteUrlConfig;
 
   constructor(context: FileSystemCacheContext) {
     super(context, 'GcsCacheHandler');
@@ -155,8 +245,14 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
 
     this.edgeCacheClearer = createEdgeCacheClearer();
+    this.site = loadSiteUrlConfig(context?.serverDistDir);
+    this.revalidations = getSharedRevalidations(bucketName, this.tagsBucket, `${this.tagsPrefix}revalidations.json`);
 
-    this.tagsBuffer = getSharedTagsBuffer(bucketName, this.tagsBucket, this.tagsMapKey);
+    // The buffer is per process, so it keeps the first handler's clearer and site config.
+    const { revalidations, edgeCacheClearer, site } = this;
+    this.tagsBuffer = getSharedTagsBuffer(bucketName, this.tagsBucket, this.tagsMapKey, (added) =>
+      purgeMissedRevalidations(added, revalidations, edgeCacheClearer, site)
+    );
 
     // Initialize asynchronously (constructors can't be async) -- stored via
     // setInitPromise() so get()/set() can await it before touching the store.
@@ -328,23 +424,123 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.edgeCacheClearer.nukeCacheInBackground(context);
   }
 
-  protected override async onRevalidateComplete(tags: string[], affectedKeys: string[]): Promise<void> {
+  /**
+   * Prune revalidations older than the previous build. Only `fetch` entries
+   * survive a deploy from before then, so those listed under the pruned tags
+   * are deleted first. In the background: requests wait on initialize(), and
+   * prune() keeps each revalidation until its entries are gone.
+   */
+  protected override async onNewGeneration(previous: BuildMeta): Promise<void> {
+    if (previous.builtAt === undefined) {
+      this.log.debug('The previous build recorded no build time; revalidations are pruned at the next deploy');
+      return;
+    }
+    this.revalidations
+      .prune(previous.builtAt, (tags) => this.deleteFetchEntriesForTags(tags))
+      .catch((error) => this.log.warn('Pruning revalidations failed; it is retried at the next deploy:', error));
+  }
+
+  private async deleteFetchEntriesForTags(tags: string[]): Promise<void> {
+    const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
+    // Route keys start with `/`; fetch keys are hashes.
+    const fetchKeys = [...new Set(tags.flatMap((tag) => mapping[tag] ?? []))].filter((key) => !key.startsWith('/'));
+
+    for (let i = 0; i < fetchKeys.length; i += FETCH_DELETE_BATCH_SIZE) {
+      await Promise.all(
+        fetchKeys.slice(i, i + FETCH_DELETE_BATCH_SIZE).map((key) =>
+          this.bucket
+            .file(this.getCacheKey(key, 'fetch'))
+            .delete()
+            .catch((error: unknown) => {
+              if (!isNotFound(error)) {
+                throw error;
+              }
+            })
+        )
+      );
+    }
+    if (fetchKeys.length > 0) {
+      this.tagsBuffer.deleteKeys(fetchKeys);
+      this.log.info(`Deleted ${fetchKeys.length} fetch entries revalidated before the previous build`);
+    }
+  }
+
+  protected override async publishRevalidations(revalidations: SharedRevalidationMap): Promise<boolean> {
+    return isBuildPhase() ? true : this.revalidations.record(revalidations);
+  }
+
+  protected override async refreshRevalidations(): Promise<void> {
+    if (isBuildPhase()) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const waited = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), REFRESH_WAIT_MS);
+    });
+    const outcome = await Promise.race([this.revalidations.refresh(), waited]);
+    clearTimeout(timer);
+    if (outcome === 'timeout') {
+      this.log.warn(`Revalidations from other instances took over ${REFRESH_WAIT_MS}ms to read; serving without them`);
+    }
+  }
+
+  protected override async onRevalidateComplete(
+    tags: string[],
+    affectedKeys: string[],
+    published = true
+  ): Promise<void> {
     // Runs on every revalidation, including soft ones (durations.expire in the
     // future): the CDN edge cache has no concept of "stale-while-revalidate"
     // for tag invalidation, so it must be cleared immediately whenever a tag
     // is revalidated, even though the origin's own stored entry is intentionally
     // kept servable in the interim (see BaseCacheHandler.revalidateTag).
-    if (affectedKeys.length === 0 || !this.edgeCacheClearer) {
+    if (!this.edgeCacheClearer) {
       return;
     }
 
-    // Clear by tags/keys
-    this.edgeCacheClearer.clearKeysInBackground(tags, `tag revalidation: ${tags.join(', ')}`);
+    const clearer = this.edgeCacheClearer;
+    const implicit = implicitTagsToPurgePaths(tags);
 
-    // Also clear by route paths for routes that may not have tags (e.g., ISR routes)
-    const routePaths = this.extractRoutePaths(affectedKeys);
-    if (routePaths.length > 0) {
-      this.edgeCacheClearer.clearPathsInBackground(routePaths, `path revalidation: ${routePaths.join(', ')}`);
+    // revalidatePath's own path is purged even when the tags map has no key for it.
+    const routePaths = new Set(implicit.paths);
+    for (const key of affectedKeys) {
+      const routePath = cacheKeyToPurgePath(key);
+      if (routePath) {
+        routePaths.add(routePath);
+      } else if (key.startsWith('/')) {
+        this.log.debug(`Not purging shell pattern ${key}: it matches no URL`);
+      }
+    }
+    const paths = [...routePaths].map((routePath) => toPublicPath(routePath, this.site));
+
+    const purge = async (phase: string) => {
+      // Keys are sent even when no keys were found: they only match once responses
+      // carry the tags as Surrogate-Key, which the tenant router turns into purge keys.
+      const context = `tag revalidation (${phase}): ${tags.join(', ')}`;
+      if (implicit.purgeAll) {
+        await Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]);
+        this.log.debug(`Purged the whole site for ${context}`);
+        return;
+      }
+      if (paths.length > 0) {
+        this.log.debug(`Purging edge paths for ${context}: ${paths.join(', ')}`);
+      }
+      await Promise.all([clearer.clearKeys(tags), clearer.clearPaths(paths)]);
+    };
+
+    // Purge now for the instances that already serve the new entry, then again
+    // once every instance does, so none can put the old page back in the CDN.
+    // Awaited rather than a timer: a server action's response waits for it, and
+    // Cloud Run may not give a detached timer CPU.
+    await purge('now');
+    if (published) {
+      await delay(applyDelayMs(this.revalidations));
+      await purge('after every instance applied it');
+    } else {
+      // Not stored yet, so other instances do not know it: purge after the retry that stores it.
+      this.revalidations.whenStored(tags, () => {
+        setTimeout(() => purge('after a delayed store').catch(() => {}), applyDelayMs(this.revalidations));
+      });
     }
   }
 
@@ -352,39 +548,24 @@ export class GcsCacheHandler extends BaseCacheHandler {
    * Called when a route cache entry is set (ISR page update).
    * Clears the edge cache for this specific route so users get the fresh version.
    */
-  protected override onRouteCacheSet(cacheKey: string): void {
+  protected override onRouteCacheSet(cacheKey: string, kind?: string): void {
     if (!this.edgeCacheClearer) {
       return;
     }
 
-    const routePath = this.cacheKeyToRoutePath(cacheKey);
-    this.edgeCacheClearer.clearPathInBackground(routePath, `ISR route update: ${routePath}`);
-  }
-
-  private cacheKeyToRoutePath(cacheKey: string): string {
-    // Cache keys may be encoded (e.g., underscores for slashes)
-    // Convert to a proper path format
-    if (cacheKey.startsWith('/')) {
-      return cacheKey;
+    const routePath = cacheKeyToPurgePath(cacheKey);
+    if (!routePath) {
+      this.log.debug(`Not purging ${cacheKey}: it matches no URL`);
+      return;
     }
-
-    // Handle encoded paths (underscores represent slashes in some cases)
-    if (cacheKey.startsWith('_')) {
-      return cacheKey.replace(/_/g, '/');
+    const paths = [toPublicPath(routePath, this.site)];
+    // Client-side navigation fetches a Pages Router page's props from its data route.
+    const dataRoute = kind === 'PAGES' ? pagesDataRoute(routePath, this.site) : null;
+    if (dataRoute) {
+      paths.push(dataRoute);
     }
-
-    return `/${cacheKey}`;
-  }
-
-  private extractRoutePaths(keys: string[]): string[] {
-    return keys
-      .filter((key) => key.startsWith('/') || key.startsWith('_'))
-      .map((key) => {
-        if (key.startsWith('_')) {
-          return key.replace(/_/g, '/');
-        }
-        return key.startsWith('/') ? key : `/${key}`;
-      });
+    this.log.debug(`Purging edge paths for ISR update of ${cacheKey}: ${paths.join(', ')}`);
+    this.edgeCacheClearer.clearPathsInBackground(paths, `ISR route update: ${paths.join(', ')}`);
   }
 }
 

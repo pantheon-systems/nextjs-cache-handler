@@ -138,7 +138,8 @@ export async function clearSharedCache(): Promise<number> {
 export async function clearEdgeCachePaths(paths: string[]): Promise<CacheClearResult | null> {
   const clearer = createEdgeCacheClearer();
   if (!clearer) return null;
-  return clearer.clearPaths(paths);
+  // This API has always dropped a trailing slash; the handlers' own purges keep it.
+  return clearer.clearPaths(paths.map((p) => p.replace(/(.)\/$/, '$1')));
 }
 
 /**

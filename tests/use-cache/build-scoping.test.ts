@@ -176,12 +176,17 @@ describe('use-cache build scoping', () => {
         expect(fs.existsSync(path.join(testCacheDir, 'sitemap.json'))).toBe(true);
       });
 
-      it('cancels the unread stream of the discarded entry', async () => {
+      it('resolves set() when the entry is a tee branch whose other branch is never read', async () => {
+        // Next passes one branch of a tee; for a dynamic hole it never reads the other.
         mockBuildPhase = true;
-        const entry = createTestEntry('buildtime');
-        const cancel = vi.spyOn(entry.value, 'cancel');
-        await new UseCacheFileHandler({ cacheDir: testCacheDir }).set('k', Promise.resolve(entry));
-        expect(cancel).toHaveBeenCalled();
+        const [branch] = createTestStream('buildtime').tee();
+        const entry = { ...createTestEntry('unused'), value: branch };
+        const set = new UseCacheFileHandler({ cacheDir: testCacheDir }).set('k', Promise.resolve(entry));
+        const outcome = await Promise.race([
+          set.then(() => 'resolved'),
+          new Promise((r) => setTimeout(() => r('hung'), 500)),
+        ]);
+        expect(outcome).toBe('resolved');
       });
 
       it('resolves set() even when the pending entry rejects', async () => {
@@ -336,6 +341,18 @@ describe('use-cache build scoping', () => {
         const build = new UseCacheGcsHandler();
         expect(await build.get('sitemap', [])).toBeUndefined();
         expect(Object.keys(store)).toEqual(liveKeys);
+      });
+
+      it('resolves set() when the entry is a tee branch whose other branch is never read', async () => {
+        mockBuildPhase = true;
+        const [branch] = createTestStream('buildtime').tee();
+        const entry = { ...createTestEntry('unused'), value: branch };
+        const set = new UseCacheGcsHandler().set('k', Promise.resolve(entry));
+        const outcome = await Promise.race([
+          set.then(() => 'resolved'),
+          new Promise((r) => setTimeout(() => r('hung'), 500)),
+        ]);
+        expect(outcome).toBe('resolved');
       });
 
       it('leaves build meta and the CDN to the runtime that serves the build', async () => {
