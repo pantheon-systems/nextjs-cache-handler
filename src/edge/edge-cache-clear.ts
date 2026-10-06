@@ -105,9 +105,9 @@ export class EdgeCacheClear {
 
   private async clearSinglePath(routePath: string, results: { path: string; success: boolean }[]): Promise<void> {
     try {
+      // Kept exactly, trailing slash included: with `trailingSlash` that is the URL the CDN caches.
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
-      const cleanPath = normalizedPath.replace(/\/$/, '') || '/';
-      const pathSegment = cleanPath === '/' ? '/' : cleanPath.substring(1);
+      const pathSegment = normalizedPath === '/' ? '/' : normalizedPath.substring(1);
       // Double-encode because the edge-cache-clearer expects URL-encoded values.
       const encodedPathSegment = encodeURIComponent(encodeURIComponent(pathSegment));
       const url = `${this.baseUrl}/paths/${encodedPathSegment}`;

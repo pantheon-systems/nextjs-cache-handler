@@ -13,6 +13,16 @@
 - `revalidatePath()` purges its own path even when no cache key is recorded for it, using the `_N_T_` tag (including the `/page` and `/layout` type forms). `revalidatePath('/', 'layout')` purges the whole site.
 - Tag (key) purges are sent even when no cache keys are found. They clear nothing today, but match once responses carry tags as `Surrogate-Key`.
 - Partial-fallback shell keys (such as `/prefix/c/[two]`) are no longer purged as paths, as they match no URL. The `_`-prefixed key handling is removed: route keys always start with `/`.
+- A revalidation made on one instance now applies on every instance. Next.js records revalidations in a per-process manifest, so an instance that did not receive the `revalidateTag()` kept serving the old page, and the CDN cached it again after the purge. Revalidations are now stored in `cache/tags/revalidations.json` and applied by each instance before it serves from the cache.
+- A page cached on one instance shortly before its tag is revalidated on another is now purged. The revalidating instance read a tags mapping that did not have the key yet; the instance that flushes the key now purges it when one of its tags was revalidated after it was cached.
+- Regenerating a Pages Router page also purges its `/_next/data/<buildId>/…json` data route, which client-side navigations fetch and the CDN caches.
+- CDN purges use the served URL on sites with `trailingSlash: true` (`/tags/`, not `/tags`) or a `basePath`.
+- `clearSharedCache()` keeps the cached entries of fully static routes again on Next.js 16.3.8+, whose route keys no longer matched the static-route list.
+
+### Changed
+
+- New optional `CACHE_TAGS_REFRESH_INTERVAL_MS` (default `1000`, minimum `100`): how often each process reads revalidations made by other processes.
+- `revalidateTag()` waits until the revalidation is stored in GCS (retrying for up to 5 s) before reading the tags mapping.
 
 ## 0.13.0
 

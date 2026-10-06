@@ -104,6 +104,7 @@ interface CacheHandlerConfig {
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
+| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
 
 ## API Reference
 
@@ -279,7 +280,10 @@ handler therefore:
   for more than 10 minutes of failed writes, the batch is dropped with an error.
 
 A freshly cached page can therefore be absent from the mapping for up to the
-flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
+flush interval. A `revalidateTag()` on another process in that window cannot
+purge it, so the process that flushes the key does: after each flush it purges
+the keys whose tags were revalidated after they were cached. The CDN can then
+serve such a page stale for up to one flush interval. Raise `CACHE_TAGS_FLUSH_INTERVAL_MS` if a site that runs many
 instances still logs `429` warnings during cold-cache bursts; lower it (minimum
 `1000`) if the mapping lag matters more than write headroom.
 
@@ -302,6 +306,25 @@ module instance Next.js loaded the cache handler into. Code that Next.js bundles
 an empty buffer registry, so a call from there flushes nothing. The function
 returns the number of buffers it flushed. A `0` from a shutdown hook that should
 have had pending updates means it ran in the wrong module instance.
+
+### Revalidations across processes
+
+Next.js records a revalidation in a per-process manifest, and checks cached
+pages, route handlers and `fetch` entries against it. The GCS handler also
+stores each revalidation in `cache/tags/revalidations.json` (awaited inside
+`revalidateTag()`, before the tags mapping is read), and every process applies
+the stored ones to its own manifest before serving from the cache, reading the
+object at most once per `CACHE_TAGS_REFRESH_INTERVAL_MS`. Without this, a
+process that did not receive the `revalidateTag()` kept serving the old entry,
+and the CDN cached it again after the purge.
+
+### CDN purge paths
+
+Path purges use the URL the page is served at: with `basePath`, with the slash
+`trailingSlash: true` adds, and, for a Pages Router page, also its
+`/_next/data/<buildId>/…json` data route. Both settings are read from the
+build output (`required-server-files.json` and `BUILD_ID`).
+`clearEdgeCachePaths()` still drops a trailing slash from the paths you pass.
 
 The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
 synchronously on `updateTags()` so other instances see revalidations promptly,

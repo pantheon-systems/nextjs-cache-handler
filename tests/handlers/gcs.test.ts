@@ -44,11 +44,11 @@ import {
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { DEFAULT_TAGS_FLUSH_INTERVAL_MS } from '../../src/utils/tags-buffer.js';
 
-/** save() calls that wrote the tags mapping (not a cache entry or build meta). */
+/** save() calls that wrote the tags mapping (tag -> keys), not an entry, build meta or revalidations. */
 function tagsMappingSaves() {
   return mockFile.save.mock.calls.filter(([data]) => {
     const parsed = JSON.parse(data as string);
-    return !('lastModified' in parsed) && !('buildId' in parsed);
+    return !('lastModified' in parsed) && !('buildId' in parsed) && Object.values(parsed).every(Array.isArray);
   });
 }
 

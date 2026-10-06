@@ -13,6 +13,7 @@ import { serializeForStorage, deserializeFromStorage } from '../utils/serializat
 import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
 import { loadBuildPrerenderTags } from '../utils/build-prerender-tags.js';
+import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
@@ -352,6 +353,8 @@ export abstract class BaseCacheHandler {
     // before checkBuildInvalidation() (in initialize()) has had a chance to
     // wipe it.
     await this.ensureInitialized();
+    // Before any tag check: Next's own checks run on what get() returns.
+    await this.refreshRevalidations();
 
     try {
       const cacheType = this.determineCacheType(ctx);
@@ -498,7 +501,7 @@ export abstract class BaseCacheHandler {
 
       // For route cache updates (ISR), trigger edge cache invalidation
       if (cacheType === 'route') {
-        this.onRouteCacheSet(cacheKey);
+        this.onRouteCacheSet(cacheKey, (incrementalCacheValue as { kind?: string } | null)?.kind);
       }
 
       this.log.debug(`Cached ${cacheKey} in ${cacheType} cache`);
@@ -515,6 +518,41 @@ export abstract class BaseCacheHandler {
 
     const tagArray = [tag].flat();
     const affectedKeys: string[] = [];
+
+    // Record the invalidation in Next.js's shared tagsManifest instead of
+    // deleting entries, as FileSystemCache does. A stale entry stays servable
+    // while it regenerates, and PPR routes can resume from it; get() drops one
+    // whose tag has expired.
+    //
+    // `durations.expire` (present when the caller passed a cacheLife profile,
+    // e.g. `revalidateTag(tag, 'minutes')`) sets a FUTURE expiry, which keeps
+    // areTagsExpired() false and areTagsStale() true — a soft/background
+    // revalidation. Omitting it while `durations` is still present (no
+    // `expire` on the profile) leaves any previously-set expiry untouched.
+    // No `durations` at all (e.g. `updateTag()`, which never carries a
+    // profile) forces an immediate/hard expiry — correct there, since
+    // updateTag's whole point is read-your-own-writes within the same action.
+    // This mirrors Next's own FileSystemCache.revalidateTag exactly.
+    const now = Date.now();
+    const revalidations: SharedRevalidationMap = {};
+    for (const currentTag of tagArray) {
+      const existingEntry = tagsManifest.get(currentTag) ?? {};
+      let updates: { stale?: number; expired?: number };
+      if (durations) {
+        updates = { ...existingEntry, stale: now };
+        if (durations.expire !== undefined) {
+          updates.expired = now + durations.expire * 1000;
+        }
+      } else {
+        updates = { ...existingEntry, expired: now };
+      }
+      tagsManifest.set(currentTag, updates);
+      revalidations[currentTag] = { ...updates, at: now };
+    }
+
+    // Published before the tags map is read: an instance flushing a key after
+    // that read then sees the revalidation and purges the key itself.
+    await this.publishRevalidations(revalidations);
 
     let tagsMapping: Record<string, string[]>;
     try {
@@ -539,34 +577,6 @@ export abstract class BaseCacheHandler {
       affectedKeys.push(...cacheKeysForTag);
     }
 
-    // Record the invalidation in Next.js's shared tagsManifest instead of
-    // deleting entries, as FileSystemCache does. A stale entry stays servable
-    // while it regenerates, and PPR routes can resume from it; get() drops one
-    // whose tag has expired.
-    //
-    // `durations.expire` (present when the caller passed a cacheLife profile,
-    // e.g. `revalidateTag(tag, 'minutes')`) sets a FUTURE expiry, which keeps
-    // areTagsExpired() false and areTagsStale() true — a soft/background
-    // revalidation. Omitting it while `durations` is still present (no
-    // `expire` on the profile) leaves any previously-set expiry untouched.
-    // No `durations` at all (e.g. `updateTag()`, which never carries a
-    // profile) forces an immediate/hard expiry — correct there, since
-    // updateTag's whole point is read-your-own-writes within the same action.
-    // This mirrors Next's own FileSystemCache.revalidateTag exactly.
-    const now = Date.now();
-    for (const currentTag of tagArray) {
-      const existingEntry = tagsManifest.get(currentTag) ?? {};
-      if (durations) {
-        const updates: { stale: number; expired?: number } = { ...existingEntry, stale: now };
-        if (durations.expire !== undefined) {
-          updates.expired = now + durations.expire * 1000;
-        }
-        tagsManifest.set(currentTag, updates);
-      } else {
-        tagsManifest.set(currentTag, { ...existingEntry, expired: now });
-      }
-    }
-
     this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
@@ -582,10 +592,21 @@ export abstract class BaseCacheHandler {
   }
 
   /**
-   * Hook called when a route cache entry is set (ISR page update).
-   * Subclasses can override to perform edge cache invalidation.
+   * Hook called when a route cache entry is set (ISR page update), with the
+   * entry's kind (APP_PAGE, APP_ROUTE, PAGES). Subclasses can override to
+   * perform edge cache invalidation.
    */
-  protected onRouteCacheSet(_cacheKey: string): void {
+  protected onRouteCacheSet(_cacheKey: string, _kind?: string): void {
+    // Default implementation does nothing
+  }
+
+  /** Share revalidations with other instances. Default: this process only. */
+  protected async publishRevalidations(_revalidations: SharedRevalidationMap): Promise<void> {
+    // Default implementation does nothing
+  }
+
+  /** Apply revalidations made by other instances to tagsManifest. Default: none. */
+  protected async refreshRevalidations(): Promise<void> {
     // Default implementation does nothing
   }
 

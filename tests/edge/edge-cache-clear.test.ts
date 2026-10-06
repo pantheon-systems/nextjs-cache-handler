@@ -161,6 +161,17 @@ describe('EdgeCacheClear', () => {
       expect(result.paths).toEqual(['/']);
     });
 
+    it('keeps a trailing slash, the URL a trailingSlash site serves', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      await new EdgeCacheClear().clearPaths(['/tags/']);
+
+      expect(fetch).toHaveBeenCalledWith(
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent(encodeURIComponent('tags/'))}`,
+        expect.any(Object)
+      );
+    });
+
     it('should handle partial failures', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce({ ok: true, status: 200 } as Response)
@@ -359,6 +370,22 @@ describe('clearEdgeCachePaths', () => {
     );
     expect(result).not.toBeNull();
     expect(result!.success).toBe(true);
+  });
+
+  it('still drops a trailing slash, as it always has', async () => {
+    process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+    await clearEdgeCachePaths(['/about/', '/']);
+
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/about',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
+      expect.objectContaining({ method: 'DELETE' })
+    );
   });
 
   it('should return null when env var is missing', async () => {
