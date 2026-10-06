@@ -172,6 +172,15 @@ describe('EdgeCacheClear', () => {
       );
     });
 
+    it('does not send a path with control characters or over the length limit', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearPaths(['/ok', '/bad\npath', `/${'a'.repeat(2048)}`]);
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(result.paths).toEqual(['/ok']);
+    });
+
     it('should handle partial failures', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce({ ok: true, status: 200 } as Response)
@@ -244,6 +253,22 @@ describe('EdgeCacheClear', () => {
         `http://${mockEndpoint}/rest/v0alpha1/cache/keys/${encodeURIComponent(encodeURIComponent('tag/with/slashes'))}`,
         expect.any(Object)
       );
+    });
+  });
+
+  describe('clearKeys validation', () => {
+    it('does not send a key with control characters or over the length limit', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearKeys([
+        'posts',
+        `_N_T_/${'a'.repeat(1024)}/layout`,
+        'bad\u0000key',
+        'x'.repeat(1100),
+      ]);
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result.paths).toEqual(['posts', `_N_T_/${'a'.repeat(1024)}/layout`]);
     });
   });
 

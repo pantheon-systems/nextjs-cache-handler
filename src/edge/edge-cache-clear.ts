@@ -2,6 +2,18 @@ import { createLogger } from '../utils/logger.js';
 
 const edgeLog = createLogger('EdgeCacheClear');
 
+// Purge values partly come from the build output (routes, build ID, tags), so
+// only path- and tag-shaped strings leave the process. Next caps a tag at 256
+// characters and a revalidatePath path at 1024 (lib/constants.ts); a path also
+// carries basePath and, for a data route, `/_next/data/<buildId>/...json`.
+const MAX_PATH_LENGTH = 2048;
+const MAX_KEY_LENGTH = 1024 + 32;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+function isSendable(value: string, maxLength: number): boolean {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength && !CONTROL_CHARS.test(value);
+}
+
 /**
  * Result of a cache clear operation.
  */
@@ -104,6 +116,11 @@ export class EdgeCacheClear {
   }
 
   private async clearSinglePath(routePath: string, results: { path: string; success: boolean }[]): Promise<void> {
+    if (!isSendable(routePath, MAX_PATH_LENGTH)) {
+      edgeLog.warn(`Not purging a malformed path (${String(routePath).length} characters)`);
+      results.push({ path: routePath, success: false });
+      return;
+    }
     try {
       // Kept exactly, trailing slash included: with `trailingSlash` that is the URL the CDN caches.
       const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
@@ -206,6 +223,11 @@ export class EdgeCacheClear {
   }
 
   private async clearSingleKey(key: string, results: { key: string; success: boolean }[]): Promise<void> {
+    if (!isSendable(key, MAX_KEY_LENGTH)) {
+      edgeLog.warn(`Not purging a malformed key (${String(key).length} characters)`);
+      results.push({ key, success: false });
+      return;
+    }
     try {
       // Double-encode because the edge-cache-clearer expects URL-encoded values.
       const url = `${this.baseUrl}/keys/${encodeURIComponent(encodeURIComponent(key))}`;
