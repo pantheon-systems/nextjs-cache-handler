@@ -72,8 +72,9 @@ const MISSED_REVALIDATION_SKEW_MS = 2000;
 // round trip (up to 1 s, less with a shorter interval).
 const MAX_APPLY_MARGIN_MS = 1000;
 
-// How long a cache read waits for revalidations from other instances before
-// serving with what this process already knows (the refresh still completes).
+// How long after a read of revalidations from other instances starts the cache
+// reads waiting on it go ahead with what this process already knows (the read
+// still completes).
 const REFRESH_WAIT_MS = 2000;
 
 /** How long after a revalidation is stored every instance has applied it. */
@@ -473,15 +474,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     if (isBuildPhase()) {
       return;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const waited = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), REFRESH_WAIT_MS);
-    });
-    const outcome = await Promise.race([this.revalidations.refresh(), waited]);
-    clearTimeout(timer);
-    if (outcome === 'timeout') {
-      this.log.warn(`Revalidations from other instances took over ${REFRESH_WAIT_MS}ms to read; serving without them`);
-    }
+    await this.revalidations.refreshWithin(REFRESH_WAIT_MS);
   }
 
   protected override async onRevalidateComplete(

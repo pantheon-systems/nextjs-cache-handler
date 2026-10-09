@@ -313,8 +313,11 @@ Next.js records a revalidation in a per-process manifest, and checks cached
 pages, route handlers and `fetch` entries against it. The GCS handler also
 stores each revalidation in `cache/tags/revalidations.json`, and every process
 applies the stored ones to its own manifest before serving from the cache,
-reading the object at most once per `CACHE_TAGS_REFRESH_INTERVAL_MS` (a read
-waits at most 2 s for it, then serves with what the process already knows).
+reading the object at most once per `CACHE_TAGS_REFRESH_INTERVAL_MS`. Cache
+reads wait for that read until 2 s after it started, then serve with what the
+process already knows, so a read that arrives during a slow one waits only for
+the time left. A slow read logs one warning per streak, and the recovery
+message reports how many cache reads were served without it.
 
 `revalidateTag()` and `revalidatePath()` therefore:
 

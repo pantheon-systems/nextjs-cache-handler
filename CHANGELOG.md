@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A slow read of revalidations from other instances no longer delays every cache read by up to 2 s. Each read used to start its own 2 s wait, so when GCS was slow to answer, every cache read made during that time took up to 2 s longer. Reads now share one deadline, 2 s after the in-flight read started, so a read arriving during a stall waits only for the time left, and one arriving after it goes ahead at once.
+- The "Revalidations from other instances took over 2000ms to read" warning is logged once per streak of slow reads instead of once per waiting cache read, which could produce dozens of lines for a single stall. The recovery message reports how many slow reads there were and how many cache reads were served without them. Both are now logged as `[SharedRevalidations]` instead of `[GcsCacheHandler]`.
+
 ## 0.13.1
 
 ### Fixed

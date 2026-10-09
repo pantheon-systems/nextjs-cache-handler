@@ -58,6 +58,11 @@ export class SharedRevalidations {
   private writtenVersion = 0;
   private writing: Promise<boolean> | null = null;
   private refreshing: Promise<void> | null = null;
+  private refreshStartedAt = 0;
+  /** The current streak of reads that took longer than a cache read waits. */
+  private slowRefreshes = 0;
+  private readsServedWithout = 0;
+  private lastSlowRefresh: Promise<void> | null = null;
   private nextRefreshAt = 0;
   private lastGeneration: string | number | null = null;
   private refreshFailing = false;
@@ -128,15 +133,82 @@ export class SharedRevalidations {
 
   /** Load revalidations from other instances, at most once per interval unless forced. */
   async refresh(force = false): Promise<void> {
+    await this.startRefresh(force);
+  }
+
+  /**
+   * refresh() for a cache read, which waits at most `maxWaitMs` from when the
+   * in-flight read of the object started. Reads that arrive during a slow read
+   * share its deadline instead of each waiting the full time. Returns false if
+   * the caller should go ahead with the revalidations it already knows.
+   */
+  async refreshWithin(maxWaitMs: number): Promise<boolean> {
+    const pending = this.startRefresh(false);
+    if (!pending) {
+      return true;
+    }
+    const remaining = this.refreshStartedAt + maxWaitMs - Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome =
+      remaining <= 0
+        ? 'timeout'
+        : await Promise.race([
+            pending.then(() => 'done' as const),
+            new Promise<'timeout'>((resolve) => {
+              timer = setTimeout(() => resolve('timeout'), remaining);
+            }),
+          ]);
+    clearTimeout(timer);
+
+    if (outcome === 'timeout') {
+      this.noteSlowRefresh(pending, maxWaitMs);
+      return false;
+    }
+    if (this.slowRefreshes > 0) {
+      log.warn(
+        `Reading revalidations from other instances recovered after ${this.slowRefreshes} slow read(s); ` +
+          `${this.readsServedWithout} cache read(s) were served without them`
+      );
+      this.slowRefreshes = 0;
+      this.readsServedWithout = 0;
+      this.lastSlowRefresh = null;
+    }
+    return true;
+  }
+
+  /** The in-flight read of the object, starting one if the interval has passed (or `force`); null if none is due. */
+  private startRefresh(force: boolean): Promise<void> | null {
     if (!force && Date.now() < this.nextRefreshAt) {
-      return;
+      return null;
     }
     if (!this.refreshing) {
+      this.refreshStartedAt = Date.now();
+      // The retry runs here, not in the callers, so it still runs when every
+      // cache read waiting on a slow read has gone ahead without it.
       this.refreshing = this.doRefresh().finally(() => {
         this.refreshing = null;
+        this.retryUnwritten();
       });
     }
-    await this.refreshing;
+    return this.refreshing;
+  }
+
+  /** One warning per streak of slow reads; the recovery message carries the counts. */
+  private noteSlowRefresh(pending: Promise<void>, maxWaitMs: number): void {
+    this.readsServedWithout++;
+    if (pending === this.lastSlowRefresh) {
+      return;
+    }
+    this.lastSlowRefresh = pending;
+    if (++this.slowRefreshes === 1) {
+      log.warn(
+        `Revalidations from other instances took over ${maxWaitMs}ms to read; serving without them ` +
+          `until a read completes in time`
+      );
+    }
+  }
+
+  private retryUnwritten(): void {
     if (this.unwritten.size > 0 && !this.writing) {
       // Retry entries an earlier record() gave up on.
       this.record({}).catch(() => {});

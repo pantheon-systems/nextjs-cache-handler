@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach, type MockInstance } from 'vitest';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { SharedRevalidations, resolveTagsRefreshIntervalMs } from '../../src/utils/shared-revalidations.js';
 import { FakeBucket } from '../helpers/fake-bucket.js';
@@ -200,6 +200,126 @@ describe('SharedRevalidations', () => {
       const beforeRemove = vi.fn();
       expect(await store().prune(50, beforeRemove)).toBe(0);
       expect(beforeRemove).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('refreshWithin', () => {
+    let release: () => void;
+    let warn: MockInstance<typeof console.warn>;
+
+    // Holds every getMetadata on the object until release() is called.
+    const stallReads = () => {
+      let gate = new Promise<void>((resolve) => (release = resolve));
+      const file = bucket.file.bind(bucket);
+      bucket.file = ((name: string, options?: { generation?: string | number }) => {
+        const handle = file(name, options);
+        return {
+          ...handle,
+          getMetadata: async () => {
+            await gate;
+            return handle.getMetadata();
+          },
+        };
+      }) as typeof bucket.file;
+      return () => {
+        release();
+        gate = Promise.resolve();
+      };
+    };
+    const slowWarnings = () => warn.mock.calls.filter(([message]) => String(message).includes('took over'));
+
+    beforeEach(() => {
+      vi.useFakeTimers({ now: 10_000 });
+      warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warn.mockRestore();
+    });
+
+    it('waits for a read that completes in time', async () => {
+      bucket.putJson(KEY, { posts: { expired: 1, at: 1 } });
+      const reader = store();
+      expect(await reader.refreshWithin(2000)).toBe(true);
+      expect(reader.get('posts')).toEqual({ expired: 1, at: 1 });
+      expect(slowWarnings()).toHaveLength(0);
+    });
+
+    it('makes reads that join a slow read share its deadline', async () => {
+      const reader = store();
+      const unstall = stallReads();
+
+      const first = reader.refreshWithin(2000);
+      await vi.advanceTimersByTimeAsync(1500);
+      let joinedAt = 0;
+      const joined = reader.refreshWithin(2000).then((result) => {
+        joinedAt = Date.now();
+        return result;
+      });
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await first).toBe(false);
+      expect(await joined).toBe(false);
+      // Waited the 500 ms left on the shared deadline, not its own 2000 ms.
+      expect(joinedAt).toBe(12_000);
+
+      // A read arriving after the deadline goes ahead at once.
+      expect(await reader.refreshWithin(2000)).toBe(false);
+      unstall();
+    });
+
+    it('warns once per streak of slow reads and reports the counts on recovery', async () => {
+      const reader = store();
+      const unstall = stallReads();
+
+      const first = reader.refreshWithin(2000);
+      await vi.advanceTimersByTimeAsync(2000);
+      await first;
+      await reader.refreshWithin(2000);
+      await reader.refreshWithin(2000);
+      expect(slowWarnings()).toHaveLength(1);
+
+      unstall();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await reader.refreshWithin(2000)).toBe(true);
+      const recovered = warn.mock.calls.filter(([message]) => String(message).includes('recovered after'));
+      expect(recovered).toHaveLength(1);
+      expect(String(recovered[0][0])).toContain('after 1 slow read(s); 3 cache read(s) were served without them');
+
+      // A later stall starts a new streak.
+      stallReads();
+      await vi.advanceTimersByTimeAsync(1000);
+      const again = reader.refreshWithin(2000);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await again).toBe(false);
+      expect(slowWarnings()).toHaveLength(2);
+      release();
+    });
+
+    it('retries an unstored revalidation when a slow read finishes, though no cache read waited for it', async () => {
+      bucket.failWrites.set(KEY, { code: 503, times: 1_000 });
+      const writer = store({ recordTimeoutMs: 3000 });
+      const recorded = writer.record({ posts: { expired: 1, at: 1 } });
+      await vi.runAllTimersAsync();
+      expect(await recorded).toBe(false);
+      bucket.failWrites.delete(KEY);
+
+      const unstall = stallReads();
+      const read = writer.refreshWithin(2000);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await read).toBe(false);
+
+      unstall();
+      await vi.runAllTimersAsync();
+      expect(bucket.json(KEY)).toEqual({ posts: { expired: 1, at: 1 } });
+    });
+
+    it('does not wait when no read is due', async () => {
+      const reader = store();
+      await reader.refreshWithin(2000);
+      stallReads();
+      expect(await reader.refreshWithin(2000)).toBe(true);
+      release();
     });
   });
 
