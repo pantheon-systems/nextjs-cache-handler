@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@pantheon-systems/nextjs-cache-handler": "file:../",
-    "next": "~16.3.6",
+    "next": "~16.3.8",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
