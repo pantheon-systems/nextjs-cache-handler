@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
-import { serializeUseCacheEntry, deserializeUseCacheEntry, discardEntry } from '../../utils/stream-serialization.js';
+import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
+import { getBuildStore } from './build-store.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
@@ -117,10 +118,9 @@ export class UseCacheFileHandler implements UseCacheHandler {
   async get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined> {
     log.debug(`GET: ${cacheKey}`);
 
-    // A build reads nothing -- see the matching comment in the GCS handler.
+    // A build uses Next's per-process store -- see the GCS handler.
     if (isBuildPhase()) {
-      log.debug(`MISS: ${cacheKey} (build phase)`);
-      return undefined;
+      return getBuildStore().get(cacheKey, softTags);
     }
 
     try {
@@ -178,9 +178,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
     // Build-time results must not reach runtime reads -- see the GCS handler.
     if (isBuildPhase()) {
-      log.debug(`SKIP: ${cacheKey} (build phase)`);
-      await discardEntry(pendingEntry);
-      return;
+      return getBuildStore().set(cacheKey, pendingEntry);
     }
 
     try {

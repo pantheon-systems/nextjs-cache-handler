@@ -46,6 +46,42 @@ describe('TagsBuffer', () => {
     return buffer;
   }
 
+  describe('onFlushed', () => {
+    it('reports the flushed keys with their tags and when they were added', async () => {
+      const onFlushed = vi.fn();
+      const buf = createBuffer(1000, { onFlushed });
+      const addedAt = Date.now();
+      buf.addTags('key1', ['tag1', 'tag2']);
+
+      await buf.flush();
+
+      expect(onFlushed).toHaveBeenCalledWith([{ cacheKey: 'key1', tags: ['tag1', 'tag2'], addedAt }]);
+    });
+
+    it('is not called for a failed flush, and keeps the add time for the retry', async () => {
+      const onFlushed = vi.fn();
+      const buf = createBuffer(1000, { onFlushed });
+      mockWrite.mockRejectedValueOnce(httpError(503));
+      const addedAt = Date.now();
+      buf.addTags('key1', ['tag1']);
+
+      await buf.flush();
+      expect(onFlushed).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await buf.flush();
+      expect(onFlushed).toHaveBeenCalledWith([{ cacheKey: 'key1', tags: ['tag1'], addedAt }]);
+    });
+
+    it('logs an onFlushed error without failing the flush', async () => {
+      const buf = createBuffer(1000, { onFlushed: vi.fn().mockRejectedValue(new Error('boom')) });
+      buf.addTags('key1', ['tag1']);
+
+      await expect(buf.flush()).resolves.toBeUndefined();
+      expect(buf.hasPending).toBe(false);
+    });
+  });
+
   describe('addTags', () => {
     it('should queue tag additions', () => {
       const buf = createBuffer();

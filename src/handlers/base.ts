@@ -12,6 +12,8 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
+import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
+import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
 import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
@@ -58,6 +60,8 @@ export function resetBuildInvalidationCheck(): void {
 export interface BuildMeta {
   buildId: string;
   timestamp: number;
+  /** When the build's prerenders were written (see loadBuildTime); absent before 0.13.1. */
+  builtAt?: number;
 }
 
 /**
@@ -206,6 +210,8 @@ export abstract class BaseCacheHandler {
   private async checkBuildInvalidation(): Promise<void> {
     // `buildId` holds the generation ID (build ID + deployment ID).
     const currentBuildId = getCacheGenerationId();
+    const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
+    const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
 
     try {
       const buildMeta = await this.readBuildMeta();
@@ -214,19 +220,22 @@ export abstract class BaseCacheHandler {
         this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
 
         await this.invalidateRouteCache();
+        await this.onNewGeneration(buildMeta);
 
-        await this.writeBuildMeta({
-          buildId: currentBuildId,
-          timestamp: Date.now(),
-        });
+        await this.writeBuildMeta(currentMeta);
       }
     } catch {
       // No previous build metadata - first run, just save current build ID
-      await this.writeBuildMeta({
-        buildId: currentBuildId,
-        timestamp: Date.now(),
-      });
+      await this.writeBuildMeta(currentMeta);
     }
+  }
+
+  /**
+   * Called once a new build (generation) replaces `previous`, after the route
+   * cache is invalidated. Default: nothing.
+   */
+  protected async onNewGeneration(_previous: BuildMeta): Promise<void> {
+    // Default implementation does nothing
   }
 
   // ============================================================================
@@ -351,6 +360,8 @@ export abstract class BaseCacheHandler {
     // before checkBuildInvalidation() (in initialize()) has had a chance to
     // wipe it.
     await this.ensureInitialized();
+    // Before any tag check: Next's own checks run on what get() returns.
+    await this.refreshRevalidations();
 
     try {
       const cacheType = this.determineCacheType(ctx);
@@ -497,7 +508,7 @@ export abstract class BaseCacheHandler {
 
       // For route cache updates (ISR), trigger edge cache invalidation
       if (cacheType === 'route') {
-        this.onRouteCacheSet(cacheKey);
+        this.onRouteCacheSet(cacheKey, (incrementalCacheValue as { kind?: string } | null)?.kind);
       }
 
       this.log.debug(`Cached ${cacheKey} in ${cacheType} cache`);
@@ -515,26 +526,6 @@ export abstract class BaseCacheHandler {
     const tagArray = [tag].flat();
     const affectedKeys: string[] = [];
 
-    let tagsMapping: Record<string, string[]>;
-    try {
-      tagsMapping = await this.readTagsMapping();
-    } catch (error) {
-      this.log.error('Error reading tags mapping during revalidateTag:', error);
-      tagsMapping = {};
-    }
-
-    for (const currentTag of tagArray) {
-      const cacheKeysForTag = tagsMapping[currentTag] || [];
-
-      if (cacheKeysForTag.length === 0) {
-        this.log.debug(`No cache entries found for tag: ${currentTag}`);
-        continue;
-      }
-
-      this.log.debug(`Found ${cacheKeysForTag.length} cache entries for tag: ${currentTag}`);
-      affectedKeys.push(...cacheKeysForTag);
-    }
-
     // Record the invalidation in Next.js's shared tagsManifest instead of
     // deleting entries, as FileSystemCache does. A stale entry stays servable
     // while it regenerates, and PPR routes can resume from it; get() drops one
@@ -550,38 +541,82 @@ export abstract class BaseCacheHandler {
     // updateTag's whole point is read-your-own-writes within the same action.
     // This mirrors Next's own FileSystemCache.revalidateTag exactly.
     const now = Date.now();
+    const revalidations: SharedRevalidationMap = {};
     for (const currentTag of tagArray) {
       const existingEntry = tagsManifest.get(currentTag) ?? {};
+      let updates: { stale?: number; expired?: number };
       if (durations) {
-        const updates: { stale: number; expired?: number } = { ...existingEntry, stale: now };
+        updates = { ...existingEntry, stale: now };
         if (durations.expire !== undefined) {
           updates.expired = now + durations.expire * 1000;
         }
-        tagsManifest.set(currentTag, updates);
       } else {
-        tagsManifest.set(currentTag, { ...existingEntry, expired: now });
+        updates = { ...existingEntry, expired: now };
       }
+      tagsManifest.set(currentTag, updates);
+      revalidations[currentTag] = { ...updates, at: now };
+    }
+
+    // Published before the tags map is read: an instance flushing a key after
+    // that read then sees the revalidation and purges the key itself.
+    const published = await this.publishRevalidations(revalidations);
+
+    let tagsMapping: Record<string, string[]>;
+    try {
+      tagsMapping = await this.readTagsMapping();
+    } catch (error) {
+      this.log.error('Error reading tags mapping during revalidateTag:', error);
+      tagsMapping = {};
+    }
+
+    // Build prerenders never pass through set(), so their keys come from the build output.
+    const buildTags = isBuildPhase() ? {} : await loadBuildPrerenderTags(this.context?.serverDistDir);
+
+    for (const currentTag of tagArray) {
+      const cacheKeysForTag = [...new Set([...(tagsMapping[currentTag] ?? []), ...(buildTags[currentTag] ?? [])])];
+
+      if (cacheKeysForTag.length === 0) {
+        this.log.debug(`No cache entries found for tag: ${currentTag}`);
+        continue;
+      }
+
+      this.log.debug(`Found ${cacheKeysForTag.length} cache entries for tag: ${currentTag}`);
+      affectedKeys.push(...cacheKeysForTag);
     }
 
     this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
-    await this.onRevalidateComplete(tagArray, affectedKeys);
+    await this.onRevalidateComplete(tagArray, affectedKeys, published);
   }
 
   /**
    * Hook called after revalidation is complete.
    * Subclasses can override to perform additional cleanup.
    */
-  protected async onRevalidateComplete(_tags: string[], _affectedKeys: string[]): Promise<void> {
+  protected async onRevalidateComplete(_tags: string[], _affectedKeys: string[], _published = true): Promise<void> {
     // Default implementation does nothing
   }
 
   /**
-   * Hook called when a route cache entry is set (ISR page update).
-   * Subclasses can override to perform edge cache invalidation.
+   * Hook called when a route cache entry is set (ISR page update), with the
+   * entry's kind (APP_PAGE, APP_ROUTE, PAGES). Subclasses can override to
+   * perform edge cache invalidation.
    */
-  protected onRouteCacheSet(_cacheKey: string): void {
+  protected onRouteCacheSet(_cacheKey: string, _kind?: string): void {
+    // Default implementation does nothing
+  }
+
+  /**
+   * Share revalidations with other instances. Resolves false if they could not
+   * be stored yet. Default: this process only.
+   */
+  protected async publishRevalidations(_revalidations: SharedRevalidationMap): Promise<boolean> {
+    return true;
+  }
+
+  /** Apply revalidations made by other instances to tagsManifest. Default: none. */
+  protected async refreshRevalidations(): Promise<void> {
     // Default implementation does nothing
   }
 
