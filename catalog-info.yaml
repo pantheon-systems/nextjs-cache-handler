@@ -4,10 +4,10 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: "nextjs-cache-handler"
-  description: "DevX owned repository"
+  description: "SiteX owned repository"
   annotations:
     "backstage.io/techdocs-ref": "dir:docs/"
 spec:
   type: "gcp-service"
   lifecycle: "production"
-  owner: "developer-experience"
+  owner: "site-experience"
