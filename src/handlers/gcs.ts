@@ -35,6 +35,7 @@ import {
 } from '../utils/shared-revalidations.js';
 import { loadSiteUrlConfig, pagesDataRoute, toPublicPath, type SiteUrlConfig } from '../utils/site-urls.js';
 import { isBuildPhase } from '../utils/build-detection.js';
+import { DelayedPurges } from '../utils/delayed-purges.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -84,7 +85,8 @@ const applyDelayMs = (revalidations: SharedRevalidations) =>
 // Deletes in flight at once during the deploy hand-over (onNewGeneration).
 const FETCH_DELETE_BATCH_SIZE = 50;
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+// Re-purges once every instance has applied a revalidation, per process.
+const delayedPurges = new DelayedPurges();
 
 /**
  * Purge keys this process just made visible in the tags map whose tags were
@@ -118,15 +120,11 @@ async function purgeMissedRevalidations(
   clearer.clearPathsInBackground(list, `revalidated before flush: ${list.join(', ')}`);
 
   // Purge again once every instance serves the revalidated entry, so one that
-  // has not refreshed yet cannot put the old page back in the CDN. A timer, not
-  // awaited, so the flush does not hold up the request that triggered it.
+  // has not refreshed yet cannot put the old page back in the CDN.
   const latest = Math.max(...added.flatMap(({ tags }) => tags.map((tag) => revalidations.get(tag)?.at ?? 0)));
-  const wait = latest + applyDelayMs(revalidations) - Date.now();
-  if (wait > 0) {
-    setTimeout(
-      () => clearer.clearPathsInBackground(list, `revalidated before flush, re-purge: ${list.join(', ')}`),
-      wait
-    );
+  const due = latest + applyDelayMs(revalidations);
+  if (due > Date.now()) {
+    delayedPurges.schedule(clearer, { paths: list }, due, `revalidated before flush, re-purge: ${list.join(', ')}`);
   }
 }
 
@@ -146,7 +144,7 @@ export interface FlushTagsMappingOptions {
 
 /**
  * Write every pending tag-mapping update in this process now, retrying until
- * `timeoutMs`. Next.js exits on SIGTERM itself, so the handler cannot hook
+ * `timeoutMs`, and send the CDN re-purges it still owes. Next.js exits on SIGTERM itself, so the handler cannot hook
  * shutdown; an app that sets NEXT_MANUAL_SIG_HANDLE and handles the signal can
  * call this before exiting so the last interval's updates are not lost. Never
  * rejects.
@@ -189,7 +187,12 @@ export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {})
     })
   );
 
-  await revalidationsStored;
+  // Re-purges this process still owes the CDN, once they are due if the deadline allows.
+  const purgesSent = delayedPurges.flush(deadline).catch((error) => {
+    gcsLog.warn('flushGcsTagsMapping: delayed CDN purges failed:', error);
+  });
+
+  await Promise.all([revalidationsStored, purgesSent]);
   return pending.filter((buffer) => !buffer.hasPending && buffer.droppedUpdates === droppedBefore.get(buffer)).length;
 }
 
@@ -202,6 +205,7 @@ export function resetGcsSharedState(): void {
     buffer.destroy();
   }
   sharedTagsBuffers.clear();
+  delayedPurges.reset();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
 }
@@ -523,17 +527,21 @@ export class GcsCacheHandler extends BaseCacheHandler {
 
     // Purge now for the instances that already serve the new entry, then again
     // once every instance does, so none can put the old page back in the CDN.
-    // Awaited rather than a timer: a server action's response waits for it, and
-    // Cloud Run may not give a detached timer CPU.
+    // Only the first is awaited: a server action's response waits for it.
     await purge('now');
+    const again = { keys: tags, paths, purgeAll: implicit.purgeAll };
+    const schedule = (phase: string) =>
+      delayedPurges.schedule(
+        clearer,
+        again,
+        Date.now() + applyDelayMs(this.revalidations),
+        `tag revalidation (${phase}): ${tags.join(', ')}`
+      );
     if (published) {
-      await delay(applyDelayMs(this.revalidations));
-      await purge('after every instance applied it');
+      schedule('after every instance applied it');
     } else {
       // Not stored yet, so other instances do not know it: purge after the retry that stores it.
-      this.revalidations.whenStored(tags, () => {
-        setTimeout(() => purge('after a delayed store').catch(() => {}), applyDelayMs(this.revalidations));
-      });
+      this.revalidations.whenStored(tags, () => schedule('after a delayed store'));
     }
   }
 

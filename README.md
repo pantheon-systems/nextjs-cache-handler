@@ -324,15 +324,22 @@ message reports how many cache reads were served without it.
 1. store the revalidation (waiting up to 250 ms so revalidations from the same
    moment share one write, then retrying a failed write for up to 5 s);
 2. purge the CDN;
-3. wait until every process has applied it (two refresh intervals, 2 s by
-   default) and purge the CDN again, so a process that had not refreshed yet
-   cannot put the old page back in the CDN.
+3. purge the CDN again once every process has applied it (two refresh
+   intervals, 2 s by default), so a process that had not refreshed yet cannot
+   put the old page back in the CDN.
 
-A server action that revalidates responds after step 3. A route handler
-responds first; Next.js finishes the revalidation after the response. If the
-revalidation could not be stored within 5 s, it is retried on later cache
-reads and the second purge runs once it is stored; `flushSharedTagsMapping()`
-also stores such revalidations at shutdown.
+A server action that revalidates responds after step 2; step 3 runs on a timer.
+Second purges that come due within 1 s of each other are sent together, each
+path and key once, so a burst of revalidations sends about one purge per second
+per process. A process that gets no CPU between requests (Cloud Run with
+request-based CPU allocation) sends an overdue second purge at its next
+request; one that stops before then loses it unless the app calls
+`flushSharedTagsMapping()` at shutdown, which sends it (waiting until it is due,
+within its deadline). A route handler responds first; Next.js finishes the
+revalidation after the response. If the revalidation could not be stored within
+5 s, it is retried on later cache reads and the second purge is scheduled once
+it is stored; `flushSharedTagsMapping()` also stores such revalidations at
+shutdown.
 
 ### How long revalidations are kept
 
