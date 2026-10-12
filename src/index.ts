@@ -138,7 +138,8 @@ export async function clearSharedCache(): Promise<number> {
 export async function clearEdgeCachePaths(paths: string[]): Promise<CacheClearResult | null> {
   const clearer = createEdgeCacheClearer();
   if (!clearer) return null;
-  return clearer.clearPaths(paths);
+  // This API has always dropped a trailing slash; the handlers' own purges keep it.
+  return clearer.clearPaths(paths.map((p) => p.replace(/(.)\/$/, '$1')));
 }
 
 /**
@@ -158,9 +159,9 @@ export async function clearEdgeCache(): Promise<CacheClearResult | null> {
 // ============================================================================
 
 /**
- * Write pending tag-mapping updates to GCS now. The GCS handler batches them
- * (see CACHE_TAGS_FLUSH_INTERVAL_MS), and Next.js exits on SIGTERM before the
- * handler can flush. If you set NEXT_MANUAL_SIG_HANDLE and handle SIGTERM
+ * Write pending tag-mapping updates to GCS now, and send the CDN re-purges
+ * still owed for recent revalidations. The GCS handler batches both, and
+ * Next.js exits on SIGTERM before the handler can flush. If you set NEXT_MANUAL_SIG_HANDLE and handle SIGTERM
  * yourself, call this before exiting.
  *
  * Call it from process-level code (a custom server), not from code Next.js

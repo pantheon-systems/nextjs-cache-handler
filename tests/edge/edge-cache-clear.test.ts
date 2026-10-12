@@ -161,6 +161,26 @@ describe('EdgeCacheClear', () => {
       expect(result.paths).toEqual(['/']);
     });
 
+    it('keeps a trailing slash, the URL a trailingSlash site serves', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      await new EdgeCacheClear().clearPaths(['/tags/']);
+
+      expect(fetch).toHaveBeenCalledWith(
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/${encodeURIComponent(encodeURIComponent('tags/'))}`,
+        expect.any(Object)
+      );
+    });
+
+    it('does not send a path with control characters or over the length limit', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearPaths(['/ok', '/bad\npath', `/${'a'.repeat(2048)}`]);
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(result.paths).toEqual(['/ok']);
+    });
+
     it('should handle partial failures', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce({ ok: true, status: 200 } as Response)
@@ -233,6 +253,22 @@ describe('EdgeCacheClear', () => {
         `http://${mockEndpoint}/rest/v0alpha1/cache/keys/${encodeURIComponent(encodeURIComponent('tag/with/slashes'))}`,
         expect.any(Object)
       );
+    });
+  });
+
+  describe('clearKeys validation', () => {
+    it('does not send a key with control characters or over the length limit', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearKeys([
+        'posts',
+        `_N_T_/${'a'.repeat(1024)}/layout`,
+        'bad\u0000key',
+        'x'.repeat(1100),
+      ]);
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result.paths).toEqual(['posts', `_N_T_/${'a'.repeat(1024)}/layout`]);
     });
   });
 
@@ -359,6 +395,22 @@ describe('clearEdgeCachePaths', () => {
     );
     expect(result).not.toBeNull();
     expect(result!.success).toBe(true);
+  });
+
+  it('still drops a trailing slash, as it always has', async () => {
+    process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+    await clearEdgeCachePaths(['/about/', '/']);
+
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/about',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
+      expect.objectContaining({ method: 'DELETE' })
+    );
   });
 
   it('should return null when env var is missing', async () => {

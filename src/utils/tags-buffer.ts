@@ -44,12 +44,26 @@ export interface TagsBufferConfig {
    * guarantee while spreading them out.
    */
   intervalJitter?: number;
+  /**
+   * Called after a flush stores additions, with each key's tags and when it
+   * was last added. Errors are logged, never thrown.
+   */
+  onFlushed?: (added: FlushedKey[]) => Promise<void> | void;
+}
+
+export interface FlushedKey {
+  cacheKey: string;
+  tags: string[];
+  addedAt: number;
 }
 
 interface PendingBatch {
   adds: Map<string, Set<string>>;
+  addedAt: Map<string, number>;
   deletes: Set<string>;
 }
+
+const emptyBatch = (): PendingBatch => ({ adds: new Map(), addedAt: new Map(), deletes: new Set() });
 
 export const DEFAULT_TAGS_FLUSH_INTERVAL_MS = 5000;
 export const MIN_TAGS_FLUSH_INTERVAL_MS = 1000;
@@ -71,9 +85,10 @@ export class TagsBuffer {
   private readonly intervalJitter: number;
   private readonly readTagsMapping: TagsBufferConfig['readTagsMapping'];
   private readonly writeTagsMapping: TagsBufferConfig['writeTagsMapping'];
+  private readonly onFlushed: TagsBufferConfig['onFlushed'];
   private readonly log: ReturnType<typeof createLogger>;
 
-  private pending: PendingBatch = { adds: new Map(), deletes: new Set() };
+  private pending: PendingBatch = emptyBatch();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushPromise: Promise<void> | null = null;
   private lastFlushTime = 0;
@@ -92,6 +107,7 @@ export class TagsBuffer {
     this.intervalJitter = Math.min(1, Math.max(0, config.intervalJitter ?? 0.25));
     this.readTagsMapping = config.readTagsMapping;
     this.writeTagsMapping = config.writeTagsMapping;
+    this.onFlushed = config.onFlushed;
     this.log = createLogger(config.handlerName ?? 'TagsBuffer');
     // Let the first flush collect a full interval's worth of updates.
     this.nextFlushTime = Date.now() + this.nextInterval();
@@ -117,6 +133,7 @@ export class TagsBuffer {
     for (const tag of tags) {
       set.add(tag);
     }
+    this.pending.addedAt.set(cacheKey, Date.now());
 
     this.scheduleFlush();
   }
@@ -238,7 +255,7 @@ export class TagsBuffer {
   private async doFlush(): Promise<void> {
     const batch = this.pending;
     const batchSince = this.oldestPendingSince;
-    this.pending = { adds: new Map(), deletes: new Set() };
+    this.pending = emptyBatch();
     const batchSize = batch.adds.size + batch.deletes.size;
 
     try {
@@ -268,6 +285,25 @@ export class TagsBuffer {
       this.restorePending(batch);
       this.oldestPendingSince = this.hasPending ? Math.min(batchSince, this.oldestPendingSince || batchSince) : 0;
       this.onFlushFailure(error);
+      return;
+    }
+
+    await this.notifyFlushed(batch);
+  }
+
+  private async notifyFlushed(batch: PendingBatch): Promise<void> {
+    if (!this.onFlushed || batch.adds.size === 0) {
+      return;
+    }
+    const added = [...batch.adds].map(([cacheKey, tags]) => ({
+      cacheKey,
+      tags: [...tags],
+      addedAt: batch.addedAt.get(cacheKey) ?? Date.now(),
+    }));
+    try {
+      await this.onFlushed(added);
+    } catch (error) {
+      this.log.error('Error in onFlushed:', error);
     }
   }
 
@@ -294,7 +330,7 @@ export class TagsBuffer {
     const pendingForMs = Date.now() - this.oldestPendingSince;
     if (pendingForMs > this.maxPendingAgeMs) {
       const dropped = this.pendingCount;
-      this.pending = { adds: new Map(), deletes: new Set() };
+      this.pending = emptyBatch();
       this.droppedUpdatesTotal += dropped;
       this.consecutiveFailures = 0;
       this.oldestPendingSince = 0;
@@ -339,6 +375,10 @@ export class TagsBuffer {
       }
       for (const tag of tags) {
         set.add(tag);
+      }
+      const addedAt = batch.addedAt.get(cacheKey);
+      if (addedAt !== undefined && !this.pending.addedAt.has(cacheKey)) {
+        this.pending.addedAt.set(cacheKey, addedAt);
       }
     }
     for (const cacheKey of batch.deletes) {

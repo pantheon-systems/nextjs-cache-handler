@@ -32,6 +32,11 @@ export function getStaticRoutes(): Set<string> {
       if (config.initialRevalidateSeconds === false) {
         const cacheKey = routeToCacheKey(route);
         staticRoutes.add(cacheKey);
+        // Next 16.3.8+ keys routes by source too; the `.meta` file records the exact key.
+        const routeCacheKey = readRouteCacheKey(route);
+        if (routeCacheKey) {
+          staticRoutes.add(toStoredKey(routeCacheKey));
+        }
       }
     }
   } catch {
@@ -51,6 +56,28 @@ function readPrerenderManifest(): PrerenderManifest | null {
   } catch {
     return null;
   }
+}
+
+/** `routeCache.key` from the route's build `.meta` file (Next 16.3.8+), if any. */
+function readRouteCacheKey(route: string): string | null {
+  const page = route === '/' ? '/index' : /^\/index(\/|$)/.test(route) ? `/index${route}` : route;
+  for (const dir of ['app', 'pages']) {
+    try {
+      const metaPath = path.join(process.cwd(), '.next', 'server', dir, `${page}.meta`);
+      const key = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))?.routeCache?.key;
+      if (typeof key === 'string') {
+        return key;
+      }
+    } catch {
+      // Not built under this router, or no .meta
+    }
+  }
+  return null;
+}
+
+/** The handlers' storage name for a cache key (GcsCacheHandler/FileCacheHandler getCacheKey). */
+function toStoredKey(cacheKey: string): string {
+  return cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
 }
 
 /**

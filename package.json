@@ -1,6 +1,6 @@
 {
   "name": "@pantheon-systems/nextjs-cache-handler",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "description": "Custom cache handler for Next.js with support for Google Cloud Storage and file-based caching",
   "type": "module",
   "main": "./dist/index.js",
@@ -59,7 +59,8 @@
     "form-data": "2.5.6",
     "postcss": "^8.5.10",
     "uuid": "^11.1.1",
-    "sharp": "^0.35.0"
+    "sharp": "^0.35.5",
+    "source-map-js": "^1.2.2"
   },
   "devDependencies": {
     "@types/node": "^22",
