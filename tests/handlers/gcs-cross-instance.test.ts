@@ -21,6 +21,7 @@ import { writeBuildOutput } from '../helpers/build-output.js';
 import { resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
 import { resetSharedRevalidationsForTests } from '../../src/utils/shared-revalidations.js';
 import { resetSiteUrlConfigForTests } from '../../src/utils/site-urls.js';
+import { MERGE_WINDOW_MS } from '../../src/utils/delayed-purges.js';
 
 vi.stubGlobal('fetch', vi.fn());
 
@@ -44,6 +45,8 @@ const purgedPaths = () => [...new Set(pathPurges())].sort();
 // CACHE_TAGS_REFRESH_INTERVAL_MS is 100 in tests (vitest.config.ts): the second
 // purge follows the stored revalidation by the interval plus an equal margin.
 const APPLY_DELAY_MS = 200;
+// The second purge goes out within the merge window after it is due.
+const SECOND_PURGE_MS = APPLY_DELAY_MS + MERGE_WINDOW_MS + 100;
 
 const page = (tags: string[]) => ({
   kind: 'APP_PAGE',
@@ -136,20 +139,60 @@ describe('GcsCacheHandler across instances', () => {
   });
 
   describe('CDN purge after every instance has the revalidation', () => {
-    it('purges now and again once every instance has applied it, and resolves after the second', async () => {
+    it('resolves after the first purge and purges again once every instance has applied it', async () => {
       bucket.putJson(TAGS_MAP, { inventory: ['/route-cache/APP_PAGE/h/$/tags'] });
       const handler = newHandler();
-      const started = Date.now();
 
-      const revalidated = handler.revalidateTag('inventory');
-      await new Promise((r) => setTimeout(r, APPLY_DELAY_MS / 2 + 250)); // batching window + half the delay
+      await handler.revalidateTag('inventory');
+      const resolvedAt = Date.now();
       expect(pathPurges()).toEqual(['/tags']);
-
-      await revalidated;
-      expect(pathPurges()).toEqual(['/tags', '/tags']);
-      expect(Date.now() - started).toBeGreaterThanOrEqual(APPLY_DELAY_MS);
       // The revalidation was stored before either purge.
       expect(bucket.json(REVALIDATIONS)).toHaveProperty('inventory');
+
+      let secondAt = 0;
+      vi.mocked(fetch).mockImplementation(async () => {
+        secondAt ||= Date.now();
+        return { ok: true, status: 200 } as Response;
+      });
+      await new Promise((r) => setTimeout(r, SECOND_PURGE_MS));
+      expect(pathPurges()).toEqual(['/tags', '/tags']);
+      // Never before every instance can have applied it.
+      expect(secondAt - resolvedAt).toBeGreaterThanOrEqual(APPLY_DELAY_MS);
+    });
+
+    it('merges re-purges due close together into one purge per path and key', async () => {
+      bucket.putJson(TAGS_MAP, {
+        inventory: ['/route-cache/APP_PAGE/h/$/tags'],
+        stations: ['/route-cache/APP_PAGE/h/$/tags', '/route-cache/APP_PAGE/h/$/stations'],
+      });
+      const handler = newHandler();
+      await handler.revalidateTag('inventory');
+      await new Promise((r) => setTimeout(r, 100));
+      await handler.revalidateTag('stations');
+      const firstPurges = vi.mocked(fetch).mock.calls.length;
+
+      await new Promise((r) => setTimeout(r, SECOND_PURGE_MS));
+      const later = vi
+        .mocked(fetch)
+        .mock.calls.slice(firstPurges)
+        .map(([url]) => String(url));
+      expect(later.filter((url) => url.includes('/cache/paths/')).sort()).toEqual([
+        expect.stringContaining('/cache/paths/stations'),
+        expect.stringContaining('/cache/paths/tags'),
+      ]);
+      expect(later.filter((url) => url.includes('/cache/keys/')).sort()).toEqual([
+        expect.stringContaining('/cache/keys/inventory'),
+        expect.stringContaining('/cache/keys/stations'),
+      ]);
+    });
+
+    it('sends a re-purge that is still owed when the process flushes for shutdown', async () => {
+      bucket.putJson(TAGS_MAP, { inventory: ['/route-cache/APP_PAGE/h/$/tags'] });
+      await newHandler().revalidateTag('inventory');
+      expect(pathPurges()).toEqual(['/tags']);
+
+      await flushGcsTagsMapping();
+      expect(pathPurges()).toEqual(['/tags', '/tags']);
     });
 
     it('defers the second purge until a revalidation that could not be stored is stored', async () => {
@@ -166,7 +209,7 @@ describe('GcsCacheHandler across instances', () => {
       expect(pathPurges()).toEqual(['/tags']);
 
       onStored!();
-      await new Promise((r) => setTimeout(r, APPLY_DELAY_MS + 50));
+      await new Promise((r) => setTimeout(r, SECOND_PURGE_MS));
       expect(pathPurges()).toEqual(['/tags', '/tags']);
     });
 
@@ -199,15 +242,13 @@ describe('GcsCacheHandler across instances', () => {
       const at = Date.now();
       bucket.putJson(REVALIDATIONS, { 'stations:santiago': { expired: at, at } });
 
+      // The shutdown flush also sends the re-purge, once every instance has applied it.
       await flushGcsTagsMapping();
       await settle();
 
       expect(bucket.json(TAGS_MAP)).toEqual({ 'stations:santiago': [santiago] });
-      expect(pathPurges()).toEqual(['/isr-fallback/americas/santiago']);
-
-      // Again once every instance has applied the revalidation.
-      await new Promise((r) => setTimeout(r, APPLY_DELAY_MS + 50));
       expect(pathPurges()).toEqual(['/isr-fallback/americas/santiago', '/isr-fallback/americas/santiago']);
+      expect(Date.now() - at).toBeGreaterThanOrEqual(APPLY_DELAY_MS);
     });
 
     it('does not purge for a revalidation that predates the key', async () => {

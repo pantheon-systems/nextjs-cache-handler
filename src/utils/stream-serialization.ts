@@ -107,21 +107,3 @@ export function deserializeUseCacheEntry(stored: SerializedUseCacheEntry): UseCa
     revalidate: stored.revalidate,
   };
 }
-
-/**
- * Waits for an entry a handler won't store and drains its stream. Never throws.
- * Not cancel(): Next passes one branch of a tee, and a branch's cancel() only
- * settles once the other branch is read or cancelled. For a dynamic hole Next
- * never reads it, so set() hung and stalled the prerender.
- */
-export async function discardEntry(pendingEntry: Promise<UseCacheEntry>): Promise<void> {
-  try {
-    const entry = await pendingEntry;
-    const reader = entry.value?.getReader();
-    while (reader && !(await reader.read()).done) {
-      // Discard the chunk
-    }
-  } catch {
-    // Nothing left to release
-  }
-}

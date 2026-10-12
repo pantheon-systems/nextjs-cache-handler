@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.2
+
+### Fixed
+
+- `use cache` entries set during `next build` are served again within the same build process. 0.13.1 made the `use cache` handlers miss every read during the build, but Next's prerender reads back what it just cached, so cached data counted as uncached: static output rendered runtime values (`use-cache-metadata-route-handler` sitemaps showed `runtime` instead of `buildtime`, and so did `fallback-shells` layouts), and builds with Cache Components could fail with "encountered uncached or runtime data during prerendering" (`resume-data-cache`). During the build the handlers now use Next's own in-memory default handler, per process. Build-time values still never reach GCS, the shared file store, or a runtime read, and the build still never reads or deletes the live revision's entries.
+- A server action that calls `revalidateTag()` or `revalidatePath()` responds after the first CDN purge again, not after the second. 0.13.1 waited for the second purge (two refresh intervals, 2 s by default) before responding, so the action's response took 2 s or more and clients saw the page update late (the Next.js `app-action`, `parallel-routes-revalidation` and `actions-revalidate-remount` deploy tests timed out). The second purge still waits until every instance has applied the revalidation, now on a timer: second purges due within 1 s of each other go out as one, each path and key once, and `flushSharedTagsMapping()` sends any still owed at shutdown.
+
 ## 0.13.1
 
 ### Fixed

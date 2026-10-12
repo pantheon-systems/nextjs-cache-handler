@@ -24,7 +24,7 @@ vi.mock('@google-cloud/storage', () => ({
   RETRYABLE_ERR_FN_DEFAULT: (err: { code?: number }) => err.code === 429 || err.code === 408 || (err.code ?? 0) >= 500,
 }));
 
-import { GcsCacheHandler, resetGcsSharedState } from '../../src/handlers/gcs.js';
+import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
 import { resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
 
@@ -144,8 +144,10 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
     it("purges the whole site for revalidatePath('/', 'layout')", async () => {
       await newHandler().revalidateTag('_N_T_/layout');
       await settle();
+      expect(sentPurges()).toMatchObject({ paths: [], nukes: 1 });
 
-      // Once now, once after every instance has applied the revalidation.
+      // Again after every instance has applied the revalidation (sent by the shutdown flush here).
+      await flushGcsTagsMapping({ timeoutMs: 5000 });
       expect(sentPurges()).toMatchObject({ paths: [], nukes: 2 });
     });
 

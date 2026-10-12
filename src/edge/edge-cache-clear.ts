@@ -41,6 +41,11 @@ export class EdgeCacheClear {
     this.baseUrl = `http://${proxyEndpoint}/rest/v0alpha1/cache`;
   }
 
+  /** Where purges go. Clearers with the same target are interchangeable. */
+  get target(): string {
+    return this.baseUrl;
+  }
+
   /**
    * Clear the entire edge cache (nuclear option).
    */
