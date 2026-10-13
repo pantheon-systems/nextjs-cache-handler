@@ -98,15 +98,27 @@ export class EdgeCacheClear {
     const startTime = Date.now();
     const results: { path: string; success: boolean }[] = [];
 
+    // Each path once: `a` and `/a` are the same request (clearSinglePath adds the slash).
+    const seen = new Set<unknown>();
+    const unique = paths.filter((routePath) => {
+      const key =
+        typeof routePath === 'string' && routePath !== '' && !routePath.startsWith('/') ? `/${routePath}` : routePath;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+
     try {
-      const clearPromises = paths.map((routePath) => this.clearSinglePath(routePath, results));
+      const clearPromises = unique.map((routePath) => this.clearSinglePath(routePath, results));
       await Promise.all(clearPromises);
 
       const duration = Date.now() - startTime;
       const successCount = results.filter((r) => r.success).length;
       const clearedPaths = results.filter((r) => r.success).map((r) => r.path);
 
-      edgeLog.debug(`Cleared ${successCount}/${paths.length} paths in ${duration}ms`);
+      edgeLog.debug(`Cleared ${successCount}/${unique.length} paths in ${duration}ms`);
 
       return {
         success: successCount > 0,
