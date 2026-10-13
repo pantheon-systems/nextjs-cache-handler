@@ -1,7 +1,14 @@
 import type { Bucket } from '@google-cloud/storage';
-import type { UseCacheEntry, UseCacheHandler, UseCacheStats, UseCacheEntryInfo } from './types.js';
+import type {
+  SerializedUseCacheEntry,
+  UseCacheEntry,
+  UseCacheHandler,
+  UseCacheStats,
+  UseCacheEntryInfo,
+} from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { getBuildStore } from './build-store.js';
+import { resolveTagsRefreshIntervalMs } from '../../utils/shared-revalidations.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
@@ -15,6 +22,57 @@ import {
 } from '../../utils/gcs-json-object.js';
 
 type TagTimestamps = Record<string, number>;
+type StoredUseCacheEntry = SerializedUseCacheEntry & { __buildId?: string };
+
+const DEFAULT_MEMORY_MB = 32;
+
+/** In-process memory for use-cache entries, from CACHE_USE_CACHE_MEMORY_MB (default 32, 0 disables). */
+export function resolveUseCacheMemoryBytes(raw: string | undefined = process.env.CACHE_USE_CACHE_MEMORY_MB): number {
+  const parsed = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  const mb = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MEMORY_MB;
+  return Math.floor(mb * 1024 * 1024);
+}
+
+/** Least-recently-used entries, bounded by the size of their stored JSON. */
+class MemoryEntries {
+  private readonly entries = new Map<string, { stored: StoredUseCacheEntry; bytes: number }>();
+  private bytes = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  get(key: string): StoredUseCacheEntry | undefined {
+    const hit = this.entries.get(key);
+    if (hit) {
+      this.entries.delete(key);
+      this.entries.set(key, hit);
+    }
+    return hit?.stored;
+  }
+
+  set(key: string, stored: StoredUseCacheEntry, bytes: number): void {
+    this.delete(key);
+    if (bytes > this.maxBytes) {
+      return;
+    }
+    this.entries.set(key, { stored, bytes });
+    this.bytes += bytes;
+    for (const [oldest, { bytes: size }] of this.entries) {
+      if (this.bytes <= this.maxBytes) {
+        break;
+      }
+      this.entries.delete(oldest);
+      this.bytes -= size;
+    }
+  }
+
+  delete(key: string): void {
+    const hit = this.entries.get(key);
+    if (hit) {
+      this.entries.delete(key);
+      this.bytes -= hit.bytes;
+    }
+  }
+}
 
 const MAX_PRECONDITION_RETRIES = 3;
 const PERSIST_BASE_BACKOFF_MS = 1000;
@@ -50,6 +108,15 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private readonly buildMetaKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
   private tagTimestamps: Map<string, number> = new Map();
+  // Next creates use-cache handlers once per process, so this is per process.
+  // A hit from memory resolves within a microtask; Next's cached-navigations
+  // render advances to its dynamic stage after one task, so a GCS read would
+  // otherwise push the cached result out of the static stage the client reuses.
+  private readonly memory = new MemoryEntries(resolveUseCacheMemoryBytes());
+  // Background reloads of tagTimestamps (see refreshTags).
+  private readonly tagsRefreshIntervalMs = resolveTagsRefreshIntervalMs();
+  private tagsReload: Promise<void> | null = null;
+  private nextTagsReloadAt = 0;
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
 
@@ -318,6 +385,19 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     // empty tagTimestamps map and treat a tag-invalidated entry as still fresh.
     await this.ensureInitialized();
 
+    // Same expiry checks as a GCS hit: tag timestamps are refreshed per request
+    // (refreshTags), and an entry another instance rewrites is only rewritten
+    // once it has expired, which this check also sees.
+    const remembered = this.memory.get(cacheKey);
+    if (remembered) {
+      const entry = deserializeUseCacheEntry(remembered);
+      if (!this.isExpired(entry)) {
+        log.debug(`HIT (memory): ${cacheKey}`);
+        return entry;
+      }
+      this.memory.delete(cacheKey);
+    }
+
     try {
       const gcsKey = this.getCacheKey(cacheKey);
       const file = this.bucket.file(gcsKey);
@@ -329,7 +409,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       }
 
       const [data] = await file.download();
-      const stored = JSON.parse(data.toString());
+      const stored: StoredUseCacheEntry = JSON.parse(data.toString());
 
       // An entry written by a different build must never be served as current:
       // this store is keyed by cache key + environment only (no build scoping),
@@ -363,6 +443,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       }
 
       log.debug(`HIT: ${cacheKey}`);
+      this.memory.set(cacheKey, stored, data.length);
 
       return entry;
     } catch (error) {
@@ -402,8 +483,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       const withBuildId = { ...serialized, __buildId: this.buildId };
       const gcsKey = this.getCacheKey(cacheKey);
       const file = this.bucket.file(gcsKey);
+      const json = JSON.stringify(withBuildId, null, 2);
 
-      await file.save(JSON.stringify(withBuildId, null, 2), {
+      // Before the write, so a read racing it is already served from memory.
+      this.memory.set(cacheKey, withBuildId, json.length);
+      await file.save(json, {
         resumable: false,
         metadata: { contentType: 'application/json' },
       });
@@ -415,12 +499,26 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
-   * Synchronize tag state from external source.
-   * Reloads tag timestamps from GCS.
+   * Synchronize tag state from external source: reload tag timestamps from GCS
+   * in the background, at most once per CACHE_TAGS_REFRESH_INTERVAL_MS.
+   *
+   * Next awaits this before a request's first 'use cache' read, inside its
+   * staged render, and with cached navigations the static stage ends after one
+   * task. Awaiting GCS here pushed every cached result out of the static stage,
+   * so the client could not reuse it. A tag revalidated on another instance
+   * therefore reaches this one's reads within about one interval; this
+   * instance's own updateTags() applies at once. The reload starts inside the
+   * request that triggered it, which has CPU.
    */
   async refreshTags(): Promise<void> {
+    if (this.tagsReload || Date.now() < this.nextTagsReloadAt) {
+      return;
+    }
     log.debug('REFRESH TAGS');
-    await this.loadTagTimestamps();
+    this.nextTagsReloadAt = Date.now() + this.tagsRefreshIntervalMs;
+    this.tagsReload = this.loadTagTimestamps().finally(() => {
+      this.tagsReload = null;
+    });
   }
 
   /**

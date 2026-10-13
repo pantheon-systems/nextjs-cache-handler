@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An instance now purges the CDN for a revalidation that another instance made, when it reads that revalidation from `revalidations.json`. The purge starts inside the request whose cache read found it, which has CPU, but that read does not wait for it. That instance may have put the old page back in the CDN until it knew of the revalidation. The second purge runs on a timer, which Cloud Run may give no CPU until the next request; this purge does not depend on it. Revalidations already stored when an instance first reads the object are not purged.
+- The GCS `use cache` handler keeps the entries a process has read or written in memory (new optional `CACHE_USE_CACHE_MEMORY_MB`, default `32`, `0` disables), checked against the same tag and revalidate expiry as a GCS read. With `cacheComponents` and `experimental.cachedNavigations`, Next renders a request in stages that advance after one task each, without waiting for cache reads. A `'use cache'` hit that needs a GCS round trip therefore arrived after the static stage ended, so the client could not reuse that segment and the navigation waited for the server (`segment-cache/cached-navigations` fallback-params cases). A hit from memory resolves within the static stage. The first read of a key on a new process still goes to GCS.
+- The GCS `use cache` handler's `refreshTags()` no longer waits for GCS. Next awaits it before a request's first `'use cache'` read, so its GCS round trip pushed even a memory hit out of the static stage. It now reloads tag timestamps in the background, at most once per `CACHE_TAGS_REFRESH_INTERVAL_MS`: a tag revalidated on another instance reaches this instance's `'use cache'` reads within about one interval, and an instance's own `updateTag()`/`revalidateTag()` applies at once. Both changes are needed: with either one alone, the cached result still arrives after the static stage.
+
 ## 0.13.2
 
 ### Fixed

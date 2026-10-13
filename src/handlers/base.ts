@@ -524,7 +524,6 @@ export abstract class BaseCacheHandler {
     this.log.debug(`REVALIDATE TAG: ${tag}`);
 
     const tagArray = [tag].flat();
-    const affectedKeys: string[] = [];
 
     // Record the invalidation in Next.js's shared tagsManifest instead of
     // deleting entries, as FileSystemCache does. A stale entry stays servable
@@ -560,7 +559,16 @@ export abstract class BaseCacheHandler {
     // Published before the tags map is read: an instance flushing a key after
     // that read then sees the revalidation and purges the key itself.
     const published = await this.publishRevalidations(revalidations);
+    const affectedKeys = await this.findAffectedKeys(tagArray);
 
+    this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
+
+    // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
+    await this.onRevalidateComplete(tagArray, affectedKeys, published);
+  }
+
+  /** Cache keys stored under any of `tags`, from the tags map and the build's prerenders. */
+  protected async findAffectedKeys(tags: string[]): Promise<string[]> {
     let tagsMapping: Record<string, string[]>;
     try {
       tagsMapping = await this.readTagsMapping();
@@ -572,7 +580,8 @@ export abstract class BaseCacheHandler {
     // Build prerenders never pass through set(), so their keys come from the build output.
     const buildTags = isBuildPhase() ? {} : await loadBuildPrerenderTags(this.context?.serverDistDir);
 
-    for (const currentTag of tagArray) {
+    const affectedKeys: string[] = [];
+    for (const currentTag of tags) {
       const cacheKeysForTag = [...new Set([...(tagsMapping[currentTag] ?? []), ...(buildTags[currentTag] ?? [])])];
 
       if (cacheKeysForTag.length === 0) {
@@ -583,11 +592,7 @@ export abstract class BaseCacheHandler {
       this.log.debug(`Found ${cacheKeysForTag.length} cache entries for tag: ${currentTag}`);
       affectedKeys.push(...cacheKeysForTag);
     }
-
-    this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
-
-    // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
-    await this.onRevalidateComplete(tagArray, affectedKeys, published);
+    return affectedKeys;
   }
 
   /**

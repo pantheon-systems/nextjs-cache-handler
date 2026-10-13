@@ -104,7 +104,8 @@ interface CacheHandlerConfig {
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
-| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` purges the CDN a second time two intervals after storing a revalidation. See [Revalidations across processes](#revalidations-across-processes). | Optional |
+| `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
+| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for two intervals after storing a revalidation. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
 
@@ -327,6 +328,15 @@ message reports how many cache reads were served without it.
 3. purge the CDN again once every process has applied it (two refresh
    intervals, 2 s by default), so a process that had not refreshed yet cannot
    put the old page back in the CDN.
+
+A process that had not refreshed yet can put the old page back in the CDN
+between steps 2 and 3. So each process, when it reads a revalidation that
+another process made, also purges the CDN for that revalidation's pages, started
+inside the request that read it (which has CPU) without holding up its cache
+reads. (Revalidations it finds on its
+first read are skipped, because it had served nothing before then.) The second
+purge in step 3 is a backstop, for a process that served the old page and then
+received no further requests.
 
 A server action that revalidates responds after step 2; step 3 runs on a timer.
 Second purges that come due within 1 s of each other are sent together, each

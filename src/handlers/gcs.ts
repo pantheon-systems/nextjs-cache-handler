@@ -35,7 +35,7 @@ import {
 } from '../utils/shared-revalidations.js';
 import { loadSiteUrlConfig, pagesDataRoute, toPublicPath, type SiteUrlConfig } from '../utils/site-urls.js';
 import { isBuildPhase } from '../utils/build-detection.js';
-import { DelayedPurges } from '../utils/delayed-purges.js';
+import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -258,6 +258,13 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.tagsBuffer = getSharedTagsBuffer(bucketName, this.tagsBucket, this.tagsMapKey, (added) =>
       purgeMissedRevalidations(added, revalidations, edgeCacheClearer, site)
     );
+    // Likewise per process: purge what another instance revalidated, since this
+    // one may have put the old pages back in the CDN until it learned of it.
+    if (edgeCacheClearer) {
+      revalidations.setOnLearned(async (tags) =>
+        this.purgeTags(tags, await this.findAffectedKeys(tags), 'applied from another instance')
+      );
+    }
 
     // Initialize asynchronously (constructors can't be async) -- stored via
     // setInitPromise() so get()/set() can await it before touching the store.
@@ -495,41 +502,15 @@ export class GcsCacheHandler extends BaseCacheHandler {
       return;
     }
 
-    const clearer = this.edgeCacheClearer;
-    const implicit = implicitTagsToPurgePaths(tags);
-
-    // revalidatePath's own path is purged even when the tags map has no key for it.
-    const routePaths = new Set(implicit.paths);
-    for (const key of affectedKeys) {
-      const routePath = cacheKeyToPurgePath(key);
-      if (routePath) {
-        routePaths.add(routePath);
-      } else if (key.startsWith('/')) {
-        this.log.debug(`Not purging shell pattern ${key}: it matches no URL`);
-      }
-    }
-    const paths = [...routePaths].map((routePath) => toPublicPath(routePath, this.site));
-
-    const purge = async (phase: string) => {
-      // Keys are sent even when no keys were found: they only match once responses
-      // carry the tags as Surrogate-Key, which the tenant router turns into purge keys.
-      const context = `tag revalidation (${phase}): ${tags.join(', ')}`;
-      if (implicit.purgeAll) {
-        await Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]);
-        this.log.debug(`Purged the whole site for ${context}`);
-        return;
-      }
-      if (paths.length > 0) {
-        this.log.debug(`Purging edge paths for ${context}: ${paths.join(', ')}`);
-      }
-      await Promise.all([clearer.clearKeys(tags), clearer.clearPaths(paths)]);
-    };
-
     // Purge now for the instances that already serve the new entry, then again
     // once every instance does, so none can put the old page back in the CDN.
-    // Only the first is awaited: a server action's response waits for it.
-    await purge('now');
-    const again = { keys: tags, paths, purgeAll: implicit.purgeAll };
+    // Only the first is awaited: a server action's response waits for it. Cloud
+    // Run may give the timer no CPU until the next request, so the second is a
+    // backstop: each other instance also purges when it learns of the
+    // revalidation (setOnLearned), inside a request.
+    const clearer = this.edgeCacheClearer;
+    await this.purgeTags(tags, affectedKeys, 'now');
+    const again = this.purgeTarget(tags, affectedKeys);
     const schedule = (phase: string) =>
       delayedPurges.schedule(
         clearer,
@@ -543,6 +524,47 @@ export class GcsCacheHandler extends BaseCacheHandler {
       // Not stored yet, so other instances do not know it: purge after the retry that stores it.
       this.revalidations.whenStored(tags, () => schedule('after a delayed store'));
     }
+  }
+
+  /** What to purge for revalidated tags: the tags as keys, and the paths of their cache keys. */
+  private purgeTarget(tags: string[], affectedKeys: string[]): Required<DelayedPurge> {
+    const implicit = implicitTagsToPurgePaths(tags);
+
+    // revalidatePath's own path is purged even when the tags map has no key for it.
+    const routePaths = new Set(implicit.paths);
+    for (const key of affectedKeys) {
+      const routePath = cacheKeyToPurgePath(key);
+      if (routePath) {
+        routePaths.add(routePath);
+      } else if (key.startsWith('/')) {
+        this.log.debug(`Not purging shell pattern ${key}: it matches no URL`);
+      }
+    }
+    const paths = [...routePaths].map((routePath) => toPublicPath(routePath, this.site));
+    return { keys: tags, paths, purgeAll: implicit.purgeAll };
+  }
+
+  /** Purge the CDN for revalidated tags now. */
+  private async purgeTags(tags: string[], affectedKeys: string[], phase: string): Promise<void> {
+    if (!this.edgeCacheClearer) {
+      return;
+    }
+
+    const clearer = this.edgeCacheClearer;
+    const { paths, purgeAll } = this.purgeTarget(tags, affectedKeys);
+
+    // Keys are sent even when no keys were found: they only match once responses
+    // carry the tags as Surrogate-Key, which the tenant router turns into purge keys.
+    const context = `tag revalidation (${phase}): ${tags.join(', ')}`;
+    if (purgeAll) {
+      await Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]);
+      this.log.debug(`Purged the whole site for ${context}`);
+      return;
+    }
+    if (paths.length > 0) {
+      this.log.debug(`Purging edge paths for ${context}: ${paths.join(', ')}`);
+    }
+    await Promise.all([clearer.clearKeys(tags), clearer.clearPaths(paths)]);
   }
 
   /**
