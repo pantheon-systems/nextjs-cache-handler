@@ -96,6 +96,30 @@ describe('EdgeCacheClear', () => {
   });
 
   describe('clearPaths', () => {
+    it('sends each path once per call (`a` and `/a` alike), but keeps `/a/` apart', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearPaths(['a', '/a', '/a/', '/a', '/b']);
+
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).toEqual([
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/a`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/a%252F`,
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/b`,
+      ]);
+      expect(result.paths).toEqual(['a', '/a/', '/b']);
+    });
+
+    it('still rejects an empty path rather than treating it as `/`', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().clearPaths(['', '/']);
+
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).toEqual([
+        `http://${mockEndpoint}/rest/v0alpha1/cache/paths/%252F`,
+      ]);
+      expect(result.paths).toEqual(['/']);
+    });
+
     it('should return success immediately for empty paths array', async () => {
       const clearer = new EdgeCacheClear();
       const result = await clearer.clearPaths([]);
