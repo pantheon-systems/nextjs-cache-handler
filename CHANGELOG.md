@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.3
+
+### Fixed
+
+- `clearEdgeCachePaths()` purges the trailing-slash URL on sites with `trailingSlash: true` (`/about/`, not `/about`). It used to drop the slash, so it missed the URL the CDN caches. Without `trailingSlash` it still drops it.
+- Regenerating a Pages Router page under `/index` (such as `pages/index/foo.js`) purges the data route Next serves, `/_next/data/<buildId>/index/index/foo.json`, not `/_next/data/<buildId>/index/foo.json`.
+- Regenerating a Pages Router page in a default locale also purges its URL without the locale prefix (`/blog` as well as `/en/blog`), which is where Next serves it. Default locales come from `i18n.defaultLocale` and each `i18n.domains` entry.
+
 ## 0.13.2
 
 ### Fixed

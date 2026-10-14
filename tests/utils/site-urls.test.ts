@@ -7,6 +7,8 @@ import {
   pagesDataRoute,
   resetSiteUrlConfigForTests,
   toPublicPath,
+  withoutDefaultLocale,
+  withServedTrailingSlash,
   type SiteUrlConfig,
 } from '../../src/utils/site-urls.js';
 
@@ -14,7 +16,45 @@ const site = (config: Partial<SiteUrlConfig> = {}): SiteUrlConfig => ({
   basePath: '',
   trailingSlash: false,
   buildId: 'build-1',
+  defaultLocales: [],
   ...config,
+});
+
+describe('withServedTrailingSlash', () => {
+  it('drops the slash without trailingSlash', () => {
+    expect(withServedTrailingSlash('/about/', false)).toBe('/about');
+    expect(withServedTrailingSlash('/about', false)).toBe('/about');
+    expect(withServedTrailingSlash('/', false)).toBe('/');
+  });
+
+  it('adds the slash with trailingSlash, except where Next does not', () => {
+    expect(withServedTrailingSlash('/about', true)).toBe('/about/');
+    expect(withServedTrailingSlash('/about/', true)).toBe('/about/');
+    expect(withServedTrailingSlash('/', true)).toBe('/');
+    expect(withServedTrailingSlash('/sitemap.xml', true)).toBe('/sitemap.xml');
+    expect(withServedTrailingSlash('/.well-known/security', true)).toBe('/.well-known/security');
+  });
+
+  it('leaves an empty path empty', () => {
+    expect(withServedTrailingSlash('', true)).toBe('');
+  });
+});
+
+describe('withoutDefaultLocale', () => {
+  const i18n = site({ defaultLocales: ['en', 'fr'] });
+
+  it('strips a default locale prefix', () => {
+    expect(withoutDefaultLocale('/en/blog', i18n)).toBe('/blog');
+    expect(withoutDefaultLocale('/fr/blog/post', i18n)).toBe('/blog/post');
+    expect(withoutDefaultLocale('/en', i18n)).toBe('/');
+  });
+
+  it('returns null for other locales and paths', () => {
+    expect(withoutDefaultLocale('/de/blog', i18n)).toBeNull();
+    expect(withoutDefaultLocale('/english/blog', i18n)).toBeNull();
+    expect(withoutDefaultLocale('/', i18n)).toBeNull();
+    expect(withoutDefaultLocale('/en/blog', site())).toBeNull();
+  });
 });
 
 describe('toPublicPath', () => {
@@ -54,6 +94,12 @@ describe('pagesDataRoute', () => {
     expect(pagesDataRoute('/en/blog', site({ basePath: '/docs' }))).toBe('/docs/_next/data/build-1/en/blog.json');
   });
 
+  it('prefixes /index on pages under /index, as Next does', () => {
+    expect(pagesDataRoute('/index/foo', site())).toBe('/_next/data/build-1/index/index/foo.json');
+    expect(pagesDataRoute('/index', site())).toBe('/_next/data/build-1/index/index.json');
+    expect(pagesDataRoute('/indexes', site())).toBe('/_next/data/build-1/indexes.json');
+  });
+
   it('returns null without a build ID', () => {
     expect(pagesDataRoute('/x', site({ buildId: null }))).toBeNull();
   });
@@ -84,7 +130,28 @@ describe('loadSiteUrlConfig', () => {
       basePath: '/docs',
       trailingSlash: true,
       buildId: 'build-TfctsWXpff2fKS',
+      defaultLocales: [],
     });
+  });
+
+  it('reads the default locales, including per-domain ones', () => {
+    fs.writeFileSync(
+      path.join(distDir, 'required-server-files.json'),
+      JSON.stringify({
+        config: {
+          i18n: {
+            locales: ['en', 'fr', 'nl'],
+            defaultLocale: 'en',
+            domains: [
+              { domain: 'example.fr', defaultLocale: 'fr' },
+              { domain: 'example.com', defaultLocale: 'en' },
+            ],
+          },
+        },
+      })
+    );
+
+    expect(loadSiteUrlConfig(path.join(distDir, 'server')).defaultLocales).toEqual(['en', 'fr']);
   });
 
   it('falls back to plain paths without a build output', () => {
@@ -92,6 +159,7 @@ describe('loadSiteUrlConfig', () => {
       basePath: '',
       trailingSlash: false,
       buildId: null,
+      defaultLocales: [],
     });
   });
 });

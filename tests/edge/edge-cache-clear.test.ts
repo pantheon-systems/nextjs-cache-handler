@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../../src/edge/edge-cache-clear.js';
 import { clearEdgeCachePaths, clearEdgeCache } from '../../src/index.js';
+import { resetSiteUrlConfigForTests } from '../../src/utils/site-urls.js';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 describe('EdgeCacheClear', () => {
   const mockEndpoint = 'proxy.example.com:8080';
@@ -421,7 +425,7 @@ describe('clearEdgeCachePaths', () => {
     expect(result!.success).toBe(true);
   });
 
-  it('still drops a trailing slash, as it always has', async () => {
+  it('drops a trailing slash without trailingSlash', async () => {
     process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
     vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
 
@@ -435,6 +439,33 @@ describe('clearEdgeCachePaths', () => {
       'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/%252F',
       expect.objectContaining({ method: 'DELETE' })
     );
+  });
+
+  it('purges the trailing-slash URL with trailingSlash', async () => {
+    process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+    const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clear-edge-paths-'));
+    fs.mkdirSync(path.join(appDir, '.next'));
+    fs.writeFileSync(
+      path.join(appDir, '.next', 'required-server-files.json'),
+      JSON.stringify({ config: { trailingSlash: true } })
+    );
+    vi.spyOn(process, 'cwd').mockReturnValue(appDir);
+    resetSiteUrlConfigForTests();
+
+    try {
+      await clearEdgeCachePaths(['/about/', '/contact', '/sitemap.xml']);
+    } finally {
+      resetSiteUrlConfigForTests();
+      fs.rmSync(appDir, { recursive: true, force: true });
+    }
+
+    const urls = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
+    expect(urls.sort()).toEqual([
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/about%252F',
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/contact%252F',
+      'http://proxy.example.com:8080/rest/v0alpha1/cache/paths/sitemap.xml',
+    ]);
   });
 
   it('should return null when env var is missing', async () => {

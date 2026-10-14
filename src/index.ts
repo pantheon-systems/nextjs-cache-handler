@@ -13,6 +13,7 @@ import {
   UseCacheGcsHandler,
 } from './handlers/index.js';
 import { createEdgeCacheClearer } from './edge/edge-cache-clear.js';
+import { loadSiteUrlConfig, withServedTrailingSlash } from './utils/site-urls.js';
 import type { CacheClearResult } from './edge/edge-cache-clear.js';
 
 // ============================================================================
@@ -138,8 +139,9 @@ export async function clearSharedCache(): Promise<number> {
 export async function clearEdgeCachePaths(paths: string[]): Promise<CacheClearResult | null> {
   const clearer = createEdgeCacheClearer();
   if (!clearer) return null;
-  // This API has always dropped a trailing slash; the handlers' own purges keep it.
-  return clearer.clearPaths(paths.map((p) => p.replace(/(.)\/$/, '$1')));
+  // The trailing slash the CDN caches the path under, as the handlers' own purges use.
+  const { trailingSlash } = loadSiteUrlConfig(undefined);
+  return clearer.clearPaths(paths.map((p) => withServedTrailingSlash(p, trailingSlash)));
 }
 
 /**
