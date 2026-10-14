@@ -88,6 +88,21 @@ const FETCH_DELETE_BATCH_SIZE = 50;
 // Re-purges once every instance has applied a revalidation, per process.
 const delayedPurges = new DelayedPurges();
 
+/** Most route paths remembered as served; the oldest are forgotten first. */
+const MAX_SERVED_PATHS = 5000;
+/** Slack for clock differences between instances when comparing a serve to a revalidation. */
+const SERVED_SKEW_MS = 1000;
+/** When this process last served each route path from the cache. Per process, like the listener that reads it. */
+const servedAt = new Map<string, number>();
+
+function recordServed(routePath: string): void {
+  servedAt.delete(routePath); // re-insert so the map stays in order of last serve
+  servedAt.set(routePath, Date.now());
+  if (servedAt.size > MAX_SERVED_PATHS) {
+    servedAt.delete(servedAt.keys().next().value as string);
+  }
+}
+
 /**
  * Purge keys this process just made visible in the tags map whose tags were
  * revalidated after they were added. A revalidateTag on another instance read
@@ -206,6 +221,7 @@ export function resetGcsSharedState(): void {
   }
   sharedTagsBuffers.clear();
   delayedPurges.reset();
+  servedAt.clear();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
 }
@@ -258,12 +274,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.tagsBuffer = getSharedTagsBuffer(bucketName, this.tagsBucket, this.tagsMapKey, (added) =>
       purgeMissedRevalidations(added, revalidations, edgeCacheClearer, site)
     );
-    // Likewise per process: purge what another instance revalidated, since this
-    // one may have put the old pages back in the CDN until it learned of it.
+    // Likewise per process: purge the pages this one served after another
+    // instance revalidated them, before it learned of it, since those may have
+    // put the old pages back in the CDN. An instance that served none purges nothing.
     if (edgeCacheClearer) {
-      revalidations.setOnLearned(async (tags) =>
-        this.purgeTags(tags, await this.findAffectedKeys(tags), 'applied from another instance')
-      );
+      revalidations.setOnLearned((tags) => this.purgeServedAfterRevalidation(tags));
     }
 
     // Initialize asynchronously (constructors can't be async) -- stored via
@@ -523,6 +538,33 @@ export class GcsCacheHandler extends BaseCacheHandler {
     } else {
       // Not stored yet, so other instances do not know it: purge after the retry that stores it.
       this.revalidations.whenStored(tags, () => schedule('after a delayed store'));
+    }
+  }
+
+  /** Purge the paths of `tags` that this process served from the cache after they were revalidated elsewhere. */
+  private async purgeServedAfterRevalidation(tags: string[]): Promise<void> {
+    const clearer = this.edgeCacheClearer;
+    if (!clearer) {
+      return;
+    }
+    const since = Math.min(...tags.map((tag) => this.revalidations.get(tag)?.at ?? Date.now())) - SERVED_SKEW_MS;
+    const { paths: candidates } = this.purgeTarget(tags, await this.findAffectedKeys(tags));
+    const paths = candidates.filter((path) => (servedAt.get(path) ?? 0) >= since);
+    if (paths.length === 0) {
+      return;
+    }
+    this.log.debug(`Purging edge paths served before learning of ${tags.join(', ')}: ${paths.join(', ')}`);
+    await clearer.clearPaths(paths);
+  }
+
+  /** Remember what this process serves, for purgeServedAfterRevalidation. */
+  protected override onServed(cacheKey: string, cacheType: CacheEntryType): void {
+    if (!this.edgeCacheClearer || cacheType === 'image') {
+      return;
+    }
+    const routePath = cacheKeyToPurgePath(cacheKey);
+    if (routePath) {
+      recordServed(toPublicPath(routePath, this.site));
     }
   }
 

@@ -299,7 +299,7 @@ export class SharedRevalidations {
       // Started inside the request whose cache read refreshed, which has CPU.
       // Not awaited: cache reads wait on this refresh (refreshWithin), and a
       // CDN purge must neither hold them up nor count as a slow read.
-      this.notifyLearned(this.learnFromStore(value)).catch(() => {});
+      void this.notifyLearned(this.learnFromStore(value));
       this.lastGeneration = readGeneration;
       if (this.refreshFailing) {
         log.warn('Reading shared revalidations recovered');
@@ -320,7 +320,7 @@ export class SharedRevalidations {
       for (let attempt = 0; ; attempt++) {
         const { value: stored, generation } = await readJsonObject<SharedRevalidationMap>(this.bucket, this.key);
         // Not awaited: this write holds up a revalidation's response.
-        this.notifyLearned(this.learnFromStore(stored)).catch(() => {});
+        void this.notifyLearned(this.learnFromStore(stored));
         const merged: SharedRevalidationMap = { ...stored };
         let changed = false;
         for (const [tag, entry] of batch) {
@@ -381,6 +381,7 @@ export class SharedRevalidations {
     return firstRead ? [] : learned;
   }
 
+  /** Never rejects: a failing listener is logged here, so callers can leave this unawaited. */
   private async notifyLearned(tags: string[]): Promise<void> {
     if (tags.length === 0 || !this.onLearnedListener) {
       return;

@@ -331,12 +331,13 @@ message reports how many cache reads were served without it.
 
 A process that had not refreshed yet can put the old page back in the CDN
 between steps 2 and 3. So each process, when it reads a revalidation that
-another process made, also purges the CDN for that revalidation's pages, started
-inside the request that read it (which has CPU) without holding up its cache
-reads. (Revalidations it finds on its
-first read are skipped, because it had served nothing before then.) The second
-purge in step 3 is a backstop, for a process that served the old page and then
-received no further requests.
+another process made, purges the CDN for the pages it served from its cache
+after that revalidation. The purge starts inside the request that read it
+(which has CPU) without holding up its cache reads. A process that served none
+of those pages purges nothing, and never purges the whole site. (Revalidations
+it finds on its first read are skipped, because it had served nothing before
+then.) The second purge in step 3 is a backstop, for a process that served the
+old page and then received no further requests.
 
 A server action that revalidates responds after step 2; step 3 runs on a timer.
 Second purges that come due within 1 s of each other are sent together, each

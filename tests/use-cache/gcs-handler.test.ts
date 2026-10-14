@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 // Mock file and bucket stored for access
@@ -320,6 +321,54 @@ describe('UseCacheGcsHandler', () => {
       expect(Array.from(await streamToBytes(result!.value))).toEqual([4, 5]);
     });
 
+    describe('revalidations the route cache handler learned from other instances', () => {
+      afterEach(() => tagsManifest.clear());
+
+      it('stops serving a memory hit for a tag in tagsManifest, before any reload', async () => {
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+        const handler = new UseCacheGcsHandler();
+        await handler.get('k', []);
+
+        tagsManifest.set('tag1', { expired: Date.now() });
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(await handler.get('k', [])).toBeUndefined();
+      });
+
+      it('reports the revalidation from getExpiration, using the moment of a soft one', async () => {
+        const handler = new UseCacheGcsHandler();
+        const at = Date.now() - 500;
+        tagsManifest.set('soft', { stale: at, expired: Date.now() + 60_000 });
+
+        expect(await handler.getExpiration(['soft'])).toBe(at);
+      });
+
+      it('ignores a revalidation older than the entry', async () => {
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+        const handler = new UseCacheGcsHandler();
+        tagsManifest.set('tag1', { expired: Date.now() - 10_000 });
+
+        expect(await handler.get('k', [])).toBeDefined();
+      });
+    });
+
+    it('stops serving its own set() from memory when the GCS save fails', async () => {
+      const handler = new UseCacheGcsHandler();
+      // Another save (the tag timestamps) may run first, so fail only the entry's.
+      mockFile.save.mockImplementation(async (json: string) => {
+        if (JSON.parse(json).value !== undefined) {
+          throw new Error('save failed');
+        }
+      });
+      await handler.set('own', Promise.resolve(createTestEntry({ value: createTestStream(new Uint8Array([4, 5])) })));
+
+      mockFile.exists.mockResolvedValue([false]);
+
+      expect(await handler.get('own', [])).toBeUndefined();
+    });
+
     it('stops serving an entry from memory once one of its tags is invalidated', async () => {
       mockFile.exists.mockResolvedValue([true]);
       mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
@@ -342,8 +391,8 @@ describe('UseCacheGcsHandler', () => {
     });
 
     it('evicts the least recently used entry past CACHE_USE_CACHE_MEMORY_MB', async () => {
-      // About two stored entries' worth (each ~200 bytes of JSON).
-      process.env.CACHE_USE_CACHE_MEMORY_MB = String(450 / 1024 / 1024);
+      // About two stored entries' worth (each ~150 bytes of JSON).
+      process.env.CACHE_USE_CACHE_MEMORY_MB = String(330 / 1024 / 1024);
       try {
         const handler = new UseCacheGcsHandler();
         await handler.set('a', Promise.resolve(createTestEntry()));

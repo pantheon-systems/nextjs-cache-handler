@@ -8,6 +8,7 @@ import type {
 } from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { getBuildStore } from './build-store.js';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { resolveTagsRefreshIntervalMs } from '../../utils/shared-revalidations.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
@@ -345,6 +346,29 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
+   * When `tag` was last invalidated, as far as this process knows (0 if never):
+   * the later of the timestamps this handler loaded and the revalidations in
+   * Next's tagsManifest. The route cache handler mirrors every revalidation it
+   * reads from other instances into that manifest, so a render it triggers
+   * cannot reuse a 'use cache' value older than a revalidation it knows of,
+   * whatever the background reload of tagTimestamps has reached. Memory only,
+   * so reads stay within the static stage.
+   */
+  private invalidatedAt(tag: string): number {
+    const known = this.tagTimestamps.get(tag) ?? 0;
+    const revalidation = tagsManifest.get(tag);
+    if (!revalidation) {
+      return known;
+    }
+    // A soft revalidation's `expired` is in the future; the moment it happened is `stale`.
+    const now = Date.now();
+    return [known, revalidation.stale, revalidation.expired].reduce<number>(
+      (latest, at) => (at !== undefined && at <= now && at > latest ? at : latest),
+      0
+    );
+  }
+
+  /**
    * Check if an entry is expired based on revalidate time.
    */
   private isExpired(entry: UseCacheEntry): boolean {
@@ -359,7 +383,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     // Also check if any of the entry's tags have been invalidated
     for (const tag of entry.tags) {
-      const tagTimestamp = this.tagTimestamps.get(tag);
+      const tagTimestamp = this.invalidatedAt(tag);
       if (tagTimestamp && tagTimestamp > entry.timestamp) {
         return true;
       }
@@ -483,14 +507,21 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       const withBuildId = { ...serialized, __buildId: this.buildId };
       const gcsKey = this.getCacheKey(cacheKey);
       const file = this.bucket.file(gcsKey);
-      const json = JSON.stringify(withBuildId, null, 2);
+      const json = JSON.stringify(withBuildId);
 
       // Before the write, so a read racing it is already served from memory.
-      this.memory.set(cacheKey, withBuildId, json.length);
-      await file.save(json, {
-        resumable: false,
-        metadata: { contentType: 'application/json' },
-      });
+      // Sized in bytes, as get() sizes what it reads.
+      this.memory.set(cacheKey, withBuildId, Buffer.byteLength(json));
+      try {
+        await file.save(json, {
+          resumable: false,
+          metadata: { contentType: 'application/json' },
+        });
+      } catch (error) {
+        // No other instance will have this value, so don't keep serving it here.
+        this.memory.delete(cacheKey);
+        throw error;
+      }
 
       log.debug(`Cached ${cacheKey} with ${entry.tags?.length ?? 0} tags`);
     } catch (error) {
@@ -528,7 +559,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     let maxTimestamp = 0;
 
     for (const tag of tags) {
-      const timestamp = this.tagTimestamps.get(tag) ?? 0;
+      const timestamp = this.invalidatedAt(tag);
       if (timestamp > maxTimestamp) {
         maxTimestamp = timestamp;
       }

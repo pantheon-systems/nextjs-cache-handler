@@ -406,6 +406,7 @@ export abstract class BaseCacheHandler {
         hasValue: entry && typeof entry === 'object' && 'value' in entry,
       });
 
+      this.onServed(cacheKey, cacheType);
       return entry;
     } catch (error) {
       this.log.error(`Error reading cache for key ${cacheKey}:`, error);
@@ -609,6 +610,11 @@ export abstract class BaseCacheHandler {
    * perform edge cache invalidation.
    */
   protected onRouteCacheSet(_cacheKey: string, _kind?: string): void {
+    // Default implementation does nothing
+  }
+
+  /** Hook called when get() returns a stored entry. Default: nothing. */
+  protected onServed(_cacheKey: string, _cacheType: CacheEntryType): void {
     // Default implementation does nothing
   }
 
