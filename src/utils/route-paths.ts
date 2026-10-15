@@ -33,7 +33,18 @@ export function cacheKeyToPurgePath(cacheKey: string): string | null {
   if (!pagePath.startsWith('/') || isDynamicRoutePath(pagePath)) {
     return null;
   }
-  return denormalizePagePath(pagePath);
+  return unescapePathDelimiters(denormalizePagePath(pagePath));
+}
+
+/**
+ * Inverse of Next's escapePathDelimiters(segment, true), which route keys go
+ * through: `%2F` `%23` `%3F` `%5C` -> `/ # ? \`, and `%252F` etc. -> `%2F`.
+ * The CDN keys the decoded request path, so the purge must name it decoded too.
+ */
+export function unescapePathDelimiters(routePath: string): string {
+  return routePath.replace(/%(25)?(2f|23|3f|5c)/gi, (_match, escapedPercent: string | undefined, hex: string) =>
+    escapedPercent ? `%${hex}` : decodeURIComponent(`%${hex}`)
+  );
 }
 
 /**

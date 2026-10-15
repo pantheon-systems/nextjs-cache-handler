@@ -91,7 +91,7 @@ sequenceDiagram
       B->>G: write route-cache/KEY.json (set)
       B->>B: TagsBuffer.addTags(key, tags)
       Note over B,G: tags.json is written every 5 s (CACHE_TAGS_FLUSH_INTERVAL_MS): by an unref'd timer, or inline by the next set() once due. One conditional write per flush, merged with other instances' writes.
-      B->>CDN: ISR path purge for the page, plus /_next/data route for Pages, in the background
+      B->>CDN: ISR path purge for the page, plus for Pages its /_next/data route and, under a default locale, its unprefixed URL, in the background
     end
     B-->>CDN: page + Cache-Control
     CDN-->>V: page (now cached at the CDN)
@@ -118,7 +118,7 @@ sequenceDiagram
   A->>G: write revalidations.json (batched 250 ms, retried ≤ 5 s)
   A->>G: read tags.json, overlay this process's unflushed keys
   A->>A: + build-prerender keys for the tag, + implicit _N_T_ paths
-  A->>A: keys → public paths (basePath, trailingSlash, data routes)
+  A->>A: keys → public paths (basePath, trailingSlash, delimiter escapes decoded)
   A->>P: FIRST PURGE: DELETE /keys/TAG per tag + DELETE /paths/PATH per path, all at once (or one full purge for revalidatePath('/', 'layout'))
   P->>CDN: purge
   A-->>Caller: response (awaits the first purge only)

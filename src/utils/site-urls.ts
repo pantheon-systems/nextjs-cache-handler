@@ -10,6 +10,8 @@ export interface SiteUrlConfig {
   trailingSlash: boolean;
   /** For Pages Router data routes (`/_next/data/<buildId>/...`). */
   buildId: string | null;
+  /** `i18n.defaultLocale` and each `i18n.domains` default: Next serves these pages without the prefix. */
+  defaultLocales: string[];
 }
 
 const cache = new Map<string, SiteUrlConfig>();
@@ -36,10 +38,20 @@ export function resetSiteUrlConfigForTests(): void {
 function readSiteUrlConfig(distDir: string): SiteUrlConfig {
   let basePath = '';
   let trailingSlash = false;
+  const defaultLocales = new Set<string>();
   try {
     const { config } = JSON.parse(fs.readFileSync(path.join(distDir, 'required-server-files.json'), 'utf-8'));
     basePath = typeof config?.basePath === 'string' ? config.basePath : '';
     trailingSlash = config?.trailingSlash === true;
+    const i18n = config?.i18n;
+    for (const locale of [
+      i18n?.defaultLocale,
+      ...(Array.isArray(i18n?.domains) ? i18n.domains : []).map((d: { defaultLocale?: unknown }) => d?.defaultLocale),
+    ]) {
+      if (typeof locale === 'string' && locale !== '') {
+        defaultLocales.add(locale);
+      }
+    }
   } catch {
     log.debug(`No required-server-files.json in ${distDir}; assuming no basePath or trailingSlash`);
   }
@@ -51,7 +63,37 @@ function readSiteUrlConfig(distDir: string): SiteUrlConfig {
     // Pages Router data routes are then not purged
   }
 
-  return { basePath, trailingSlash, buildId };
+  return { basePath, trailingSlash, buildId, defaultLocales: [...defaultLocales] };
+}
+
+/**
+ * `urlPath` with the trailing slash Next serves it with: added under `trailingSlash`
+ * unless the last segment has a `.` or the path is under `/.well-known`
+ * (lib/load-custom-routes.ts), otherwise removed. A `?` or `#` is part of the path.
+ */
+export function withServedTrailingSlash(urlPath: string, trailingSlash: boolean): string {
+  if (urlPath === '') {
+    return urlPath;
+  }
+  const bare = urlPath.length > 1 && urlPath.endsWith('/') ? urlPath.slice(0, -1) : urlPath;
+  const lastSegment = bare.slice(bare.lastIndexOf('/') + 1);
+  if (trailingSlash && bare !== '/' && !lastSegment.includes('.') && !/^\/\.well-known(\/|$)/.test(bare)) {
+    return `${bare}/`;
+  }
+  return bare;
+}
+
+/**
+ * The path to purge for a URL a caller passes in: withServedTrailingSlash of its
+ * pathname, without a query string or fragment. The CDN keys a page by its path
+ * alone, and edge-cache-clearer would hash a query as part of the path, so it
+ * would match nothing. Route paths from cache keys have no query, so a `?` or `#`
+ * in them is part of the path and must not go through this.
+ */
+export function urlToPurgePath(url: string, trailingSlash: boolean): string {
+  const suffixStart = url.search(/[?#]/);
+  const pathname = suffixStart === -1 ? url : url.slice(0, suffixStart);
+  return withServedTrailingSlash(pathname === '' && suffixStart !== -1 ? '/' : pathname, trailingSlash);
 }
 
 /**
@@ -60,17 +102,7 @@ function readSiteUrlConfig(distDir: string): SiteUrlConfig {
  * and never under `/.well-known` (lib/load-custom-routes.ts).
  */
 export function toPublicPath(routePath: string, config: SiteUrlConfig): string {
-  let publicPath = routePath;
-  const lastSegment = publicPath.slice(publicPath.lastIndexOf('/') + 1);
-  if (
-    config.trailingSlash &&
-    publicPath !== '/' &&
-    !publicPath.endsWith('/') &&
-    !lastSegment.includes('.') &&
-    !/^\/\.well-known(\/|$)/.test(publicPath)
-  ) {
-    publicPath += '/';
-  }
+  const publicPath = withServedTrailingSlash(routePath, config.trailingSlash);
 
   if (!config.basePath) {
     return publicPath;
@@ -86,5 +118,20 @@ export function pagesDataRoute(routePath: string, config: SiteUrlConfig): string
   if (!config.buildId) {
     return null;
   }
-  return `${config.basePath}/_next/data/${config.buildId}${routePath === '/' ? '/index' : routePath}.json`;
+  // As Next's getAssetPathFromRoute: `/` -> `/index`, `/index/foo` -> `/index/index/foo`.
+  const assetPath = routePath === '/' ? '/index' : /^\/index(\/|$)/.test(routePath) ? `/index${routePath}` : routePath;
+  return `${config.basePath}/_next/data/${config.buildId}${assetPath}.json`;
+}
+
+/**
+ * The path a Pages Router route path under a default locale is also served at,
+ * without the locale prefix (`/en/blog` -> `/blog`, `/en` -> `/`), or null.
+ * Next keys such pages with the locale but serves the default locale unprefixed.
+ */
+export function withoutDefaultLocale(routePath: string, config: SiteUrlConfig): string | null {
+  const [, locale, ...rest] = routePath.split('/');
+  if (!locale || !config.defaultLocales.includes(locale)) {
+    return null;
+  }
+  return `/${rest.join('/')}`;
 }
