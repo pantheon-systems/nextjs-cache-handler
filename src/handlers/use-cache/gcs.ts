@@ -109,10 +109,9 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private readonly buildMetaKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
   private tagTimestamps: Map<string, number> = new Map();
-  // Next creates use-cache handlers once per process, so this is per process.
-  // A hit from memory resolves within a microtask; Next's cached-navigations
-  // render advances to its dynamic stage after one task, so a GCS read would
-  // otherwise push the cached result out of the static stage the client reuses.
+  // Per process. A memory hit resolves in a microtask; a GCS read would outlast the
+  // one task Next's cached-navigations render waits before its dynamic stage, so the
+  // result would miss the static stage the client reuses.
   private readonly memory: MemoryEntries;
   // Background reloads of tagTimestamps (see refreshTags).
   private readonly tagsRefreshIntervalMs = resolveTagsRefreshIntervalMs();
