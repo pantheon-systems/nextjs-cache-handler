@@ -83,7 +83,7 @@ sequenceDiagram
       B->>G: write route-cache/KEY.json (set)
       B->>B: TagsBuffer.addTags(key, tags)
       Note over B,G: tags.json is written every 5 s (CACHE_TAGS_FLUSH_INTERVAL_MS): by an unref'd timer, or inline by the next set() once due. One conditional write per flush, merged with other instances' writes.
-      B->>CDN: ISR path purge for the page, plus /_next/data route for Pages, in the background
+      B->>CDN: ISR path purge for the page, plus for Pages its /_next/data route and, under a default locale, its unprefixed URL, in the background
     end
     B-->>CDN: page + Cache-Control
     CDN-->>V: page (now cached at the CDN)
@@ -110,7 +110,7 @@ sequenceDiagram
   A->>G: write revalidations.json (batched 250 ms, retried ≤ 5 s)
   A->>G: read tags.json, overlay this process's unflushed keys
   A->>A: + build-prerender keys for the tag, + implicit _N_T_ paths
-  A->>A: keys → public paths (basePath, trailingSlash, data routes)
+  A->>A: keys → public paths (basePath, trailingSlash)
   A->>P: FIRST PURGE: DELETE /keys/TAG per tag + DELETE /paths/PATH per path, all at once (or one full purge for revalidatePath('/', 'layout'))
   P->>CDN: purge
   A-->>Caller: response (awaits the first purge only)
@@ -131,10 +131,15 @@ What each step depends on:
 
 | Step | Code | If it fails or is late |
 |---|---|---|
-| Store revalidation | `shared-revalidations.ts`, `base.ts:562` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:544`). Other instances keep serving the old page until it lands. |
-| Read tags map | `gcs.ts:281` | Logged; only this process's own keys and build prerenders are purged. |
-| First purge | `gcs.ts:531`, `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
-| Second purge | `gcs.ts:532-545`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
+| Store revalidation | `shared-revalidations.ts`, `base.ts:562` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:550`). Other instances keep serving the old page until it lands. |
+| Read tags map | `gcs.ts:287` | Logged; only this process's own keys and build prerenders are purged. |
+| First purge | `gcs.ts:537`, `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
+| Second purge | `gcs.ts:538-551`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
+
+Pages Router entries carry no tags (Next writes `x-next-cache-tags` only for App Router
+pages and route handlers), so no tag finds them and this purge has no data routes or
+unprefixed locale URLs. A Pages Router page is purged when it regenerates, by its ISR
+purge (section 4).
 
 `use cache` entries are invalidated separately: Next calls the `use cache` handler's `updateTags`,
 which writes `use-cache/_tags.json` timestamps (`use-cache/gcs.ts:452`). That handler sends no
@@ -145,12 +150,12 @@ CDN purges for tags; the route handler's purge above covers the pages.
 ```mermaid
 flowchart TB
   subgraph triggers["Triggers"]
-    t1["revalidateTag / revalidatePath<br/>gcs.ts:484"]
-    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts:552"]
-    t3["tags.json flush finds keys whose tag<br/>was revalidated before they landed<br/>purgeMissedRevalidations, gcs.ts:96"]
-    t4["New generation on first request<br/>route handler: base.ts:220 → gcs.ts:409"]
+    t1["revalidateTag / revalidatePath<br/>gcs.ts:490"]
+    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts:558"]
+    t3["tags.json flush finds keys whose tag<br/>was revalidated before they landed<br/>purgeMissedRevalidations, gcs.ts:102"]
+    t4["New generation on first request<br/>route handler: base.ts:220 → gcs.ts:415"]
     t5["New generation on first request<br/>use cache handler: use-cache/gcs.ts:123"]
-    t6["clearSharedCache()<br/>gcs.ts:708"]
+    t6["clearSharedCache()<br/>gcs.ts:720"]
     t7["Public API: clearEdgeCachePaths()<br/>clearEdgeCache(), index.ts"]
   end
 
@@ -180,7 +185,18 @@ Request shapes (`edge-cache-clear.ts`):
 | Key (tag) | `DELETE /rest/v0alpha1/cache/keys/<seg>` | `encodeURIComponent` twice |
 | Full | `DELETE /rest/v0alpha1/cache` | – |
 
-Grouping that exists today: paths are a set per revalidation (`gcs.ts:502`) and per
+Path requests per ISR regeneration (`onRouteCacheSet`, `gcs.ts:558`), one `DELETE` each:
+
+| Entry | Paths purged | Requests |
+|---|---|---|
+| App Router page or route handler | the page (`/blog`) | 1 |
+| Pages Router page | the page and its data route (`/_next/data/<buildId>/blog.json`) | 2 |
+| Pages Router page under a default locale (`i18n`) | `/en/blog`, its data route, and `/blog`, where Next serves the default locale | 3 |
+
+Without the data route, client-side navigation keeps getting the old props. Without the
+unprefixed URL, the default locale's public URL keeps serving the old page.
+
+Grouping that exists today: paths are a set per revalidation (`gcs.ts:508`) and per
 `clearPaths` call; second purges due within 1 s are merged per target
 (`delayed-purges.ts`). Nothing else is merged across calls, and nothing limits requests in
 flight or per second; per-tenant limits are left to the platform.
