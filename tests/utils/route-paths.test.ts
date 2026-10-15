@@ -43,6 +43,19 @@ describe('cacheKeyToPurgePath', () => {
     expect(cacheKeyToPurgePath('/isr-fallback/europe/[station]')).toBeNull();
   });
 
+  it('decodes the path delimiters Next escapes in a key', () => {
+    // A param of `a/b`, `what?`, `c#` or `a\b` (escapePathDelimiters).
+    expect(cacheKeyToPurgePath('/docs/a%2Fb')).toBe('/docs/a/b');
+    expect(cacheKeyToPurgePath('/what%3F')).toBe('/what?');
+    expect(cacheKeyToPurgePath('/c%23')).toBe('/c#');
+    expect(cacheKeyToPurgePath('/a%5cb')).toBe('/a\\b');
+    // A param of the literal text `%2F`, which Next escapes to `%252F`.
+    expect(cacheKeyToPurgePath('/x%252Fy')).toBe('/x%2Fy');
+    // Next decodes other escapes before keying, so a lone `%` or `%20` is already literal.
+    expect(cacheKeyToPurgePath('/100%')).toBe('/100%');
+    expect(cacheKeyToPurgePath('/café')).toBe('/café');
+  });
+
   describe('Next 16.3.8+ namespaced keys', () => {
     // Shapes taken from a Next 16.3.8 build's `.meta` routeCache.key values.
     const hash = 'c6377dd9ce6a1c2cd100eb4344e843eb4639b9ed26f84643f77680e9eb454c4b';

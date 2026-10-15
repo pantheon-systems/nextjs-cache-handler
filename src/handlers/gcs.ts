@@ -33,7 +33,13 @@ import {
   type SharedRevalidations,
   type SharedRevalidationMap,
 } from '../utils/shared-revalidations.js';
-import { loadSiteUrlConfig, pagesDataRoute, toPublicPath, type SiteUrlConfig } from '../utils/site-urls.js';
+import {
+  loadSiteUrlConfig,
+  pagesDataRoute,
+  toPublicPath,
+  withoutDefaultLocale,
+  type SiteUrlConfig,
+} from '../utils/site-urls.js';
 import { isBuildPhase } from '../utils/build-detection.js';
 import { DelayedPurges } from '../utils/delayed-purges.js';
 
@@ -560,10 +566,16 @@ export class GcsCacheHandler extends BaseCacheHandler {
       return;
     }
     const paths = [toPublicPath(routePath, this.site)];
-    // Client-side navigation fetches a Pages Router page's props from its data route.
-    const dataRoute = kind === 'PAGES' ? pagesDataRoute(routePath, this.site) : null;
-    if (dataRoute) {
-      paths.push(dataRoute);
+    if (kind === 'PAGES') {
+      // Client-side navigation fetches a Pages Router page's props from its data route.
+      const dataRoute = pagesDataRoute(routePath, this.site);
+      if (dataRoute) {
+        paths.push(dataRoute);
+      }
+      const unprefixed = withoutDefaultLocale(routePath, this.site);
+      if (unprefixed) {
+        paths.push(toPublicPath(unprefixed, this.site));
+      }
     }
     this.log.debug(`Purging edge paths for ISR update of ${cacheKey}: ${paths.join(', ')}`);
     this.edgeCacheClearer.clearPathsInBackground(paths, `ISR route update: ${paths.join(', ')}`);
