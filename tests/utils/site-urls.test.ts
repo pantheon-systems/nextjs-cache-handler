@@ -8,6 +8,7 @@ import {
   resetSiteUrlConfigForTests,
   toPublicPath,
   withoutDefaultLocale,
+  urlToPurgePath,
   withServedTrailingSlash,
   type SiteUrlConfig,
 } from '../../src/utils/site-urls.js';
@@ -39,13 +40,28 @@ describe('withServedTrailingSlash', () => {
     expect(withServedTrailingSlash('', true)).toBe('');
   });
 
-  it('places the slash before a query string or fragment', () => {
-    expect(withServedTrailingSlash('/about?x=1', true)).toBe('/about/?x=1');
-    expect(withServedTrailingSlash('/about/?x=1', true)).toBe('/about/?x=1');
-    expect(withServedTrailingSlash('/about#top', true)).toBe('/about/#top');
-    expect(withServedTrailingSlash('/about/?x=1', false)).toBe('/about?x=1');
-    expect(withServedTrailingSlash('/sitemap.xml?v=2', true)).toBe('/sitemap.xml?v=2');
-    expect(withServedTrailingSlash('/?x=1', true)).toBe('/?x=1');
+  it('treats a ? or # as part of the path, as in a decoded route path', () => {
+    expect(withServedTrailingSlash('/what?', true)).toBe('/what?/');
+    expect(withServedTrailingSlash('/c#', true)).toBe('/c#/');
+    expect(withServedTrailingSlash('/what?/', false)).toBe('/what?');
+  });
+});
+
+describe('urlToPurgePath', () => {
+  it('drops a query string or fragment, which the CDN key does not include', () => {
+    expect(urlToPurgePath('/about?x=1', true)).toBe('/about/');
+    expect(urlToPurgePath('/about/?x=1', true)).toBe('/about/');
+    expect(urlToPurgePath('/about#top', true)).toBe('/about/');
+    expect(urlToPurgePath('/about/?x=1', false)).toBe('/about');
+    expect(urlToPurgePath('/sitemap.xml?v=2', true)).toBe('/sitemap.xml');
+    expect(urlToPurgePath('/?x=1', true)).toBe('/');
+    expect(urlToPurgePath('?x=1', true)).toBe('/');
+  });
+
+  it('handles a URL without a query string like withServedTrailingSlash', () => {
+    expect(urlToPurgePath('/about', true)).toBe('/about/');
+    expect(urlToPurgePath('/about/', false)).toBe('/about');
+    expect(urlToPurgePath('', true)).toBe('');
   });
 });
 

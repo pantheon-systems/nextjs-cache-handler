@@ -392,6 +392,18 @@ describe('GcsCacheHandler across instances', () => {
       expect(purgedPaths()).toEqual(['/about/', '/sitemap.xml', '/tags/']);
     });
 
+    it('purges the decoded URL of a key with an escaped path delimiter', async () => {
+      writeBuild({ trailingSlash: true });
+      bucket.putJson(TAGS_MAP, {
+        faq: ['/route-cache/APP_PAGE/h/$/what%3F', '/route-cache/APP_PAGE/h/$/docs/a%2Fb'],
+      });
+
+      await newHandler().revalidateTag('faq');
+      await settle();
+
+      expect(purgedPaths()).toEqual(['/docs/a/b/', '/what?/']);
+    });
+
     it('prefixes basePath', async () => {
       writeBuild({ basePath: '/docs' });
       await newHandler().set(

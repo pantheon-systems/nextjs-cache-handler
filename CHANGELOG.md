@@ -7,6 +7,8 @@
 - `clearEdgeCachePaths()` purges the trailing-slash URL on sites with `trailingSlash: true` (`/about/`, not `/about`). It used to drop the slash, so it missed the URL the CDN caches. Without `trailingSlash` it still drops it.
 - Regenerating a Pages Router page under `/index` (such as `pages/index/foo.js`) purges the data route Next serves, `/_next/data/<buildId>/index/index/foo.json`, not `/_next/data/<buildId>/index/foo.json`.
 - Regenerating a Pages Router page in a default locale also purges its URL without the locale prefix (`/blog` as well as `/en/blog`), which is where Next serves it. Default locales come from `i18n.defaultLocale` and each `i18n.domains` entry.
+- A page whose dynamic segment contains `/`, `?`, `#` or `\` (`/what%3F`) is purged at its decoded URL (`/what?`), which is what the CDN keys it by. The purge used the cache key as Next escapes it, so it never matched.
+- `clearEdgeCachePaths()` drops a query string or fragment from the paths you pass (`/search?q=x` purges `/search`). The CDN keys a page by its path alone, so a purge that kept the query matched nothing.
 
 ## 0.13.2
 

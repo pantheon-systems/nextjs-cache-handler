@@ -69,21 +69,31 @@ function readSiteUrlConfig(distDir: string): SiteUrlConfig {
 /**
  * `urlPath` with the trailing slash Next serves it with: added under `trailingSlash`
  * unless the last segment has a `.` or the path is under `/.well-known`
- * (lib/load-custom-routes.ts), otherwise removed. A query string or fragment stays after it.
+ * (lib/load-custom-routes.ts), otherwise removed. A `?` or `#` is part of the path.
  */
 export function withServedTrailingSlash(urlPath: string, trailingSlash: boolean): string {
-  const suffixStart = urlPath.search(/[?#]/);
-  const pathname = suffixStart === -1 ? urlPath : urlPath.slice(0, suffixStart);
-  const suffix = suffixStart === -1 ? '' : urlPath.slice(suffixStart);
-  if (pathname === '') {
+  if (urlPath === '') {
     return urlPath;
   }
-  const bare = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const bare = urlPath.length > 1 && urlPath.endsWith('/') ? urlPath.slice(0, -1) : urlPath;
   const lastSegment = bare.slice(bare.lastIndexOf('/') + 1);
   if (trailingSlash && bare !== '/' && !lastSegment.includes('.') && !/^\/\.well-known(\/|$)/.test(bare)) {
-    return `${bare}/${suffix}`;
+    return `${bare}/`;
   }
-  return `${bare}${suffix}`;
+  return bare;
+}
+
+/**
+ * The path to purge for a URL a caller passes in: withServedTrailingSlash of its
+ * pathname, without a query string or fragment. The CDN keys a page by its path
+ * alone, and edge-cache-clearer would hash a query as part of the path, so it
+ * would match nothing. Route paths from cache keys have no query, so a `?` or `#`
+ * in them is part of the path and must not go through this.
+ */
+export function urlToPurgePath(url: string, trailingSlash: boolean): string {
+  const suffixStart = url.search(/[?#]/);
+  const pathname = suffixStart === -1 ? url : url.slice(0, suffixStart);
+  return withServedTrailingSlash(pathname === '' && suffixStart !== -1 ? '/' : pathname, trailingSlash);
 }
 
 /**

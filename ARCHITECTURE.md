@@ -110,7 +110,7 @@ sequenceDiagram
   A->>G: write revalidations.json (batched 250 ms, retried ≤ 5 s)
   A->>G: read tags.json, overlay this process's unflushed keys
   A->>A: + build-prerender keys for the tag, + implicit _N_T_ paths
-  A->>A: keys → public paths (basePath, trailingSlash)
+  A->>A: keys → public paths (basePath, trailingSlash, delimiter escapes decoded)
   A->>P: FIRST PURGE: DELETE /keys/TAG per tag + DELETE /paths/PATH per path, all at once (or one full purge for revalidatePath('/', 'layout'))
   P->>CDN: purge
   A-->>Caller: response (awaits the first purge only)
@@ -195,6 +195,11 @@ Path requests per ISR regeneration (`onRouteCacheSet`, `gcs.ts:558`), one `DELET
 
 Without the data route, client-side navigation keeps getting the old props. Without the
 unprefixed URL, the default locale's public URL keeps serving the old page.
+
+Each path is named the way the CDN keys it: decoded (a cache key for `/what%3F` is purged
+as `/what?`) and with the trailing slash Next serves. `clearEdgeCachePaths()` applies the
+same trailing-slash rule to the paths a caller passes and also drops any query string or
+fragment, since the CDN keys a page by its path alone.
 
 Grouping that exists today: paths are a set per revalidation (`gcs.ts:508`) and per
 `clearPaths` call; second purges due within 1 s are merged per target

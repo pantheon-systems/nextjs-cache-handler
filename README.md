@@ -396,7 +396,8 @@ Path purges use the URL the page is served at: with `basePath`, with the slash
 its URL without the locale prefix. These settings are read from the build
 output (`required-server-files.json` and `BUILD_ID`).
 `clearEdgeCachePaths()` gives the paths you pass the trailing slash the site
-serves them with: added with `trailingSlash: true`, removed without it.
+serves them with: added with `trailingSlash: true`, removed without it, and
+drops any query string or fragment, since the CDN keys a page by its path alone.
 Purging a Pages Router page's URL yourself (`clearEdgeCachePaths()`also clears 
 its data route, except a default-locale page's unprefixed URL: purge the prefixed 
 path too (`/en/blog` as well as `/blog`).
