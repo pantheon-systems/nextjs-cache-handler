@@ -479,6 +479,18 @@ describe('GcsCacheHandler across instances', () => {
       expect(purgedPaths()).toEqual(['/about/', '/sitemap.xml', '/tags/']);
     });
 
+    it('purges the decoded URL of a key with an escaped path delimiter', async () => {
+      writeBuild({ trailingSlash: true });
+      bucket.putJson(TAGS_MAP, {
+        faq: ['/route-cache/APP_PAGE/h/$/what%3F', '/route-cache/APP_PAGE/h/$/docs/a%2Fb'],
+      });
+
+      await newHandler().revalidateTag('faq');
+      await settle();
+
+      expect(purgedPaths()).toEqual(['/docs/a/b/', '/what?/']);
+    });
+
     it('prefixes basePath', async () => {
       writeBuild({ basePath: '/docs' });
       await newHandler().set(
@@ -491,6 +503,44 @@ describe('GcsCacheHandler across instances', () => {
       await settle();
 
       expect(purgedPaths()).toEqual(['/docs', '/docs/_next/data/build-1/index.json']);
+    });
+
+    it('purges the data route Next serves for a page under /index', async () => {
+      writeBuild({});
+      await newHandler().set(
+        '/route-cache/PAGES/h/$/index/index/foo',
+        { kind: 'PAGES', html: '', pageData: {} } as any,
+        {
+          tags: [],
+        } as any
+      );
+      await settle();
+
+      expect(purgedPaths()).toEqual(['/_next/data/build-1/index/index/foo.json', '/index/foo']);
+    });
+
+    it('also purges the unprefixed URL of a default-locale Pages Router page', async () => {
+      writeBuild({ trailingSlash: true, i18n: { locales: ['en', 'fr'], defaultLocale: 'en' } });
+      const handler = newHandler();
+      for (const key of [
+        '/route-cache/PAGES/h/$/en/blog',
+        '/route-cache/PAGES/h/$/en',
+        '/route-cache/PAGES/h/$/fr/blog',
+      ]) {
+        await handler.set(key, { kind: 'PAGES', html: '', pageData: {} } as any, { tags: [] } as any);
+      }
+      await settle();
+
+      expect(purgedPaths()).toEqual([
+        '/',
+        '/_next/data/build-1/en.json',
+        '/_next/data/build-1/en/blog.json',
+        '/_next/data/build-1/fr/blog.json',
+        '/blog/',
+        '/en/',
+        '/en/blog/',
+        '/fr/blog/',
+      ]);
     });
   });
 });

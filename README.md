@@ -406,9 +406,15 @@ GCS handler for more than one process.
 
 Path purges use the URL the page is served at: with `basePath`, with the slash
 `trailingSlash: true` adds, and, for a Pages Router page, also its
-`/_next/data/<buildId>/…json` data route. Both settings are read from the
-build output (`required-server-files.json` and `BUILD_ID`).
-`clearEdgeCachePaths()` still drops a trailing slash from the paths you pass.
+`/_next/data/<buildId>/…json` data route and, under a default locale (`i18n`),
+its URL without the locale prefix. These settings are read from the build
+output (`required-server-files.json` and `BUILD_ID`).
+`clearEdgeCachePaths()` gives the paths you pass the trailing slash the site
+serves them with: added with `trailingSlash: true`, removed without it, and
+drops any query string or fragment, since the CDN keys a page by its path alone.
+Purging a Pages Router page's URL yourself (`clearEdgeCachePaths()`also clears 
+its data route, except a default-locale page's unprefixed URL: purge the prefixed 
+path too (`/en/blog` as well as `/blog`).
 
 The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
 synchronously on `updateTags()` so other instances see revalidations promptly,
