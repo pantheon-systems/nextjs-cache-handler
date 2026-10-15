@@ -69,18 +69,21 @@ function readSiteUrlConfig(distDir: string): SiteUrlConfig {
 /**
  * `urlPath` with the trailing slash Next serves it with: added under `trailingSlash`
  * unless the last segment has a `.` or the path is under `/.well-known`
- * (lib/load-custom-routes.ts), otherwise removed.
+ * (lib/load-custom-routes.ts), otherwise removed. A query string or fragment stays after it.
  */
 export function withServedTrailingSlash(urlPath: string, trailingSlash: boolean): string {
-  if (urlPath === '') {
+  const suffixStart = urlPath.search(/[?#]/);
+  const pathname = suffixStart === -1 ? urlPath : urlPath.slice(0, suffixStart);
+  const suffix = suffixStart === -1 ? '' : urlPath.slice(suffixStart);
+  if (pathname === '') {
     return urlPath;
   }
-  const bare = urlPath.length > 1 && urlPath.endsWith('/') ? urlPath.slice(0, -1) : urlPath;
+  const bare = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
   const lastSegment = bare.slice(bare.lastIndexOf('/') + 1);
   if (trailingSlash && bare !== '/' && !lastSegment.includes('.') && !/^\/\.well-known(\/|$)/.test(bare)) {
-    return `${bare}/`;
+    return `${bare}/${suffix}`;
   }
-  return bare;
+  return `${bare}${suffix}`;
 }
 
 /**

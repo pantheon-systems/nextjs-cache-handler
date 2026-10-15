@@ -38,6 +38,15 @@ describe('withServedTrailingSlash', () => {
   it('leaves an empty path empty', () => {
     expect(withServedTrailingSlash('', true)).toBe('');
   });
+
+  it('places the slash before a query string or fragment', () => {
+    expect(withServedTrailingSlash('/about?x=1', true)).toBe('/about/?x=1');
+    expect(withServedTrailingSlash('/about/?x=1', true)).toBe('/about/?x=1');
+    expect(withServedTrailingSlash('/about#top', true)).toBe('/about/#top');
+    expect(withServedTrailingSlash('/about/?x=1', false)).toBe('/about?x=1');
+    expect(withServedTrailingSlash('/sitemap.xml?v=2', true)).toBe('/sitemap.xml?v=2');
+    expect(withServedTrailingSlash('/?x=1', true)).toBe('/?x=1');
+  });
 });
 
 describe('withoutDefaultLocale', () => {
@@ -152,6 +161,41 @@ describe('loadSiteUrlConfig', () => {
     );
 
     expect(loadSiteUrlConfig(path.join(distDir, 'server')).defaultLocales).toEqual(['en', 'fr']);
+  });
+
+  it.each([
+    ['a non-string defaultLocale', { defaultLocale: 42 }],
+    ['an empty defaultLocale', { defaultLocale: '' }],
+    ['a null i18n', null],
+    ['domains that are not an array', { domains: { defaultLocale: 'fr' } }],
+    ['domains without usable defaults', { domains: [null, 'fr', {}, { defaultLocale: ['fr'] }] }],
+  ])('ignores %s', (_, i18n) => {
+    fs.writeFileSync(path.join(distDir, 'required-server-files.json'), JSON.stringify({ config: { i18n } }));
+
+    expect(loadSiteUrlConfig(path.join(distDir, 'server')).defaultLocales).toEqual([]);
+  });
+
+  it('keeps usable default locales next to malformed ones', () => {
+    fs.writeFileSync(
+      path.join(distDir, 'required-server-files.json'),
+      JSON.stringify({
+        config: { i18n: { defaultLocale: 'en', domains: [null, { defaultLocale: 7 }, { defaultLocale: 'fr' }] } },
+      })
+    );
+
+    expect(loadSiteUrlConfig(path.join(distDir, 'server')).defaultLocales).toEqual(['en', 'fr']);
+  });
+
+  it('falls back to plain paths when required-server-files.json is not JSON', () => {
+    fs.writeFileSync(path.join(distDir, 'required-server-files.json'), '{"config": {"basePath": "/docs"');
+    fs.writeFileSync(path.join(distDir, 'BUILD_ID'), 'build-1\n');
+
+    expect(loadSiteUrlConfig(path.join(distDir, 'server'))).toEqual({
+      basePath: '',
+      trailingSlash: false,
+      buildId: 'build-1',
+      defaultLocales: [],
+    });
   });
 
   it('falls back to plain paths without a build output', () => {
