@@ -397,6 +397,9 @@ its URL without the locale prefix. These settings are read from the build
 output (`required-server-files.json` and `BUILD_ID`).
 `clearEdgeCachePaths()` gives the paths you pass the trailing slash the site
 serves them with: added with `trailingSlash: true`, removed without it.
+Purging a Pages Router page's URL yourself (`clearEdgeCachePaths()`also clears 
+its data route, except a default-locale page's unprefixed URL: purge the prefixed 
+path too (`/en/blog` as well as `/blog`).
 
 The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
 synchronously on `updateTags()` so other instances see revalidations promptly,
