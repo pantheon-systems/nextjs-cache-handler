@@ -113,7 +113,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   // A hit from memory resolves within a microtask; Next's cached-navigations
   // render advances to its dynamic stage after one task, so a GCS read would
   // otherwise push the cached result out of the static stage the client reuses.
-  private readonly memory = new MemoryEntries(resolveUseCacheMemoryBytes());
+  private readonly memory: MemoryEntries;
   // Background reloads of tagTimestamps (see refreshTags).
   private readonly tagsRefreshIntervalMs = resolveTagsRefreshIntervalMs();
   private tagsReload: Promise<void> | null = null;
@@ -128,11 +128,14 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private persistFailures = 0;
   private persistRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor() {
+  constructor(config: { memoryMb?: number } = {}) {
     const bucketName = process.env.CACHE_BUCKET;
     if (!bucketName) {
       throw new Error('CACHE_BUCKET environment variable is required for GCS cache handler');
     }
+    this.memory = new MemoryEntries(
+      resolveUseCacheMemoryBytes(config.memoryMb === undefined ? undefined : String(config.memoryMb))
+    );
 
     // Two clients on purpose: unconditional entry writes disable retries on
     // their client's shared state, which must not leak into tag writes.

@@ -76,7 +76,16 @@ export function createUseCacheHandler(
   config?: UseCacheHandlerConfig
 ): typeof UseCacheFileHandler | typeof UseCacheGcsHandler {
   if (shouldUseGcs(config?.type ?? 'auto')) {
-    return UseCacheGcsHandler;
+    const memoryMb = config?.memoryMb;
+    if (memoryMb === undefined) {
+      return UseCacheGcsHandler;
+    }
+    // Next calls `new` with no arguments, so bind the option in a subclass.
+    return class extends UseCacheGcsHandler {
+      constructor() {
+        super({ memoryMb });
+      }
+    };
   }
   return UseCacheFileHandler;
 }

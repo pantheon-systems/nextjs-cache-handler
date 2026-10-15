@@ -31,6 +31,7 @@ vi.mock('@google-cloud/storage', () => {
 
 // Import after mock is set up
 import { UseCacheGcsHandler, resolveUseCacheMemoryBytes } from '../../src/handlers/use-cache/gcs.js';
+import { createUseCacheHandler } from '../../src/index.js';
 import { streamToBytes } from '../../src/utils/stream-serialization.js';
 
 // Mock fetch for edge cache
@@ -416,6 +417,34 @@ describe('UseCacheGcsHandler', () => {
         await handler.set('k', Promise.resolve(createTestEntry()));
         mockFile.exists.mockResolvedValue([false]);
 
+        expect(await handler.get('k', [])).toBeUndefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('memoryMb overrides CACHE_USE_CACHE_MEMORY_MB', async () => {
+      process.env.CACHE_USE_CACHE_MEMORY_MB = '8';
+      try {
+        const handler = new UseCacheGcsHandler({ memoryMb: 0 });
+        await handler.set('k', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(await handler.get('k', [])).toBeUndefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('createUseCacheHandler binds memoryMb into a no-argument constructor', async () => {
+      process.env.CACHE_USE_CACHE_MEMORY_MB = '8';
+      try {
+        const Handler = createUseCacheHandler({ type: 'gcs', memoryMb: 0 });
+        const handler = new Handler();
+        await handler.set('k', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(handler).toBeInstanceOf(UseCacheGcsHandler);
         expect(await handler.get('k', [])).toBeUndefined();
       } finally {
         delete process.env.CACHE_USE_CACHE_MEMORY_MB;

@@ -44,7 +44,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const nextConfig = {
   cacheHandler: path.resolve(__dirname, "./cacheHandler.mjs"),
-  cacheMaxMemorySize: 0, // Disable in-memory caching to use custom handler
+  cacheMaxMemorySize: 0, // Turns off Next's built-in in-memory cache so this handler is the source of truth
 };
 
 export default nextConfig;
@@ -104,7 +104,7 @@ interface CacheHandlerConfig {
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
-| `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
+| `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries (the `memoryMb` option of `createUseCacheHandler` takes precedence) it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
 | `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for two intervals after storing a revalidation. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
@@ -183,6 +183,7 @@ import { createUseCacheHandler } from '@pantheon-systems/nextjs-cache-handler/us
 
 const UseCacheHandler = createUseCacheHandler({
   type: 'auto', // Auto-detect: GCS if CACHE_BUCKET exists, else file-based
+  memoryMb: 32, // Per-process in-memory entries for the GCS handler (default 32, 0 disables)
 });
 
 // Note the `new` — Next.js calls methods directly on this exported value
@@ -211,6 +212,8 @@ const nextConfig = {
     default: path.resolve(__dirname, "./use-cache-handler.mjs"),
   },
 
+  // Only affects Next's built-in cache for the `cacheHandler` above. The
+  // `'use cache'` handler's own memory is set with `memoryMb` in its handler file.
   cacheMaxMemorySize: 0,
   cacheComponents: true,
 };
@@ -220,7 +223,7 @@ export default nextConfig;
 
 ### `createUseCacheHandler(config?)`
 
-Factory function that returns the appropriate use-cache handler. Accepts the same `type` option (`'auto'`, `'file'`, `'gcs'`).
+Factory function that returns the appropriate use-cache handler. Accepts the same `type` option (`'auto'`, `'file'`, `'gcs'`), plus `memoryMb` for the GCS handler's per-process memory (overrides `CACHE_USE_CACHE_MEMORY_MB`).
 
 ### `getUseCacheStats()`
 
