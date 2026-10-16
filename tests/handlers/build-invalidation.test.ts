@@ -162,9 +162,8 @@ describe('FileCacheHandler build invalidation', () => {
     }
     mockGenerationId = current;
 
-    // FileCacheHandler doesn't expose its init promise, so let it settle.
-    new FileCacheHandler({} as any);
-    await new Promise((r) => setTimeout(r, 100));
+    // get() waits for the build check.
+    await new FileCacheHandler({} as any).get('k');
 
     expect(fs.existsSync(sentinel)).toBe(!invalidates);
     expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8')).buildId).toBe(
@@ -186,8 +185,7 @@ describe('FileCacheHandler build invalidation', () => {
     const { metaFile, sentinel } = setUp((f) => fs.writeFileSync(f, 'not json'));
     mockGenerationId = 'build-A';
 
-    new FileCacheHandler({} as any);
-    await new Promise((r) => setTimeout(r, 100));
+    await new FileCacheHandler({} as any).get('k');
 
     expect(fs.existsSync(sentinel)).toBe(false);
     expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8')).buildId).toBe('build-A');
@@ -199,8 +197,7 @@ describe('FileCacheHandler build invalidation', () => {
     mockGenerationId = 'build-A';
     const writeBuildMeta = vi.spyOn(FileCacheHandler.prototype as any, 'writeBuildMeta');
 
-    new FileCacheHandler({} as any);
-    await new Promise((r) => setTimeout(r, 100));
+    await new FileCacheHandler({} as any).get('k');
 
     expect(writeBuildMeta).not.toHaveBeenCalled();
     expect(fs.existsSync(sentinel)).toBe(true);
