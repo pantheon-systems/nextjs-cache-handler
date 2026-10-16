@@ -461,8 +461,11 @@ When deployed on Pantheon, the cache handlers automatically clear the CDN edge c
 
 - `revalidateTag()` calls (clears matching surrogate keys and paths)
 - `revalidatePath()` calls (clears the specific path from the CDN)
+- ISR regeneration storing a page (clears that page's paths)
+- A new build, when a starting process detects it (clears the whole CDN)
+- Another instance's revalidation, once this process reads it (clears the paths this process served from cache since)
 
-Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). It runs in the background and does not block cache operations.
+Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). `revalidateTag()` and `revalidatePath()` wait for the first purge, and a new build's full purge finishes before the process serves its first request; the other purges run in the background. A failed purge never fails the cache operation.
 
 ## Build Invalidation
 

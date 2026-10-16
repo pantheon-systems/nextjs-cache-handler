@@ -16,12 +16,24 @@ describe('toObjectName', () => {
     const names = ['a/b', 'a_b', 'a.b', 'a b'].map((p) => toObjectName(route + p));
     expect(new Set(names).size).toBe(4);
     for (const name of names) {
-      expect(name).toMatch(/^_route-cache_APP_PAGE_c3858___docs_a_b-[0-9a-f]{16}$/);
+      expect(name).toMatch(/^_route-cache_APP_PAGE_c3858___docs_a_b_[0-9a-f]{16}$/);
     }
   });
 
   it('is stable for the same key', () => {
     expect(toObjectName('/blog/post')).toBe(toObjectName('/blog/post'));
+  });
+
+  it('keeps names of long keys within file name limits, and distinct', () => {
+    const route = '/route-cache/APP_PAGE/c3858/$/blog/';
+    const keys = [route + 'a'.repeat(400), route + 'a'.repeat(399) + 'b', 'f'.repeat(201), 'f'.repeat(200) + 'e'];
+    const names = keys.map(toObjectName);
+    expect(new Set(names).size).toBe(keys.length);
+    for (const name of names) {
+      expect(name.length).toBeLessThanOrEqual(200);
+      expect(name).toContain('_');
+    }
+    expect(toObjectName('f'.repeat(200))).toBe('f'.repeat(200));
   });
 
   it("never names a key like the use cache handler's control objects", () => {
@@ -50,5 +62,16 @@ describe('FileCacheHandler with keys that sanitize alike', () => {
     expect(((await handler.get('/route-cache/APP_PAGE/h/$/docs/a/b')) as any)?.value?.html).toBe('a/b');
     expect(((await handler.get('/route-cache/APP_PAGE/h/$/docs/a_b')) as any)?.value?.html).toBe('a_b');
     expect(await handler.get('/route-cache/APP_PAGE/h/$/docs/a.b')).toBeNull();
+  });
+
+  it('stores and serves a key too long for a file name as it is', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'object-names-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tempDir);
+    const handler = new FileCacheHandler({} as any);
+    const key = `/route-cache/APP_PAGE/h/$/blog/${'long-slug-'.repeat(40)}`;
+
+    await handler.set(key, { kind: 'APP_PAGE', html: 'long', headers: {} } as any, { tags: [] } as any);
+
+    expect(((await handler.get(key)) as any)?.value?.html).toBe('long');
   });
 });

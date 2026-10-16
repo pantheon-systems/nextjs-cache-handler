@@ -25,6 +25,12 @@ const { tagsManifest } = nextExports;
  */
 const usesTimestamps = typeof nextExports.areTagsExpired !== 'function';
 
+/**
+ * Whether Next.js's IncrementalCache checks a fetch entry's tags itself (16+).
+ * Next.js 15 leaves that to FileSystemCache.get, which a custom handler replaces.
+ */
+export const nextChecksFetchTags = !usesTimestamps;
+
 /** The tag's current revalidation, normalized to the Next.js 16 shape. */
 export function getTagRevalidation(tag: string): TagRevalidation | undefined {
   const entry = tagsManifest.get(tag);
@@ -37,6 +43,9 @@ export function getTagRevalidation(tag: string): TagRevalidation | undefined {
  * the latest of `stale` and `expired` that has passed. A soft revalidation from
  * Next.js 16 keeps the tag's earlier `expired` and sets a new `stale`, and its
  * `expired` may still be ahead; either way `stale` marks when it happened.
+ * Next.js 15's isStale has no `<= now` guard, so a timestamp still ahead (from
+ * an instance whose clock is ahead) is recorded as now. A revalidation older
+ * than the one recorded keeps the recorded one: entries it expired stay expired.
  */
 export function setTagRevalidation(tag: string, revalidation: TagRevalidation): void {
   if (usesTimestamps) {
@@ -46,7 +55,8 @@ export function setTagRevalidation(tag: string, revalidation: TagRevalidation): 
     );
     const timestamp = passed.length > 0 ? Math.max(...passed) : (revalidation.stale ?? revalidation.expired);
     if (timestamp !== undefined) {
-      tagsManifest.set(tag, timestamp);
+      const recorded = tagsManifest.get(tag);
+      tagsManifest.set(tag, Math.max(Math.min(timestamp, now), typeof recorded === 'number' ? recorded : 0));
     }
     return;
   }

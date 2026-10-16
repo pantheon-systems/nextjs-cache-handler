@@ -62,8 +62,7 @@ export class FileCacheHandler extends BaseCacheHandler {
     });
 
     this.ensureCacheDir();
-    // Initialize asynchronously (don't await to avoid blocking constructor)
-    this.initialize().catch(() => {});
+    this.setInitPromise(this.initialize().catch(() => {}));
   }
 
   private ensureCacheDir(): void {
