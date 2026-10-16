@@ -196,6 +196,14 @@ describe('GcsCacheHandler across instances', () => {
       expect(pathPurges()).toEqual(['/tags', '/tags']);
     });
 
+    it('does not hold the revalidation for the apply delay', async () => {
+      const started = Date.now();
+      await newHandler().revalidateTag('inventory');
+
+      // The batching window plus GCS round trips, not the window plus the apply delay.
+      expect(Date.now() - started).toBeLessThan(250 + APPLY_DELAY_MS);
+    });
+
     it('defers the second purge until a revalidation that could not be stored is stored', async () => {
       bucket.putJson(TAGS_MAP, { inventory: ['/route-cache/APP_PAGE/h/$/tags'] });
       const store = (await import('../../src/utils/shared-revalidations.js')).SharedRevalidations.prototype;
@@ -227,6 +235,85 @@ describe('GcsCacheHandler across instances', () => {
         'stations',
         'stations:london',
       ]);
+    });
+  });
+
+  describe("purging another instance's revalidations on this one", () => {
+    const tagsKey = '/route-cache/APP_PAGE/h/$/tags';
+    const storePage = async () => {
+      await newHandler().set(tagsKey, page(['inventory']) as any, { tags: [] } as any);
+      await settle();
+      vi.mocked(fetch).mockClear(); // the ISR purge from storing it
+    };
+    const nextRefresh = () => new Promise((r) => setTimeout(r, 150)); // past the 100 ms test interval
+
+    it('purges the pages of a tag another instance revalidated once this one learns of it', async () => {
+      await storePage();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any); // first read of the store
+      expect(pathPurges()).toEqual([]);
+
+      const at = Date.now();
+      bucket.putJson(REVALIDATIONS, { inventory: { expired: at, at } });
+      // Served before it learns of the revalidation: the CDN may have kept this copy.
+      expect(await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any)).not.toBeNull();
+      await nextRefresh();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+      await settle(); // started by that request, not awaited by its cache read
+
+      expect(pathPurges()).toEqual(['/tags']);
+    });
+
+    it('purges nothing on an instance that served no page after the revalidation', async () => {
+      await storePage();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+
+      const at = Date.now() + 5000; // after everything this instance served
+      bucket.putJson(REVALIDATIONS, { inventory: { expired: at, at } });
+      await nextRefresh();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+      await settle();
+
+      expect(pathPurges()).toEqual([]);
+    });
+
+    it('does not hold the cache read that learns of it for the purge', async () => {
+      await storePage();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+      vi.mocked(fetch).mockImplementation(() => new Promise(() => {})); // the CDN never answers
+
+      const at = Date.now();
+      bucket.putJson(REVALIDATIONS, { inventory: { expired: at, at } });
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+      await nextRefresh();
+      const started = Date.now();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+
+      expect(Date.now() - started).toBeLessThan(500);
+      await settle(); // let the purge reach fetch here, not in the next test
+      expect(pathPurges()).toEqual(['/tags']);
+    });
+
+    it('does not purge revalidations already stored when this instance first reads the store', async () => {
+      bucket.putJson(TAGS_MAP, { inventory: [tagsKey] });
+      const at = Date.now();
+      bucket.putJson(REVALIDATIONS, { inventory: { expired: at, at } });
+
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+      await nextRefresh();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+
+      expect(pathPurges()).toEqual([]);
+    });
+
+    it("does not purge this instance's own revalidation a third time when it reads it back", async () => {
+      await storePage();
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+
+      await newHandler().revalidateTag('inventory');
+      await new Promise((r) => setTimeout(r, SECOND_PURGE_MS));
+      await newHandler().get(tagsKey, { kind: 'APP_PAGE' } as any);
+
+      expect(pathPurges()).toEqual(['/tags', '/tags']);
     });
   });
 

@@ -5,7 +5,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    // revalidateTag() waits about two refresh intervals before its second CDN purge.
+    // revalidateTag() schedules its second CDN purge two refresh intervals out.
     env: { CACHE_TAGS_REFRESH_INTERVAL_MS: '100' },
     coverage: {
       provider: 'v8',
