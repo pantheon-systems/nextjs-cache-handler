@@ -66,6 +66,8 @@ export class SharedRevalidations {
   private nextRefreshAt = 0;
   private lastGeneration: string | number | null = null;
   private refreshFailing = false;
+  private loaded = false;
+  private onLearnedListener: ((tags: string[]) => Promise<void>) | null = null;
 
   constructor(
     private readonly bucket: Bucket,
@@ -75,6 +77,15 @@ export class SharedRevalidations {
     this.refreshIntervalMs = config.refreshIntervalMs ?? resolveTagsRefreshIntervalMs();
     this.recordTimeoutMs = config.recordTimeoutMs ?? 5000;
     this.batchWindowMs = config.batchWindowMs ?? 250;
+  }
+
+  /**
+   * Set, once per process, what to do with tags another instance revalidated
+   * after this process first read the store: this process may have served
+   * their old entries until it learned of them. Later calls are ignored.
+   */
+  setOnLearned(listener: (tags: string[]) => Promise<void>): void {
+    this.onLearnedListener ??= listener;
   }
 
   /** Whether revalidations are waiting to be stored (an earlier record() gave up). */
@@ -275,6 +286,7 @@ export class SharedRevalidations {
         generation = metadata.generation ?? 0;
       } catch (error) {
         if (isNotFound(error)) {
+          this.loaded = true;
           return;
         }
         throw error;
@@ -284,9 +296,10 @@ export class SharedRevalidations {
       }
 
       const { value, generation: readGeneration } = await readJsonObject<SharedRevalidationMap>(this.bucket, this.key);
-      if (value) {
-        this.learn(value);
-      }
+      // Started inside the request whose cache read refreshed, which has CPU.
+      // Not awaited: cache reads wait on this refresh (refreshWithin), and a
+      // CDN purge must neither hold them up nor count as a slow read.
+      void this.notifyLearned(this.learnFromStore(value));
       this.lastGeneration = readGeneration;
       if (this.refreshFailing) {
         log.warn('Reading shared revalidations recovered');
@@ -306,9 +319,8 @@ export class SharedRevalidations {
     try {
       for (let attempt = 0; ; attempt++) {
         const { value: stored, generation } = await readJsonObject<SharedRevalidationMap>(this.bucket, this.key);
-        if (stored) {
-          this.learn(stored);
-        }
+        // Not awaited: this write holds up a revalidation's response.
+        void this.notifyLearned(this.learnFromStore(stored));
         const merged: SharedRevalidationMap = { ...stored };
         let changed = false;
         for (const [tag, entry] of batch) {
@@ -358,8 +370,32 @@ export class SharedRevalidations {
     }
   }
 
-  /** Keep the latest revalidation per tag and mirror it into tagsManifest. */
-  private learn(entries: SharedRevalidationMap): void {
+  /**
+   * Learn what the store holds. Returns the tags that are new to this process,
+   * except on its first read, before which it served nothing from the cache.
+   */
+  private learnFromStore(stored: SharedRevalidationMap | null | undefined): string[] {
+    const learned = stored ? this.learn(stored) : [];
+    const firstRead = !this.loaded;
+    this.loaded = true;
+    return firstRead ? [] : learned;
+  }
+
+  /** Never rejects: a failing listener is logged here, so callers can leave this unawaited. */
+  private async notifyLearned(tags: string[]): Promise<void> {
+    if (tags.length === 0 || !this.onLearnedListener) {
+      return;
+    }
+    try {
+      await this.onLearnedListener(tags);
+    } catch (error) {
+      log.error(`Error handling revalidations of ${tags.join(', ')} from another instance:`, error);
+    }
+  }
+
+  /** Keep the latest revalidation per tag and mirror it into tagsManifest. Returns the tags that changed. */
+  private learn(entries: SharedRevalidationMap): string[] {
+    const changed: string[] = [];
     for (const [tag, entry] of Object.entries(entries)) {
       const current = this.known.get(tag);
       if (!isRevalidation(entry) || (current && current.at >= entry.at)) {
@@ -370,7 +406,9 @@ export class SharedRevalidations {
         ...(entry.stale !== undefined ? { stale: entry.stale } : {}),
         ...(entry.expired !== undefined ? { expired: entry.expired } : {}),
       });
+      changed.push(tag);
     }
+    return changed;
   }
 }
 

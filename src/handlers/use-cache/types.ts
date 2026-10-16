@@ -168,6 +168,11 @@ export interface UseCacheHandlerConfig {
    * - 'gcs': Use Google Cloud Storage (production/Pantheon)
    */
   type?: 'auto' | 'file' | 'gcs';
+  /**
+   * Megabytes of `'use cache'` entries each server process keeps in memory (GCS handler).
+   * Takes precedence over CACHE_USE_CACHE_MEMORY_MB. Defaults to 32; 0 disables.
+   */
+  memoryMb?: number;
 }
 
 // ============================================================================

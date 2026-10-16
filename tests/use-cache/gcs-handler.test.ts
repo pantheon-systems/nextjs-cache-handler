@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 // Mock file and bucket stored for access
@@ -29,7 +30,8 @@ vi.mock('@google-cloud/storage', () => {
 });
 
 // Import after mock is set up
-import { UseCacheGcsHandler } from '../../src/handlers/use-cache/gcs.js';
+import { UseCacheGcsHandler, resolveUseCacheMemoryBytes } from '../../src/handlers/use-cache/gcs.js';
+import { createUseCacheHandler } from '../../src/index.js';
 import { streamToBytes } from '../../src/utils/stream-serialization.js';
 
 // Mock fetch for edge cache
@@ -268,6 +270,196 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('memory', () => {
+    const storedJson = (overrides: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        value: Buffer.from([7, 8, 9]).toString('base64'),
+        tags: ['tag1'],
+        stale: 60,
+        timestamp: Date.now() - 1000,
+        expire: 3600,
+        revalidate: 300,
+        ...overrides,
+      });
+
+    it('serves a repeated hit from memory without reading GCS', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+      const handler = new UseCacheGcsHandler();
+      await handler.get('k', []);
+
+      mockFile.exists.mockRejectedValue(new Error('GCS must not be read'));
+      const result = await handler.get('k', []);
+
+      expect(Array.from(await streamToBytes(result!.value))).toEqual([7, 8, 9]);
+    });
+
+    it('resolves a memory hit within the same task', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+      const handler = new UseCacheGcsHandler();
+      await handler.get('k', []);
+      // A real GCS read takes at least a task.
+      mockFile.exists.mockImplementation(() => new Promise((r) => setTimeout(() => r([true]), 0)));
+
+      let result: UseCacheEntry | undefined;
+      void handler.get('k', []).then((entry) => (result = entry));
+      // Microtasks only: Next's cached-navigations render ends the static stage after one task.
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+
+      expect(result).toBeDefined();
+    });
+
+    it('serves its own set() from memory', async () => {
+      const handler = new UseCacheGcsHandler();
+      await handler.set('own', Promise.resolve(createTestEntry({ value: createTestStream(new Uint8Array([4, 5])) })));
+
+      mockFile.exists.mockResolvedValue([false]);
+      const result = await handler.get('own', []);
+
+      expect(Array.from(await streamToBytes(result!.value))).toEqual([4, 5]);
+    });
+
+    describe('revalidations the route cache handler learned from other instances', () => {
+      afterEach(() => tagsManifest.clear());
+
+      it('stops serving a memory hit for a tag in tagsManifest, before any reload', async () => {
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+        const handler = new UseCacheGcsHandler();
+        await handler.get('k', []);
+
+        tagsManifest.set('tag1', { expired: Date.now() });
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(await handler.get('k', [])).toBeUndefined();
+      });
+
+      it('reports the revalidation from getExpiration, using the moment of a soft one', async () => {
+        const handler = new UseCacheGcsHandler();
+        const at = Date.now() - 500;
+        tagsManifest.set('soft', { stale: at, expired: Date.now() + 60_000 });
+
+        expect(await handler.getExpiration(['soft'])).toBe(at);
+      });
+
+      it('ignores a revalidation older than the entry', async () => {
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+        const handler = new UseCacheGcsHandler();
+        tagsManifest.set('tag1', { expired: Date.now() - 10_000 });
+
+        expect(await handler.get('k', [])).toBeDefined();
+      });
+    });
+
+    it('stops serving its own set() from memory when the GCS save fails', async () => {
+      const handler = new UseCacheGcsHandler();
+      // Another save (the tag timestamps) may run first, so fail only the entry's.
+      mockFile.save.mockImplementation(async (json: string) => {
+        if (JSON.parse(json).value !== undefined) {
+          throw new Error('save failed');
+        }
+      });
+      await handler.set('own', Promise.resolve(createTestEntry({ value: createTestStream(new Uint8Array([4, 5])) })));
+
+      mockFile.exists.mockResolvedValue([false]);
+
+      expect(await handler.get('own', [])).toBeUndefined();
+    });
+
+    it('stops serving an entry from memory once one of its tags is invalidated', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
+      const handler = new UseCacheGcsHandler();
+      await handler.get('k', []);
+
+      await handler.updateTags(['tag1'], []);
+      mockFile.exists.mockResolvedValue([false]);
+
+      expect(await handler.get('k', [])).toBeUndefined();
+    });
+
+    it('stops serving an entry from memory once it is past its revalidate time', async () => {
+      const handler = new UseCacheGcsHandler();
+      await handler.set('old', Promise.resolve(createTestEntry({ timestamp: Date.now() - 10_000, revalidate: 5 })));
+
+      mockFile.exists.mockResolvedValue([false]);
+
+      expect(await handler.get('old', [])).toBeUndefined();
+    });
+
+    it('evicts the least recently used entry past CACHE_USE_CACHE_MEMORY_MB', async () => {
+      // About two stored entries' worth (each ~150 bytes of JSON).
+      process.env.CACHE_USE_CACHE_MEMORY_MB = String(330 / 1024 / 1024);
+      try {
+        const handler = new UseCacheGcsHandler();
+        await handler.set('a', Promise.resolve(createTestEntry()));
+        await handler.set('b', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+        expect(await handler.get('a', [])).toBeDefined(); // a is now the most recent
+        await handler.set('c', Promise.resolve(createTestEntry()));
+
+        expect(await handler.get('b', [])).toBeUndefined();
+        expect(await handler.get('a', [])).toBeDefined();
+        expect(await handler.get('c', [])).toBeDefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('keeps nothing in memory with CACHE_USE_CACHE_MEMORY_MB=0', async () => {
+      process.env.CACHE_USE_CACHE_MEMORY_MB = '0';
+      try {
+        const handler = new UseCacheGcsHandler();
+        await handler.set('k', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(await handler.get('k', [])).toBeUndefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('memoryMb overrides CACHE_USE_CACHE_MEMORY_MB', async () => {
+      process.env.CACHE_USE_CACHE_MEMORY_MB = '8';
+      try {
+        const handler = new UseCacheGcsHandler({ memoryMb: 0 });
+        await handler.set('k', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(await handler.get('k', [])).toBeUndefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('createUseCacheHandler binds memoryMb into a no-argument constructor', async () => {
+      process.env.CACHE_USE_CACHE_MEMORY_MB = '8';
+      try {
+        const Handler = createUseCacheHandler({ type: 'gcs', memoryMb: 0 });
+        const handler = new Handler();
+        await handler.set('k', Promise.resolve(createTestEntry()));
+        mockFile.exists.mockResolvedValue([false]);
+
+        expect(handler).toBeInstanceOf(UseCacheGcsHandler);
+        expect(await handler.get('k', [])).toBeUndefined();
+      } finally {
+        delete process.env.CACHE_USE_CACHE_MEMORY_MB;
+      }
+    });
+
+    it('reads CACHE_USE_CACHE_MEMORY_MB', () => {
+      expect(resolveUseCacheMemoryBytes(undefined)).toBe(32 * 1024 * 1024);
+      expect(resolveUseCacheMemoryBytes('8')).toBe(8 * 1024 * 1024);
+      expect(resolveUseCacheMemoryBytes('0')).toBe(0);
+      expect(resolveUseCacheMemoryBytes('nope')).toBe(32 * 1024 * 1024);
+      expect(resolveUseCacheMemoryBytes('-1')).toBe(32 * 1024 * 1024);
+    });
+  });
+
   describe('refreshTags', () => {
     it('should not throw', async () => {
       mockFile.exists.mockResolvedValue([true]);
@@ -284,9 +476,65 @@ describe('UseCacheGcsHandler', () => {
 
       const handler = new UseCacheGcsHandler();
       await handler.refreshTags();
+      await new Promise((r) => setTimeout(r, 20)); // the reload runs in the background
 
       const expiration = await handler.getExpiration(['tag1']);
       expect(expiration).toBe(1234567890);
+    });
+
+    it('returns without waiting for GCS, so a cached read stays in the static stage', async () => {
+      const handler = new UseCacheGcsHandler();
+      await handler.get('warm-up', []); // initialization
+      mockFile.exists.mockImplementation(() => new Promise(() => {})); // GCS never answers
+
+      let done = false;
+      void handler.refreshTags().then(() => (done = true));
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+
+      expect(done).toBe(true);
+    });
+
+    it('picks up a tag another instance revalidated on the next reload', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([
+        Buffer.from(
+          JSON.stringify({
+            value: '',
+            tags: ['tag1'],
+            stale: 60,
+            timestamp: Date.now() - 1000,
+            expire: 3600,
+            revalidate: 300,
+          })
+        ),
+      ]);
+      const handler = new UseCacheGcsHandler();
+      expect(await handler.get('k', [])).toBeDefined(); // now in memory
+
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ tag1: Date.now() }))]);
+      await new Promise((r) => setTimeout(r, 150)); // past the 100 ms test refresh interval
+      await handler.refreshTags();
+      await new Promise((r) => setTimeout(r, 20));
+      mockFile.exists.mockResolvedValue([false]);
+
+      expect(await handler.get('k', [])).toBeUndefined();
+    });
+
+    it('reloads at most once per refresh interval', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      const handler = new UseCacheGcsHandler();
+      await handler.get('warm-up', []);
+      mockFile.download.mockClear();
+
+      await handler.refreshTags();
+      await handler.refreshTags();
+      await handler.refreshTags();
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(mockFile.download).toHaveBeenCalledTimes(1);
     });
   });
 
