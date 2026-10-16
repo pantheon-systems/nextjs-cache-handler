@@ -5,7 +5,7 @@ import * as os from 'os';
 import { FileCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/file.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { getTagRevalidation } from '../../src/utils/tags-manifest.js';
-import { hasStaleTags } from '../helpers/next-version.js';
+import { hasStaleTags, nextMajor } from '../helpers/next-version.js';
 
 describe('FileCacheHandler', () => {
   let tempDir: string;
@@ -96,12 +96,8 @@ describe('FileCacheHandler', () => {
 
       await handler.set('image-key', cacheValue as any, { cacheControl: { revalidate: 60 } } as any);
 
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))
-      ).toBe(true);
-      expect(
-        fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))
-      ).toBe(false);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'image-cache', 'image-key.json'))).toBe(true);
+      expect(fs.existsSync(path.join(tempDir, '.next', 'cache', 'route-cache', 'image-key.json'))).toBe(false);
 
       const result = await handler.get('image-key', { kind: 'IMAGE', isFallback: false } as any);
       expect(result).not.toBeNull();
@@ -315,6 +311,51 @@ describe('FileCacheHandler', () => {
     });
   });
 
+  // Next.js 15's IncrementalCache only checks fetch tags against the request's
+  // own revalidatedTags; the tagsManifest check lives in its FileSystemCache.get,
+  // which returns null for a FETCH entry whose ctx.tags or ctx.softTags were
+  // revalidated after it was written. Replacing FileSystemCache means doing the same.
+  describe.runIf(nextMajor === 15)('fetch entries with a revalidated tag, on Next.js 15', () => {
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const fetchValue = { kind: 'FETCH' as const, data: { headers: {}, body: '', url: '' }, revalidate: 3600 };
+    const fetchCtx = (tags: string[], softTags: string[]) => ({
+      kind: 'FETCH',
+      fetchUrl: 'https://api.example.com/posts',
+      fetchIdx: 0,
+      revalidate: 3600,
+      tags,
+      softTags,
+    });
+
+    afterEach(() => {
+      tagsManifest.clear();
+    });
+
+    const cases = [
+      { name: 'a fetch tag', tags: ['api-posts'], softTags: [] },
+      { name: 'an implicit (soft) tag', tags: [], softTags: ['_N_T_/posts'] },
+    ];
+
+    for (const { name, tags, softTags } of cases) {
+      it(`returns null once ${name} is revalidated after the entry was written`, async () => {
+        await handler.set('fetch-key', fetchValue as any, { fetchCache: true, tags } as any);
+        await tick();
+        await handler.revalidateTag([...tags, ...softTags]);
+
+        // A handler is constructed per request, so read through a fresh one.
+        expect(await new FileCacheHandler({} as any).get('fetch-key', fetchCtx(tags, softTags) as any)).toBeNull();
+      });
+    }
+
+    it('returns a fetch entry written after its tag was revalidated', async () => {
+      await handler.revalidateTag('api-posts');
+      await tick();
+      await handler.set('fetch-key', fetchValue as any, { fetchCache: true, tags: ['api-posts'] } as any);
+
+      expect(await handler.get('fetch-key', fetchCtx(['api-posts'], []) as any)).not.toBeNull();
+    });
+  });
+
   describe('extractTagsFromDataHeaders fallback', () => {
     it('should extract tags from data.headers when ctx.tags is empty (APP_PAGE)', async () => {
       const cacheValue = {
@@ -380,7 +421,7 @@ describe('FileCacheHandler', () => {
       expect(result).not.toBeNull();
 
       // Tags should be deduplicated
-      const tagCount = result!.tags.filter(t => t === 'shared-tag').length;
+      const tagCount = result!.tags.filter((t) => t === 'shared-tag').length;
       expect(tagCount).toBe(1);
 
       // All unique tags should be present
