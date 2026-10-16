@@ -43,7 +43,14 @@ vi.stubGlobal('fetch', vi.fn());
 const { UseCacheFileHandler } = await import('../../src/handlers/use-cache/file.js');
 const { UseCacheGcsHandler } = await import('../../src/handlers/use-cache/gcs.js');
 const { streamToBytes } = await import('../../src/utils/stream-serialization.js');
-const { resetBuildStoreForTests } = await import('../../src/handlers/use-cache/build-store.js');
+
+// Next's in-memory build store is one per process and outlives each test, so
+// every build-phase test uses keys of its own.
+let buildTest = 0;
+beforeEach(() => {
+  buildTest++;
+});
+const key = (name: string) => `${name}-${buildTest}`;
 
 function createTestStream(text: string): ReadableStream<Uint8Array> {
   const data = new TextEncoder().encode(text);
@@ -153,41 +160,40 @@ describe('use-cache build scoping', () => {
     describe('during next build', () => {
       afterEach(() => {
         mockBuildPhase = false;
-        resetBuildStoreForTests();
       });
 
       it('serves an entry set earlier in the same build, as prerendering needs', async () => {
         mockBuildPhase = true;
         const writer = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        await writer.set('sitemap', Promise.resolve(createTestEntry('buildtime')));
+        await writer.set(key('sitemap'), Promise.resolve(createTestEntry('buildtime')));
 
         const reader = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        const entry = await reader.get('sitemap', []);
+        const entry = await reader.get(key('sitemap'), []);
         expect(entry).toBeDefined();
         expect(await readValue(entry!)).toBe('buildtime');
-        expect(fs.existsSync(path.join(testCacheDir, 'sitemap.json'))).toBe(false);
+        expect(fs.existsSync(path.join(testCacheDir, `${key('sitemap')}.json`))).toBe(false);
       });
 
       it('does not persist entries, so the runtime renders fresh', async () => {
         mockBuildPhase = true;
         const build = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        await build.set('page-sentinel', Promise.resolve(createTestEntry('buildtime')));
-        expect(fs.existsSync(path.join(testCacheDir, 'page-sentinel.json'))).toBe(false);
+        await build.set(key('page-sentinel'), Promise.resolve(createTestEntry('buildtime')));
+        expect(fs.existsSync(path.join(testCacheDir, `${key('page-sentinel')}.json`))).toBe(false);
 
         mockBuildPhase = false;
         const runtime = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        expect(await runtime.get('page-sentinel', [])).toBeUndefined();
+        expect(await runtime.get(key('page-sentinel'), [])).toBeUndefined();
       });
 
       it('misses without reading or deleting entries the live revision uses', async () => {
         const live = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        await live.set('sitemap', Promise.resolve(createTestEntry('live')));
+        await live.set(key('sitemap'), Promise.resolve(createTestEntry('live')));
 
         mockBuildPhase = true;
         mockBuildId = 'build-B';
         const build = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        expect(await build.get('sitemap', [])).toBeUndefined();
-        expect(fs.existsSync(path.join(testCacheDir, 'sitemap.json'))).toBe(true);
+        expect(await build.get(key('sitemap'), [])).toBeUndefined();
+        expect(fs.existsSync(path.join(testCacheDir, `${key('sitemap')}.json`))).toBe(true);
       });
 
       it('resolves set() when the entry is a tee branch whose other branch is never read', async () => {
@@ -195,7 +201,7 @@ describe('use-cache build scoping', () => {
         mockBuildPhase = true;
         const [branch] = createTestStream('buildtime').tee();
         const entry = { ...createTestEntry('unused'), value: branch };
-        const set = new UseCacheFileHandler({ cacheDir: testCacheDir }).set('k', Promise.resolve(entry));
+        const set = new UseCacheFileHandler({ cacheDir: testCacheDir }).set(key('k'), Promise.resolve(entry));
         const outcome = await Promise.race([
           set.then(() => 'resolved'),
           new Promise((r) => setTimeout(() => r('hung'), 500)),
@@ -206,13 +212,13 @@ describe('use-cache build scoping', () => {
       it('resolves set() even when the pending entry rejects', async () => {
         mockBuildPhase = true;
         const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        await expect(handler.set('k', Promise.reject(new Error('render failed')))).resolves.toBeUndefined();
+        await expect(handler.set(key('k'), Promise.reject(new Error('render failed')))).resolves.toBeUndefined();
       });
 
       it('persists and serves entries again once the build phase is over', async () => {
         const runtime = new UseCacheFileHandler({ cacheDir: testCacheDir });
-        await runtime.set('page-sentinel', Promise.resolve(createTestEntry('runtime')));
-        const entry = await runtime.get('page-sentinel', []);
+        await runtime.set(key('page-sentinel'), Promise.resolve(createTestEntry('runtime')));
+        const entry = await runtime.get(key('page-sentinel'), []);
         expect(entry).toBeDefined();
         expect(await readValue(entry!)).toBe('runtime');
       });
@@ -328,7 +334,6 @@ describe('use-cache build scoping', () => {
     describe('during next build', () => {
       afterEach(() => {
         mockBuildPhase = false;
-        resetBuildStoreForTests();
         delete process.env.OUTBOUND_PROXY_ENDPOINT;
       });
 
@@ -340,30 +345,30 @@ describe('use-cache build scoping', () => {
         mockBuildPhase = true;
         mockBuildId = 'build-B';
         const writer = new UseCacheGcsHandler();
-        await writer.set('sitemap', Promise.resolve(createTestEntry('buildtime')));
+        await writer.set(key('sitemap'), Promise.resolve(createTestEntry('buildtime')));
 
-        const entry = await new UseCacheGcsHandler().get('sitemap', []);
+        const entry = await new UseCacheGcsHandler().get(key('sitemap'), []);
         expect(entry).toBeDefined();
         expect(await readValue(entry!)).toBe('buildtime');
         // Read twice: the stored copy must survive being served.
-        expect(await readValue((await writer.get('sitemap', []))!)).toBe('buildtime');
+        expect(await readValue((await writer.get(key('sitemap'), []))!)).toBe('buildtime');
         expect(store).toEqual(liveStore);
       });
 
       it('does not serve a build-time entry once the build phase is over (use-cache-private)', async () => {
         mockBuildPhase = true;
-        await new UseCacheGcsHandler().set('page-sentinel', Promise.resolve(createTestEntry('buildtime')));
+        await new UseCacheGcsHandler().set(key('page-sentinel'), Promise.resolve(createTestEntry('buildtime')));
 
         mockBuildPhase = false;
-        expect(await new UseCacheGcsHandler().get('page-sentinel', [])).toBeUndefined();
+        expect(await new UseCacheGcsHandler().get(key('page-sentinel'), [])).toBeUndefined();
       });
 
       it('lets a get() for a key still being set wait for it, as Next does', async () => {
         mockBuildPhase = true;
         let resolveEntry!: (entry: UseCacheEntry) => void;
         const handler = new UseCacheGcsHandler();
-        const set = handler.set('k', new Promise<UseCacheEntry>((r) => (resolveEntry = r)));
-        const get = handler.get('k', []);
+        const set = handler.set(key('k'), new Promise<UseCacheEntry>((r) => (resolveEntry = r)));
+        const get = handler.get(key('k'), []);
         resolveEntry(createTestEntry('buildtime'));
         await set;
         expect(await readValue((await get)!)).toBe('buildtime');
@@ -372,8 +377,8 @@ describe('use-cache build scoping', () => {
       it('stores nothing for a rejected entry and does not leave later reads waiting', async () => {
         mockBuildPhase = true;
         const handler = new UseCacheGcsHandler();
-        await expect(handler.set('k', Promise.reject(new Error('render failed')))).resolves.toBeUndefined();
-        expect(await handler.get('k', [])).toBeUndefined();
+        await expect(handler.set(key('k'), Promise.reject(new Error('render failed')))).resolves.toBeUndefined();
+        expect(await handler.get(key('k'), [])).toBeUndefined();
       });
 
       it('does not persist entries, so the runtime renders fresh (use-cache-private)', async () => {
@@ -382,23 +387,23 @@ describe('use-cache build scoping', () => {
 
         mockBuildPhase = true;
         const build = new UseCacheGcsHandler();
-        await build.set('page-sentinel', Promise.resolve(createTestEntry('buildtime')));
-        expect(Object.keys(store).some((k) => k.endsWith('page-sentinel.json'))).toBe(false);
+        await build.set(key('page-sentinel'), Promise.resolve(createTestEntry('buildtime')));
+        expect(Object.keys(store).some((k) => k.endsWith(`${key('page-sentinel')}.json`))).toBe(false);
 
         mockBuildPhase = false;
         const runtime = new UseCacheGcsHandler();
-        expect(await runtime.get('page-sentinel', [])).toBeUndefined();
+        expect(await runtime.get(key('page-sentinel'), [])).toBeUndefined();
       });
 
       it('misses without reading or deleting entries the live revision uses', async () => {
         const live = new UseCacheGcsHandler();
-        await live.set('sitemap', Promise.resolve(createTestEntry('live')));
+        await live.set(key('sitemap'), Promise.resolve(createTestEntry('live')));
         const liveKeys = Object.keys(store);
 
         mockBuildPhase = true;
         mockBuildId = 'build-B';
         const build = new UseCacheGcsHandler();
-        expect(await build.get('sitemap', [])).toBeUndefined();
+        expect(await build.get(key('sitemap'), [])).toBeUndefined();
         expect(Object.keys(store)).toEqual(liveKeys);
       });
 
@@ -406,7 +411,7 @@ describe('use-cache build scoping', () => {
         mockBuildPhase = true;
         const [branch] = createTestStream('buildtime').tee();
         const entry = { ...createTestEntry('unused'), value: branch };
-        const set = new UseCacheGcsHandler().set('k', Promise.resolve(entry));
+        const set = new UseCacheGcsHandler().set(key('k'), Promise.resolve(entry));
         const outcome = await Promise.race([
           set.then(() => 'resolved'),
           new Promise((r) => setTimeout(() => r('hung'), 500)),
@@ -416,7 +421,7 @@ describe('use-cache build scoping', () => {
 
       it('leaves build meta and the CDN to the runtime that serves the build', async () => {
         const live = new UseCacheGcsHandler();
-        await live.get('sitemap', []);
+        await live.get(key('sitemap'), []);
         const metaKey = Object.keys(store).find((k) => k.endsWith('_build-meta.json'))!;
         const liveMeta = store[metaKey];
 
@@ -427,14 +432,14 @@ describe('use-cache build scoping', () => {
         mockBuildPhase = true;
         mockBuildId = 'build-B';
         const build = new UseCacheGcsHandler();
-        await build.set('sitemap', Promise.resolve(createTestEntry('buildtime')));
+        await build.set(key('sitemap'), Promise.resolve(createTestEntry('buildtime')));
         expect(store[metaKey]).toBe(liveMeta);
         expect(fetch).not.toHaveBeenCalled();
 
         // The new revision's first runtime handler detects the build and purges.
         mockBuildPhase = false;
         const runtime = new UseCacheGcsHandler();
-        await runtime.get('sitemap', []);
+        await runtime.get(key('sitemap'), []);
         expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
         expect(fetch).toHaveBeenCalledWith(
           'http://proxy.example.com:8080/rest/v0alpha1/cache',
