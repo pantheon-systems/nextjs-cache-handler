@@ -214,17 +214,21 @@ describe('FileCacheHandler', () => {
         expect(entry?.expired).toBeLessThanOrEqual(after);
       });
 
-      it('sets a future expiry equal to now + expire*1000 when durations.expire is provided', async () => {
-        const before = Date.now();
-        await handler.revalidateTag('soft-tag', { expire: 60 });
-        const after = Date.now();
+      // Next.js 15 passes no durations; its single timestamp is covered in tags-manifest.test.ts.
+      it.skipIf(!hasStaleTags)(
+        'sets a future expiry equal to now + expire*1000 when durations.expire is provided',
+        async () => {
+          const before = Date.now();
+          await handler.revalidateTag('soft-tag', { expire: 60 });
+          const after = Date.now();
 
-        const entry = getTagRevalidation('soft-tag');
-        expect(entry?.expired).toBeGreaterThanOrEqual(before + 60 * 1000);
-        expect(entry?.expired).toBeLessThanOrEqual(after + 60 * 1000);
-        // Confirms this is a genuinely future expiry, not an immediate one.
-        expect(entry?.expired).toBeGreaterThan(after);
-      });
+          const entry = getTagRevalidation('soft-tag');
+          expect(entry?.expired).toBeGreaterThanOrEqual(before + 60 * 1000);
+          expect(entry?.expired).toBeLessThanOrEqual(after + 60 * 1000);
+          // Confirms this is a genuinely future expiry, not an immediate one.
+          expect(entry?.expired).toBeGreaterThan(after);
+        }
+      );
 
       it('preserves the existing expiry when durations is present but expire is undefined', async () => {
         await handler.revalidateTag('profile-tag', { expire: 120 });

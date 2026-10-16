@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { toObjectName } from './object-names.js';
 
 interface PrerenderManifest {
   routes?: Record<
@@ -30,12 +31,11 @@ export function getStaticRoutes(): Set<string> {
       // initialRevalidateSeconds: false means truly static (SSG)
       // initialRevalidateSeconds: number means ISR (can be cleared)
       if (config.initialRevalidateSeconds === false) {
-        const cacheKey = routeToCacheKey(route);
-        staticRoutes.add(cacheKey);
+        staticRoutes.add(toObjectName(routeToCacheKey(route)));
         // Next 16.3.8+ keys routes by source too; the `.meta` file records the exact key.
         const routeCacheKey = readRouteCacheKey(route);
         if (routeCacheKey) {
-          staticRoutes.add(toStoredKey(routeCacheKey));
+          staticRoutes.add(toObjectName(routeCacheKey));
         }
       }
     }
@@ -75,18 +75,10 @@ function readRouteCacheKey(route: string): string | null {
   return null;
 }
 
-/** The handlers' storage name for a cache key (GcsCacheHandler/FileCacheHandler getCacheKey). */
-function toStoredKey(cacheKey: string): string {
-  return cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-}
-
 /**
- * Converts a route path to cache key format.
- * Example: "/ssg-demo" -> "_ssg-demo", "/" -> "_index"
+ * The cache key Next used for a route before 16.3.8 (and 15.5.x before route
+ * keys): its path, with `/` stored as `/index`.
  */
 function routeToCacheKey(route: string): string {
-  if (route === '/') {
-    return '_index';
-  }
-  return route.replace(/\//g, '_');
+  return route === '/' ? '/index' : route;
 }

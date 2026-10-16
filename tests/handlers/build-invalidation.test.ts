@@ -12,11 +12,14 @@ vi.mock('../../src/utils/build-detection.js', () => ({
 }));
 
 const store: Record<string, string> = {};
+// Keys whose download fails with a transient error.
+const failingReads = new Set<string>();
 const mockBucket = {
   file: vi.fn((key: string) => ({
     exists: vi.fn(async () => [key in store]),
     download: vi.fn(async () => {
-      if (!(key in store)) throw new Error('404');
+      if (failingReads.has(key)) throw Object.assign(new Error('Service unavailable'), { code: 503 });
+      if (!(key in store)) throw Object.assign(new Error('No such object'), { code: 404 });
       return [Buffer.from(store[key])];
     }),
     save: vi.fn(async (data: string) => {
@@ -56,6 +59,7 @@ const scenarios: Array<[string, string | undefined, string, boolean]> = [
 describe('GcsCacheHandler build invalidation', () => {
   beforeEach(() => {
     for (const k of Object.keys(store)) delete store[k];
+    failingReads.clear();
     process.env.CACHE_BUCKET = 'test-bucket';
     process.env.PANTHEON_ENVIRONMENT = 'pr-42';
     process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
@@ -95,6 +99,42 @@ describe('GcsCacheHandler build invalidation', () => {
     }
     if (stored === undefined) expect(JSON.parse(store[metaKey]).buildId).toBe(current);
   });
+
+  it('leaves the check to the next handler when build-meta.json cannot be read, then invalidates', async () => {
+    const metaKey = 'environments/pr-42/build-meta.json';
+    store[metaKey] = JSON.stringify({ buildId: 'build-A', timestamp: 1 });
+    mockGenerationId = 'build-B';
+    failingReads.add(metaKey);
+
+    await new GcsCacheHandler({} as any).get('k');
+
+    // Not treated as a first run: no new generation recorded, nothing wiped or purged yet.
+    expect(JSON.parse(store[metaKey]).buildId).toBe('build-A');
+    expect(mockBucket.getFiles).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+
+    failingReads.delete(metaKey);
+    await new GcsCacheHandler({} as any).get('k');
+
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-42/route-cache/' });
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/rest/v0alpha1/cache'),
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+  });
+
+  it('treats build-meta.json that is not valid JSON as a different build', async () => {
+    const metaKey = 'environments/pr-42/build-meta.json';
+    store[metaKey] = 'not json';
+    mockGenerationId = 'build-A';
+
+    await new GcsCacheHandler({} as any).get('k');
+
+    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-42/route-cache/' });
+    expect(fetch).toHaveBeenCalled();
+    expect(JSON.parse(store[metaKey]).buildId).toBe('build-A');
+  });
 });
 
 describe('FileCacheHandler build invalidation', () => {
@@ -130,5 +170,39 @@ describe('FileCacheHandler build invalidation', () => {
     expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8')).buildId).toBe(
       stored === undefined || invalidates ? current : stored
     );
+  });
+
+  function setUp(meta: (metaFile: string) => void) {
+    const metaFile = path.join(tempDir, '.cache', 'build-meta.json');
+    const sentinel = path.join(tempDir, '.next', 'cache', 'route-cache', 'sentinel.json');
+    fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+    fs.writeFileSync(sentinel, '{}');
+    fs.mkdirSync(path.dirname(metaFile), { recursive: true });
+    meta(metaFile);
+    return { metaFile, sentinel };
+  }
+
+  it('treats build metadata that is not valid JSON as a different build', async () => {
+    const { metaFile, sentinel } = setUp((f) => fs.writeFileSync(f, 'not json'));
+    mockGenerationId = 'build-A';
+
+    new FileCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(fs.existsSync(sentinel)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8')).buildId).toBe('build-A');
+  });
+
+  it('does not treat unreadable build metadata as a first run', async () => {
+    // A directory where the file should be: reading it fails with EISDIR, not ENOENT.
+    const { sentinel } = setUp((f) => fs.mkdirSync(f));
+    mockGenerationId = 'build-A';
+    const writeBuildMeta = vi.spyOn(FileCacheHandler.prototype as any, 'writeBuildMeta');
+
+    new FileCacheHandler({} as any);
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(writeBuildMeta).not.toHaveBeenCalled();
+    expect(fs.existsSync(sentinel)).toBe(true);
   });
 });

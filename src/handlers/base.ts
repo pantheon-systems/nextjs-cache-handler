@@ -152,7 +152,8 @@ export abstract class BaseCacheHandler {
     cacheType: CacheEntryType
   ): Promise<void>;
 
-  protected abstract readBuildMeta(): Promise<BuildMeta>;
+  /** The stored build metadata, or null when none is stored. Throws when it can't be read. */
+  protected abstract readBuildMeta(): Promise<BuildMeta | null>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
   protected abstract invalidateRouteCache(): Promise<void>;
 
@@ -213,20 +214,39 @@ export abstract class BaseCacheHandler {
     const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
     const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
 
+    let buildMeta: BuildMeta | null;
     try {
-      const buildMeta = await this.readBuildMeta();
+      buildMeta = await this.readBuildMeta();
+    } catch (error) {
+      // Not a first run: the previous generation is unknown, so the check
+      // (and any wipe and purge) is left to the next handler.
+      this.log.warn('Could not read build metadata; the build check is retried on the next request:', error);
+      throw error;
+    }
 
-      if (buildMeta.buildId !== currentBuildId) {
-        this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
-
-        await this.invalidateRouteCache();
-        await this.onNewGeneration(buildMeta);
-
-        await this.writeBuildMeta(currentMeta);
-      }
-    } catch {
-      // No previous build metadata - first run, just save current build ID
+    if (!buildMeta) {
+      // First run: nothing to invalidate.
       await this.writeBuildMeta(currentMeta);
+      return;
+    }
+
+    if (buildMeta.buildId !== currentBuildId) {
+      this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
+
+      await this.invalidateRouteCache();
+      await this.onNewGeneration(buildMeta);
+
+      await this.writeBuildMeta(currentMeta);
+    }
+  }
+
+  /** Stored build metadata that isn't valid JSON counts as an unknown previous generation. */
+  protected parseBuildMeta(data: string): BuildMeta {
+    try {
+      return JSON.parse(data) as BuildMeta;
+    } catch {
+      this.log.warn('Stored build metadata is not valid JSON; treating it as a different build');
+      return { buildId: '', timestamp: 0 };
     }
   }
 

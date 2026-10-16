@@ -45,6 +45,22 @@ describe('tags-manifest compatibility', () => {
   });
 
   describe.runIf(nextMajor === 15)('on Next.js 15', () => {
+    it("applies a soft revalidation made on Next.js 16, which keeps the tag's earlier expiry", () => {
+      const earlier = Date.now() - 60_000;
+      const now = Date.now();
+      setTagRevalidation('posts', { stale: now, expired: earlier });
+
+      expect(next.tagsManifest.get('posts')).toBe(now);
+      expect(next.isStale?.(['posts'], now - 1000)).toBe(true);
+    });
+
+    it('applies a soft revalidation whose expiry is still ahead from when it was made', () => {
+      const now = Date.now();
+      setTagRevalidation('posts', { stale: now, expired: now + 60_000 });
+
+      expect(next.tagsManifest.get('posts')).toBe(now);
+    });
+
     it("records the expiry as a timestamp, which Next's own isStale reads", () => {
       const now = Date.now();
       setTagRevalidation('posts', { expired: now });

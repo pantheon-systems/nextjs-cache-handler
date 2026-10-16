@@ -41,6 +41,7 @@ import {
   type SiteUrlConfig,
 } from '../utils/site-urls.js';
 import { isBuildPhase } from '../utils/build-detection.js';
+import { toObjectName } from '../utils/object-names.js';
 import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
@@ -352,14 +353,13 @@ export class GcsCacheHandler extends BaseCacheHandler {
   // ============================================================================
 
   private getCacheKey(cacheKey: string, cacheType: CacheEntryType): string {
-    const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
     const prefix =
       cacheType === 'fetch'
         ? this.fetchCachePrefix
         : cacheType === 'image'
           ? this.imageCachePrefix
           : this.routeCachePrefix;
-    return `${prefix}${safeKey}.json`;
+    return `${prefix}${toObjectName(cacheKey)}.json`;
   }
 
   protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
@@ -405,10 +405,17 @@ export class GcsCacheHandler extends BaseCacheHandler {
   // Build meta implementation
   // ============================================================================
 
-  protected async readBuildMeta(): Promise<BuildMeta> {
-    const file = this.bucket.file(this.buildMetaKey);
-    const [data] = await file.download();
-    return JSON.parse(data.toString());
+  protected async readBuildMeta(): Promise<BuildMeta | null> {
+    let data: Buffer;
+    try {
+      [data] = await this.bucket.file(this.buildMetaKey).download();
+    } catch (error) {
+      if (isNotFound(error)) {
+        return null;
+      }
+      throw error;
+    }
+    return this.parseBuildMeta(data.toString());
   }
 
   protected async writeBuildMeta(meta: BuildMeta): Promise<void> {
@@ -425,8 +432,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const deletePromises = files.map((file) => file.delete());
       await Promise.all(deletePromises);
 
-      // Awaited (unlike the ordinary tag-revalidation path below, which uses
-      // the fire-and-forget clearEdgeCache()/nukeCacheInBackground): this runs
+      // Awaited, unlike the background purges elsewhere: this runs
       // during startup-time build invalidation, which get()/set() now block
       // on via ensureInitialized() before touching the store. Awaiting here
       // means the edge purge request has actually been ISSUED (not just
@@ -447,15 +453,6 @@ export class GcsCacheHandler extends BaseCacheHandler {
   // ============================================================================
   // Edge cache integration
   // ============================================================================
-
-  private clearEdgeCache(context: string): void {
-    if (!this.edgeCacheClearer) {
-      this.log.debug(`Edge cache clearer not configured, skipping edge cache clear for: ${context}`);
-      return;
-    }
-
-    this.edgeCacheClearer.nukeCacheInBackground(context);
-  }
 
   /**
    * Prune revalidations older than the previous build. Only `fetch` entries

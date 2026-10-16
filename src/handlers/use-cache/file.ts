@@ -5,6 +5,7 @@ import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/st
 import { getBuildStore } from './build-store.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
+import { toObjectName } from '../../utils/object-names.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
 const log = createLogger('UseCacheFileHandler');
 
@@ -83,9 +84,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   private getCacheFilePath(cacheKey: string): string {
-    // Sanitize cache key for filesystem
-    const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    return safeJoin(this.cacheDir, `${safeKey}.json`);
+    return safeJoin(this.cacheDir, `${toObjectName(cacheKey)}.json`);
   }
 
   /**

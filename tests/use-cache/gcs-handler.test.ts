@@ -800,6 +800,50 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('build check', () => {
+    const buildMetaSaves = () =>
+      mockFile.save.mock.calls.filter(([json]) => {
+        const parsed = JSON.parse(json as string);
+        return 'buildId' in parsed && !('value' in parsed);
+      });
+
+    it('retries the build check when _build-meta.json cannot be read, without recording the generation', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      mockFile.download.mockRejectedValue(Object.assign(new Error('Service unavailable'), { code: 503 }));
+
+      const handler = new UseCacheGcsHandler();
+      await handler.get('k', []);
+
+      expect(buildMetaSaves()).toHaveLength(0);
+      expect(fetch).not.toHaveBeenCalled();
+
+      // GCS recovers and holds another build's metadata: the next read runs the check.
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ buildId: 'old-build', timestamp: 1 }))]);
+      await handler.get('k', []);
+
+      expect(fetch).toHaveBeenCalledWith(
+        'http://proxy.example.com:8080/rest/v0alpha1/cache',
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(buildMetaSaves()).toHaveLength(1);
+    });
+
+    it('treats _build-meta.json that is not valid JSON as a different build', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      mockFile.download.mockResolvedValue([Buffer.from('not json')]);
+
+      await new UseCacheGcsHandler().get('k', []);
+
+      expect(fetch).toHaveBeenCalledWith(
+        'http://proxy.example.com:8080/rest/v0alpha1/cache',
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(buildMetaSaves()).toHaveLength(1);
+    });
+  });
+
   describe('cache key sanitization', () => {
     it('should handle keys with special characters', async () => {
       mockFile.exists.mockResolvedValue([false]);
@@ -807,8 +851,10 @@ describe('UseCacheGcsHandler', () => {
       const handler = new UseCacheGcsHandler();
       await handler.get('/api/cache/test?param=value', []);
 
-      // Key should be sanitized
-      expect(mockBucket.file).toHaveBeenCalledWith('use-cache/_api_cache_test_param_value.json');
+      // Sanitized, plus a hash of the full key so similar keys don't share an object
+      expect(mockBucket.file).toHaveBeenCalledWith(
+        expect.stringMatching(/^use-cache\/_api_cache_test_param_value-[0-9a-f]{16}\.json$/)
+      );
     });
   });
 });

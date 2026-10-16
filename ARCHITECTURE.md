@@ -52,7 +52,8 @@ flowchart LR
   revalidation timestamp on Next.js 15, which has no stale-but-served state: every revalidation
   expires the tag at once. `src/utils/tags-manifest.ts` reads and writes whichever format the
   running Next.js uses; `revalidations.json` keeps the 16 shape on both, and an instance on 15
-  applies an entry by its `expired` time, or its `stale` time when it has none.
+  applies an entry by the later of its `stale` and `expired` times that has passed, or by `stale`
+  when neither has (a soft revalidation from 16 keeps the tag's earlier `expired`).
 - `servedAt` holds the public paths this process served from GCS entries, up to 5000 (the oldest
   are dropped first). It is filled only when `OUTBOUND_PROXY_ENDPOINT` is set, and never for
   images or build-prerender hits. Its only use is deciding which pages to purge when this process
@@ -61,13 +62,14 @@ flowchart LR
   default). A memory hit skips the GCS round trip but goes through the same tag and revalidate
   expiry checks.
 - Build-time prerendered pages are not in GCS. They are served from `.next/server` when GCS
-  misses (`base.ts:385`), and their tags are indexed per process from the build output
+  misses (`base.ts:405`), and their tags are indexed per process from the build output
   (`loadBuildPrerenderTags`), never written to `tags.json`.
 - The CDN caches whatever `Cache-Control` Next sends (for a static page, `s-maxage=31536000`); the
   handler never changes that header. Before its `s-maxage` runs out, only a purge makes the CDN
   drop an entry. Nothing ties a CDN entry to the GCS entry it came from.
-- `KEY` in an object name is the cache key with every character outside `[a-zA-Z0-9-]` replaced
-  by `_` (`gcs.ts:355`, `use-cache/gcs.ts:346`), so different keys can share one object (section 6).
+- `KEY` in an object name is the cache key itself when it has only `[a-zA-Z0-9-]` (fetch and image
+  keys). Any other key is sanitized to those characters and suffixed with a hash of the full key
+  (`src/utils/object-names.ts`), so keys that sanitize alike still get their own objects.
 
 ## 2. Serving and storing a page
 
@@ -167,11 +169,11 @@ What each step depends on:
 
 | Step | Code | If it fails or is late |
 |---|---|---|
-| Store revalidation | `shared-revalidations.ts`, `base.ts:562` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:546`). Other instances keep serving the old page until it lands. |
-| Read tags map | `gcs.ts:309` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
-| First purge | `gcs.ts:596` (`purgeTags`), `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
-| Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `gcs.ts:551` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
-| Second purge | `gcs.ts:532-547`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
+| Store revalidation | `shared-revalidations.ts`, `base.ts:582` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:543`). Other instances keep serving the old page until it lands. |
+| Read tags map | `gcs.ts:310` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
+| First purge | `gcs.ts:593` (`purgeTags`), `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
+| Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `gcs.ts:548` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
+| Second purge | `gcs.ts:529-544`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
 
 Pages Router entries carry no tags (Next writes `x-next-cache-tags` only for App Router
 pages and route handlers), so no tag finds them and these purges include no data routes or
@@ -180,7 +182,7 @@ purge (section 4).
 
 `use cache` entries are invalidated separately: Next calls the `use cache` handler's `updateTags`
 (Next.js 16) or `expireTags` (Next.js 15, which calls `updateTags`), which writes
-`use-cache/_tags.json` timestamps (`use-cache/gcs.ts:590`). It ignores `durations`, so a soft
+`use-cache/_tags.json` timestamps (`use-cache/gcs.ts:603`). It ignores `durations`, so a soft
 `revalidateTag(tag, profile)` expires `use cache` entries at once. That handler sends no
 CDN purges for tags; the route handler's purge above covers the pages.
 
@@ -200,13 +202,13 @@ Other instances' `use cache` reads see the invalidation two ways:
 ```mermaid
 flowchart TB
   subgraph triggers["Triggers"]
-    t1["revalidateTag / revalidatePath<br/>onRevalidateComplete, gcs.ts:512"]
-    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts:622"]
-    t3["tags.json flush finds keys whose tag<br/>was revalidated before they landed<br/>purgeMissedRevalidations, gcs.ts:117"]
-    t4["New generation on first request<br/>route handler: base.ts:222 → gcs.ts:422"]
-    t5["New generation on first request,<br/>or getUseCacheStats()<br/>use cache handler: use-cache/gcs.ts:174"]
-    t6["clearSharedCache(), if it deleted entries<br/>gcs.ts:745"]
-    t8["Another instance's revalidation is read<br/>purgeServedAfterRevalidation, gcs.ts:551"]
+    t1["revalidateTag / revalidatePath<br/>onRevalidateComplete, gcs.ts:509"]
+    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts:619"]
+    t3["tags.json flush finds keys whose tag<br/>was revalidated before they landed<br/>purgeMissedRevalidations, gcs.ts:118"]
+    t4["New generation on first request<br/>route handler: base.ts:236 → gcs.ts:429"]
+    t5["New generation on first request,<br/>or getUseCacheStats()<br/>use cache handler: use-cache/gcs.ts:176"]
+    t6["clearSharedCache(), if it deleted entries<br/>gcs.ts:742"]
+    t8["Another instance's revalidation is read<br/>purgeServedAfterRevalidation, gcs.ts:548"]
     t7["Public API: clearEdgeCachePaths()<br/>clearEdgeCache(), index.ts"]
   end
 
@@ -237,7 +239,7 @@ Request shapes (`edge-cache-clear.ts`):
 | Key (tag) | `DELETE /rest/v0alpha1/cache/keys/<seg>` | `encodeURIComponent` twice |
 | Full | `DELETE /rest/v0alpha1/cache` | – |
 
-Path requests per ISR regeneration (`onRouteCacheSet`, `gcs.ts:622`), one `DELETE` each:
+Path requests per ISR regeneration (`onRouteCacheSet`, `gcs.ts:619`), one `DELETE` each:
 
 | Entry | Paths purged | Requests |
 |---|---|---|
@@ -253,7 +255,7 @@ as `/what?`) and with the trailing slash Next serves. `clearEdgeCachePaths()` ap
 same trailing-slash rule to the paths a caller passes and also drops any query string or
 fragment, since the CDN keys a page by its path alone.
 
-What gets grouped today: paths are deduplicated per revalidation (`gcs.ts:582`) and per
+What gets grouped today: paths are deduplicated per revalidation (`gcs.ts:579`) and per
 `clearPaths` call, and second purges due within 1 s of each other are merged per target
 (`delayed-purges.ts`). Nothing else is merged across calls. Nothing limits requests in
 flight or per second either; per-tenant limits are left to the platform.
@@ -270,16 +272,18 @@ sequenceDiagram
 
   N->>N: generation = BUILD_ID[:deploymentId]<br/>(fallback-NOW if neither .next/BUILD_ID nor a build ID in .next/build-manifest.json is readable from the working directory)
   N->>G: read build-meta.json
-  alt generation differs
+  alt generation differs (or the stored metadata is not valid JSON)
     N->>G: delete route-cache/* (one request per object, all at once)
     N->>P: full purge (awaited, before serving), skipped if any delete failed
     P->>CDN: purge everything
     N->>G: prune revalidations.json to those since the previous build was built, deleting fetch-cache entries under the pruned tags first (background, skipped if the previous build-meta.json has no builtAt)
     N->>G: write build-meta.json
-  else build-meta.json missing or unreadable
+  else build-meta.json missing
     N->>G: write build-meta.json (no wipe, no purge)
+  else build-meta.json cannot be read
+    N->>N: nothing written, the next handler runs the check again
   end
-  Note over N,G: The use cache handler checks use-cache/_build-meta.json the same way and sends its own full purge, so a deploy sends two full purges per starting process. It deletes no entries (each records its generation, and one from another generation is deleted when read) and rewrites _build-meta.json on every start.
+  Note over N,G: The use cache handler checks use-cache/_build-meta.json the same way and sends its own full purge, so a deploy sends two full purges per starting process. It deletes no entries (each records its generation, and one from another generation is deleted when read), rewrites _build-meta.json on every start, and retries the check on its next read or write when the file cannot be read.
 ```
 
 The check runs once per process, and any difference counts as a new generation, not only a newer
@@ -297,14 +301,12 @@ so each such cold start would wipe `route-cache/` and fully purge the CDN.
 |---|---|---|
 | Second and background purges run on timers | Late under request-based CPU; lost on shutdown without `flushSharedTagsMapping()`. Even with it, a second purge whose revalidation is stored only during the flush, and a `tags.json`-flush purge (`purgeMissedRevalidations`) that is already due, are started but not awaited. The purge each instance sends when it learns of a revalidation covers most of this | README "Revalidations across processes" |
 | Revalidation first seen on an instance's first read of `revalidations.json` | That instance sends no purge for pages it served before, or while, its first read was in flight (`get()` serves after 2 s without waiting for the read to finish). Only the second purge covers them | – |
-| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path in `base.ts:409`, not on the prerender return at `base.ts:388`. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
+| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path in `base.ts:429`, not on the prerender return at `base.ts:408`. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
 | `use cache` tag reload is background | A tag revalidated on another instance can be missed by this instance's `use cache` reads for up to about one refresh interval plus the reload's GCS round trip (see below) | README `CACHE_TAGS_REFRESH_INTERVAL_MS` |
 | GCS stall longer than the second-purge delay | An instance still serving without the revalidation can re-cache the old page after the last purge | – |
-| `build-meta.json` read fails on a deploy | Any read error, not only a missing object, is treated as a first run: the new generation is written without wiping `route-cache/` or purging the CDN, and no later process retries (`base.ts:228`). The use cache handler does the same | – |
-| Route-cache wipe fails part-way | One failed delete skips the full purge, with nothing logged (`gcs.ts:442`). Old pages stay in the CDN and, where not deleted, in GCS | – |
+| Route-cache wipe fails part-way | One failed delete skips the full purge, with nothing logged (`gcs.ts:448`). Old pages stay in the CDN and, where not deleted, in GCS | – |
 | `build-meta.json` write fails | The check is retried by the next handler, so each request wipes `route-cache/` and purges the CDN again until a write succeeds | – |
 | Two revisions serving at once | Cold starts on either revision wipe and fully purge in turn, and old instances can store old pages after the new revision's purge (section 5) | – |
-| GCS object names are lossy | Keys differing only in characters outside `[a-zA-Z0-9-]` (`/docs/a/b`, `/docs/a_b`, `/docs/a.b` under one catch-all route) share an object, and reads don't check the stored key, so one URL can be served another's page | – |
 | GCS read and write failures | A failed read is a silent miss, so the page re-renders. A failed write is logged, but `set()` still records the tags and sends the ISR purge for an entry that was not stored | – |
 | Pending `tags.json` additions dropped | After 10 minutes of failed flushes, or at shutdown without `flushSharedTagsMapping()`, the keys are dropped and later revalidations of their tags don't purge those pages | README "How the mapping is written to GCS" |
 | `tags.json` never loses route keys | Route keys are only ever added, so the object grows across deploys, every revalidation downloads all of it, and purges include paths that no longer exist | – |
@@ -313,7 +315,6 @@ so each such cold start would wipe `route-cache/` and fully purge the CDN.
 | Some full-purge failures leave no trace | `nukeCache()` does not log, and the full purge for `revalidatePath('/', 'layout')` and second full purges ignore its result | – |
 | Learned-revalidation purge limits | Needs `OUTBOUND_PROXY_ENDPOINT` (no `servedAt` otherwise) and forgets paths past the 5000 most recent. For `revalidatePath('/', 'layout')` it can send one `DELETE` per remembered path, all at once | – |
 | `clearSharedCache()` | Purges the CDN only if it deleted entries. It deletes `tags.json` while the static-route entries it keeps stay, so revalidations no longer find them. It leaves `use-cache/` and `revalidations.json` | – |
-| Mixed Next.js 15 and 16 instances on one bucket | A soft revalidation made on 16 keeps the tag's earlier `expired`, and an instance on 15 applies `expired` before `stale`, so it misses the new revalidation (only while both versions serve, such as an upgrade rollout) | – |
 
 More on the `use cache` gap. A read on this instance can return outdated data when all of these hold:
 

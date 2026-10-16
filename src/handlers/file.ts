@@ -13,6 +13,7 @@ import { getStaticRoutes } from '../utils/static-routes.js';
 import { TagsBuffer } from '../utils/tags-buffer.js';
 import { createLogger } from '../utils/logger.js';
 import { safeJoin } from '../utils/path-safety.js';
+import { toObjectName } from '../utils/object-names.js';
 
 const fileLog = createLogger('FileCacheHandler');
 
@@ -155,12 +156,11 @@ export class FileCacheHandler extends BaseCacheHandler {
   // ============================================================================
 
   private getCacheFilePath(cacheKey: string, cacheType: CacheEntryType): string {
-    const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
     const dir =
       cacheType === 'fetch' ? this.fetchCacheDir : cacheType === 'image' ? this.imageCacheDir : this.routeCacheDir;
     // safeJoin guarantees the resolved path stays within the cache directory,
     // in addition to the character sanitization applied to the key above.
-    return safeJoin(dir, `${safeKey}.json`);
+    return safeJoin(dir, `${toObjectName(cacheKey)}.json`);
   }
 
   protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
@@ -193,9 +193,17 @@ export class FileCacheHandler extends BaseCacheHandler {
   // Build meta implementation
   // ============================================================================
 
-  protected async readBuildMeta(): Promise<BuildMeta> {
-    const data = await readFile(this.buildMetaFile, 'utf-8');
-    return JSON.parse(data);
+  protected async readBuildMeta(): Promise<BuildMeta | null> {
+    let data: string;
+    try {
+      data = await readFile(this.buildMetaFile, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    }
+    return this.parseBuildMeta(data);
   }
 
   protected async writeBuildMeta(meta: BuildMeta): Promise<void> {
