@@ -2,6 +2,13 @@
 
 Custom cache handler for Next.js with support for Google Cloud Storage and file-based caching. Designed for Pantheon's Next.js hosting platform.
 
+## Supported versions
+
+[![Next.js 15](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-15.yml/badge.svg?branch=main&event=push)](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-15.yml?query=branch%3Amain)
+[![Next.js 16](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-16.yml/badge.svg?branch=main&event=push)](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-16.yml?query=branch%3Amain)
+
+Each badge shows whether the tests on `main` pass against the newest Next.js 15 and 16 releases.
+
 ## Features
 
 - **Dual Cache Handlers**: Support for both GCS (production) and file-based (development) caching

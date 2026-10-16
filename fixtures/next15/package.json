@@ -1,0 +1,26 @@
+{
+  "name": "nextjs-cache-handler-fixture-next15",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Next.js 15 app that runs example/integration against this package.",
+  "scripts": {
+    "build": "next build",
+    "start": "next start",
+    "test:integration": "jest"
+  },
+  "dependencies": {
+    "@pantheon-systems/nextjs-cache-handler": "file:../../",
+    "next": "^15.5.28",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "jest": "^30.5.2",
+    "ts-jest": "^29.4.14",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,97 @@
+name: Tests
+
+# Called once per supported Next.js major (next-15.yml, next-16.yml), so each
+# major has its own workflow and README badge. Each run tests the newest release
+# of that major, not the version in the lockfiles.
+on:
+  workflow_call:
+    inputs:
+      next:
+        description: Next.js major to test against
+        required: true
+        type: string
+      app:
+        description: App directory the integration tests build and serve
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# An explicit shell runs with pipefail, so `... | tee` steps fail when the command does.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install the newest Next.js ${{ inputs.next }}
+        run: |
+          npm install --no-save --no-audit --no-fund "next@${{ inputs.next }}"
+          echo "Testing against next@$(node -p "require('next/package.json').version")" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run root tests
+        run: npm test
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            ${{ inputs.app }}/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      # Installed from a tarball, the handler resolves the app's own `next`. A
+      # `file:` symlink would resolve the repo root's Next.js 16 instead.
+      - name: Pack the handler
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+
+      - name: Install app dependencies
+        working-directory: ${{ inputs.app }}
+        run: npm ci
+
+      - name: Install the packed handler and the newest Next.js ${{ inputs.next }}
+        working-directory: ${{ inputs.app }}
+        run: |
+          npm install --no-save --no-audit --no-fund "$RUNNER_TEMP"/pantheon-systems-nextjs-cache-handler-*.tgz "next@${{ inputs.next }}"
+          node -e "
+            const { createRequire } = require('module');
+            const app = require('next/package.json').version;
+            const handler = createRequire(require.resolve('@pantheon-systems/nextjs-cache-handler'))('next/package.json').version;
+            if (app !== handler || !app.startsWith('${{ inputs.next }}.')) {
+              console.error('Expected next@${{ inputs.next }}.x for both; the app loads next@' + app + ', the handler next@' + handler);
+              process.exit(1);
+            }
+            console.log('Testing against next@' + app);
+          " | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run integration tests
+        working-directory: ${{ inputs.app }}
+        run: npm run test:integration
