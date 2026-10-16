@@ -55,7 +55,8 @@ flowchart LR
   applies an entry by the later of its `stale` and `expired` times that has passed, or by `stale`
   when neither has (a soft revalidation from 16 keeps the tag's earlier `expired`). A time still
   ahead of this instance's clock is recorded as now: Next.js 15 expires every entry older than
-  the timestamp, with no check that it has passed.
+  the timestamp, with no check that it has passed. A time older than the one recorded leaves the
+  recorded one in place, so entries it expired stay expired.
 - `get()` returns a miss for an entry carrying a tag revalidated after the entry was written. For
   pages, route handlers and Pages Router entries the tags come from the entry. For `fetch` and
   `unstable_cache` entries on Next.js 15 they are the fetch's tags plus the requesting route's
@@ -75,8 +76,10 @@ flowchart LR
   handler never changes that header. Before its `s-maxage` runs out, only a purge makes the CDN
   drop an entry. Nothing ties a CDN entry to the GCS entry it came from.
 - `KEY` in an object name is the cache key itself when it has only `[a-zA-Z0-9-]` (fetch and image
-  keys). Any other key is sanitized to those characters and suffixed with a hash of the full key
-  (`src/utils/object-names.ts`), so keys that sanitize alike still get their own objects.
+  keys) and at most 200 characters. Any other key is sanitized to those characters, cut to fit,
+  and suffixed with `_` and a hash of the full key (`src/utils/object-names.ts`), so keys that
+  sanitize or cut alike still get their own objects. 200 keeps file names under the 255-byte limit
+  most file systems set.
 
 ## 2. Serving and storing a page
 
