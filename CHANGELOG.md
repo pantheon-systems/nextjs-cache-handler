@@ -2,8 +2,16 @@
 
 ## 0.13.3
 
+### Added
+
+- CI runs the unit and integration tests against the newest Next.js 15 and 16 releases on every pull request.
+
 ### Fixed
 
+- The package works on Next.js 15 (15.5.28 and later). 0.13.2 imported Next.js 16-only modules and failed to load on 15, although its peer dependency allowed `next@>=14.0.0`. The peer dependency is now `next@>=15.5.28 <17.0.0`.
+- The `use cache` handlers accept Next.js 15's calls: `getExpiration(...tags)` with the tags spread as arguments, and `expireTags(...tags)`, which invalidates like `updateTags()`. `expireTags` is optional on the `UseCacheHandler` type, so existing implementations still compile.
+- Tag revalidations are recorded in the format the running Next.js reads: `{ stale, expired }` on 16, a single timestamp on 15. Writing the 16 format on 15 would make `revalidateTag()` invisible to Next's own tag checks. On Next.js 15 every revalidation is immediate; it has no stale-but-served state.
+- During `next build`, `use cache` entries use Next's in-memory default handler through `cache-handlers/default.external.js`, which exists on 15 and 16, instead of `createDefaultCacheHandler`, which is 16-only.
 - `clearEdgeCachePaths()` purges the trailing-slash URL on sites with `trailingSlash: true` (`/about/`, not `/about`). It used to drop the slash, so it missed the URL the CDN caches. Without `trailingSlash` it still drops it.
 - Regenerating a Pages Router page under `/index` (such as `pages/index/foo.js`) purges the data route Next serves, `/_next/data/<buildId>/index/index/foo.json`, not `/_next/data/<buildId>/index/foo.json`.
 - Regenerating a Pages Router page in a default locale also purges its URL without the locale prefix (`/blog` as well as `/en/blog`), which is where Next serves it. Default locales come from `i18n.defaultLocale` and each `i18n.domains` entry.

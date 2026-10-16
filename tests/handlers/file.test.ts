@@ -4,6 +4,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { FileCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/file.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { getTagRevalidation } from '../../src/utils/tags-manifest.js';
+import { hasStaleTags } from '../helpers/next-version.js';
 
 describe('FileCacheHandler', () => {
   let tempDir: string;
@@ -207,7 +209,7 @@ describe('FileCacheHandler', () => {
         await handler.revalidateTag('immediate-tag');
         const after = Date.now();
 
-        const entry = tagsManifest.get('immediate-tag');
+        const entry = getTagRevalidation('immediate-tag');
         expect(entry?.expired).toBeGreaterThanOrEqual(before);
         expect(entry?.expired).toBeLessThanOrEqual(after);
       });
@@ -217,7 +219,7 @@ describe('FileCacheHandler', () => {
         await handler.revalidateTag('soft-tag', { expire: 60 });
         const after = Date.now();
 
-        const entry = tagsManifest.get('soft-tag');
+        const entry = getTagRevalidation('soft-tag');
         expect(entry?.expired).toBeGreaterThanOrEqual(before + 60 * 1000);
         expect(entry?.expired).toBeLessThanOrEqual(after + 60 * 1000);
         // Confirms this is a genuinely future expiry, not an immediate one.
@@ -226,11 +228,11 @@ describe('FileCacheHandler', () => {
 
       it('preserves the existing expiry when durations is present but expire is undefined', async () => {
         await handler.revalidateTag('profile-tag', { expire: 120 });
-        const softExpired = tagsManifest.get('profile-tag')?.expired;
+        const softExpired = getTagRevalidation('profile-tag')?.expired;
 
         await handler.revalidateTag('profile-tag', {});
 
-        expect(tagsManifest.get('profile-tag')?.expired).toBe(softExpired);
+        expect(getTagRevalidation('profile-tag')?.expired).toBe(softExpired);
       });
     });
   });
@@ -272,7 +274,7 @@ describe('FileCacheHandler', () => {
       expect(await handler.get('/ctx-tags')).toBeNull();
     });
 
-    it('keeps returning a page whose tag is only stale', async () => {
+    it.skipIf(!hasStaleTags)('keeps returning a page whose tag is only stale', async () => {
       await handler.set('/stale-page', page('posts') as any, { tags: [] });
       await tick();
       await handler.revalidateTag('posts', { expire: 3600 });

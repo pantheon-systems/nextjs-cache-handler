@@ -424,9 +424,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
-   * Return maximum revalidation timestamp for given tags.
+   * Return maximum revalidation timestamp for given tags. Next.js 16 passes
+   * an array; Next.js 15 spreads the tags as arguments.
    */
-  async getExpiration(tags: string[]): Promise<number> {
+  async getExpiration(...args: (string | string[])[]): Promise<number> {
+    const tags = args.flat();
     let maxTimestamp = 0;
 
     for (const tag of tags) {
@@ -438,6 +440,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     log.debug(`GET EXPIRATION for [${tags.join(', ')}]: ${maxTimestamp}`);
     return maxTimestamp;
+  }
+
+  /** Next.js 15's name for {@link updateTags}, with the tags spread as arguments. */
+  async expireTags(...tags: string[]): Promise<void> {
+    await this.updateTags(tags, []);
   }
 
   /**

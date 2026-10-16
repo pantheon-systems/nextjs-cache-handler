@@ -14,7 +14,7 @@ import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js'
 import { createLogger, type Logger } from '../utils/logger.js';
 import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
 import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
-import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { areTagsExpired, getTagRevalidation, setTagRevalidation } from '../utils/tags-manifest.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
 let buildInvalidationPromise: Promise<void> | null = null;
@@ -543,7 +543,7 @@ export abstract class BaseCacheHandler {
     const now = Date.now();
     const revalidations: SharedRevalidationMap = {};
     for (const currentTag of tagArray) {
-      const existingEntry = tagsManifest.get(currentTag) ?? {};
+      const existingEntry = getTagRevalidation(currentTag) ?? {};
       let updates: { stale?: number; expired?: number };
       if (durations) {
         updates = { ...existingEntry, stale: now };
@@ -553,7 +553,7 @@ export abstract class BaseCacheHandler {
       } else {
         updates = { ...existingEntry, expired: now };
       }
-      tagsManifest.set(currentTag, updates);
+      setTagRevalidation(currentTag, updates);
       revalidations[currentTag] = { ...updates, at: now };
     }
 

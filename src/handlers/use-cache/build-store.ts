@@ -1,8 +1,7 @@
-import { createDefaultCacheHandler } from 'next/dist/server/lib/cache-handlers/default.js';
+// default.external.js exists in Next.js 15 and 16; default.js and its
+// createDefaultCacheHandler factory are 16+ only.
+import defaultCacheHandlerModule from 'next/dist/server/lib/cache-handlers/default.external.js';
 import type { UseCacheEntry } from './types.js';
-
-// Next's own default size (cacheMaxMemorySize).
-const BUILD_STORE_MAX_SIZE = 50 * 1024 * 1024;
 
 export interface BuildStore {
   get(cacheKey: string, softTags: string[]): Promise<UseCacheEntry | undefined>;
@@ -10,6 +9,9 @@ export interface BuildStore {
 }
 
 let store: BuildStore | null = null;
+// Next's handler is a process-wide singleton, so a test reset starts a new
+// key namespace instead of a new store.
+let generation = 0;
 
 // Next skips storing an `expire: 0` entry, so a failed render stores nothing.
 const NOTHING_TO_STORE: UseCacheEntry = {
@@ -28,14 +30,19 @@ const NOTHING_TO_STORE: UseCacheEntry = {
  */
 export function getBuildStore(): BuildStore {
   if (!store) {
-    const next = createDefaultCacheHandler(BUILD_STORE_MAX_SIZE) as unknown as BuildStore;
+    // CJS module: imported from ESM the handler surfaces as `.default`, from a
+    // bundler with __esModule interop as the import itself. Either way it is
+    // Next's 50 MB in-memory handler (its cacheMaxMemorySize default).
+    const mod = defaultCacheHandlerModule as unknown as BuildStore & { default?: BuildStore };
+    const next = mod.default ?? mod;
+    const prefix = generation === 0 ? '' : `${generation}:`;
     store = {
-      get: (cacheKey, softTags) => next.get(cacheKey, softTags),
+      get: (cacheKey, softTags) => next.get(prefix + cacheKey, softTags),
       // Next's set() awaits the entry outside its try, so a rejected render
       // would throw and leave later get()s for the key waiting forever.
       set: (cacheKey, pendingEntry) =>
         next.set(
-          cacheKey,
+          prefix + cacheKey,
           pendingEntry.catch(() => NOTHING_TO_STORE)
         ),
     };
@@ -46,4 +53,5 @@ export function getBuildStore(): BuildStore {
 /** @internal Test hook. */
 export function resetBuildStoreForTests(): void {
   store = null;
+  generation++;
 }

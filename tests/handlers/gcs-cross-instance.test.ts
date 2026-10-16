@@ -15,6 +15,7 @@ vi.mock('@google-cloud/storage', () => ({
 }));
 
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { hasStaleTags } from '../helpers/next-version.js';
 import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
@@ -125,7 +126,7 @@ describe('GcsCacheHandler across instances', () => {
       expect(Date.now() - started).toBeLessThan(2500);
     });
 
-    it('marks the entry stale, not expired, for a soft revalidation', async () => {
+    it.skipIf(!hasStaleTags)('marks the entry stale, not expired, for a soft revalidation', async () => {
       const handler = newHandler();
       await handler.set('/route-cache/APP_PAGE/h/$/tags', page(['inventory']) as any, { tags: [] } as any);
       const at = Date.now() + 5;

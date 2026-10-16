@@ -334,6 +334,31 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('Next.js 15 calling convention', () => {
+    it('getExpiration accepts tags spread as arguments', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      const handler = new UseCacheGcsHandler();
+      await handler.updateTags(['tag1'], [0]);
+
+      const spread = await handler.getExpiration('tag1', 'tag2');
+      expect(spread).toBeGreaterThan(0);
+      expect(spread).toBe(await handler.getExpiration(['tag1', 'tag2']));
+    });
+
+    it('expireTags invalidates like updateTags', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      const handler = new UseCacheGcsHandler();
+
+      const before = Date.now();
+      await handler.expireTags('blog', 'posts');
+
+      expect(await handler.getExpiration('blog')).toBeGreaterThanOrEqual(before);
+      expect(await handler.getExpiration('posts')).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe('updateTags', () => {
     it('should save tag timestamps to GCS', async () => {
       mockFile.exists.mockResolvedValue([true]);

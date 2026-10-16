@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach, type MockInstance } from 'vitest';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { SharedRevalidations, resolveTagsRefreshIntervalMs } from '../../src/utils/shared-revalidations.js';
+import { getTagRevalidation } from '../../src/utils/tags-manifest.js';
+import { hasStaleTags } from '../helpers/next-version.js';
 import { FakeBucket } from '../helpers/fake-bucket.js';
 
 const KEY = 'cache/tags/revalidations.json';
@@ -27,7 +29,7 @@ describe('SharedRevalidations', () => {
 
     await store().refresh();
 
-    expect(tagsManifest.get('posts')).toEqual({ expired: 1000 });
+    expect(getTagRevalidation('posts')).toEqual({ expired: 1000 });
   });
 
   it('keeps the latest revalidation of a tag, even when it expires sooner', async () => {
@@ -38,7 +40,8 @@ describe('SharedRevalidations', () => {
 
     await store().refresh();
 
-    expect(tagsManifest.get('posts')).toEqual({ stale: 1000, expired: 2000 });
+    // Next.js 15 keeps one timestamp per tag: the expiry.
+    expect(getTagRevalidation('posts')).toEqual(hasStaleTags ? { stale: 1000, expired: 2000 } : { expired: 2000 });
   });
 
   it('merges concurrent writers instead of overwriting', async () => {
@@ -84,7 +87,7 @@ describe('SharedRevalidations', () => {
     await vi.runAllTimersAsync();
     expect(await recorded).toBe(false);
     // Still applied locally.
-    expect(tagsManifest.get('posts')).toEqual({ expired: 1 });
+    expect(getTagRevalidation('posts')).toEqual({ expired: 1 });
 
     bucket.failWrites.delete(KEY);
     await writer.refresh(true);

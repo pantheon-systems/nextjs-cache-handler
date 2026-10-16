@@ -46,6 +46,11 @@ flowchart LR
   clearer --> cdn
 ```
 
+- Next's `tagsManifest` holds `{ stale, expired }` per tag on Next.js 16 and a single
+  revalidation timestamp on Next.js 15, which has no stale-but-served state: every revalidation
+  expires the tag at once. `src/utils/tags-manifest.ts` reads and writes whichever format the
+  running Next.js uses; `revalidations.json` keeps the 16 shape on both, and an instance on 15
+  applies an entry by its `expired` time, or its `stale` time when it has none.
 - Build-time prerendered pages are **not** in GCS. They are served from `.next/server` when GCS
   misses (`base.ts:385`), and their tags are indexed per process from the build output
   (`loadBuildPrerenderTags`), never written to `tags.json`.
@@ -73,7 +78,7 @@ sequenceDiagram
     B->>B: apply revalidations to tagsManifest
     B->>G: read route-cache/KEY.json
     alt GCS hit, tags not expired
-      G-->>B: entry (served even if stale, while it regenerates)
+      G-->>B: entry (served even if stale, while it regenerates, Next.js 16 only)
     else GCS miss
       B->>FS: build prerender read-through
       FS-->>B: prerendered page, or nothing
@@ -106,7 +111,7 @@ sequenceDiagram
   participant CDN
 
   Caller->>A: revalidateTag('posts')
-  A->>A: tagsManifest: posts stale (or expired)
+  A->>A: tagsManifest: posts stale (or expired, always expired on Next.js 15)
   A->>G: write revalidations.json (batched 250 ms, retried ≤ 5 s)
   A->>G: read tags.json, overlay this process's unflushed keys
   A->>A: + build-prerender keys for the tag, + implicit _N_T_ paths
@@ -141,8 +146,9 @@ pages and route handlers), so no tag finds them and this purge has no data route
 unprefixed locale URLs. A Pages Router page is purged when it regenerates, by its ISR
 purge (section 4).
 
-`use cache` entries are invalidated separately: Next calls the `use cache` handler's `updateTags`,
-which writes `use-cache/_tags.json` timestamps (`use-cache/gcs.ts:452`). That handler sends no
+`use cache` entries are invalidated separately: Next calls the `use cache` handler's `updateTags`
+(Next.js 16) or `expireTags` (Next.js 15, which calls `updateTags`), which writes
+`use-cache/_tags.json` timestamps (`use-cache/gcs.ts:459`). That handler sends no
 CDN purges for tags; the route handler's purge above covers the pages.
 
 ## 4. Everything that sends a CDN purge
