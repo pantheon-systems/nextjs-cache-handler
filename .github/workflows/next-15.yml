@@ -1,0 +1,16 @@
+name: Next.js 15
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+    with:
+      next: '15'
+      app: fixtures/next15

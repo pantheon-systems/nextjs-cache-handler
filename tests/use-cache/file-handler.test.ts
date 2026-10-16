@@ -229,6 +229,27 @@ describe('UseCacheFileHandler', () => {
     });
   });
 
+  describe('Next.js 15 calling convention', () => {
+    it('getExpiration accepts tags spread as arguments', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+      await handler.updateTags(['tag1'], [0]);
+
+      const spread = await handler.getExpiration('tag1', 'tag2');
+      expect(spread).toBeGreaterThan(0);
+      expect(spread).toBe(await handler.getExpiration(['tag1', 'tag2']));
+    });
+
+    it('expireTags invalidates like updateTags', async () => {
+      const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });
+
+      const before = Date.now();
+      await handler.expireTags('blog', 'posts');
+
+      expect(await handler.getExpiration('blog')).toBeGreaterThanOrEqual(before);
+      expect(await handler.getExpiration('posts')).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe('updateTags', () => {
     it('should invalidate cache entries with matching tags', async () => {
       const handler = new UseCacheFileHandler({ cacheDir: testCacheDir });

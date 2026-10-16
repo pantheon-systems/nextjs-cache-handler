@@ -15,6 +15,7 @@ vi.mock('@google-cloud/storage', () => ({
 }));
 
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { hasStaleTags, nextMajor } from '../helpers/next-version.js';
 import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
@@ -125,7 +126,7 @@ describe('GcsCacheHandler across instances', () => {
       expect(Date.now() - started).toBeLessThan(2500);
     });
 
-    it('marks the entry stale, not expired, for a soft revalidation', async () => {
+    it.skipIf(!hasStaleTags)('marks the entry stale, not expired, for a soft revalidation', async () => {
       const handler = newHandler();
       await handler.set('/route-cache/APP_PAGE/h/$/tags', page(['inventory']) as any, { tags: [] } as any);
       const at = Date.now() + 5;
@@ -135,6 +136,50 @@ describe('GcsCacheHandler across instances', () => {
       // Served (Next serves it stale and regenerates); tagsManifest carries the staleness.
       expect(await newHandler().get('/route-cache/APP_PAGE/h/$/tags', { kind: 'APP_PAGE' } as any)).not.toBeNull();
       expect(tagsManifest.get('inventory')).toEqual({ stale: at, expired: at + 3_600_000 });
+    });
+
+    describe.runIf(nextMajor === 15)('on Next.js 15', () => {
+      const FETCH_KEY = 'fetch-key';
+      const fetchValue = { kind: 'FETCH', data: { headers: {}, body: '', url: '' }, revalidate: 3600 };
+      const fetchCtx = {
+        kind: 'FETCH',
+        fetchUrl: 'https://api.example.com/posts',
+        fetchIdx: 0,
+        revalidate: 3600,
+        tags: ['api-posts'],
+        softTags: [],
+      };
+
+      // Next.js 15's IncrementalCache leaves the tagsManifest check for fetches
+      // to its FileSystemCache.get, which this handler replaces.
+      it('stops serving a fetch entry whose tag another instance revalidated', async () => {
+        await newHandler().set(FETCH_KEY, fetchValue as any, { fetchCache: true, tags: ['api-posts'] } as any);
+        const at = Date.now() + 5;
+        bucket.putJson(REVALIDATIONS, { 'api-posts': { expired: at, at } });
+        await new Promise((r) => setTimeout(r, 20));
+
+        expect(await newHandler().get(FETCH_KEY, fetchCtx as any)).toBeNull();
+      });
+
+      // Next.js 15's isStale has no `<= now` guard, so a revalidation stamped by
+      // a clock that is ahead would mark the regenerated entry stale as well.
+      const aheadCases = [
+        { name: 'an expiry', revalidation: (ahead: number) => ({ expired: ahead, at: ahead }) },
+        { name: 'a soft revalidation', revalidation: (ahead: number) => ({ stale: ahead, at: ahead }) },
+      ];
+
+      for (const { name, revalidation } of aheadCases) {
+        it(`serves a page regenerated after learning ${name} from an instance whose clock is ahead`, async () => {
+          bucket.putJson(REVALIDATIONS, { inventory: revalidation(Date.now() + 3_000) });
+          // The first read learns the revalidation.
+          await newHandler().get('/route-cache/APP_PAGE/h/$/other', { kind: 'APP_PAGE' } as any);
+          await new Promise((r) => setTimeout(r, 5));
+
+          await newHandler().set('/route-cache/APP_PAGE/h/$/tags', page(['inventory']) as any, { tags: [] } as any);
+
+          expect(await newHandler().get('/route-cache/APP_PAGE/h/$/tags', { kind: 'APP_PAGE' } as any)).not.toBeNull();
+        });
+      }
     });
   });
 

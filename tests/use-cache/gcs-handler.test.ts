@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { setTagRevalidation } from '../../src/utils/tags-manifest.js';
+import { hasStaleTags } from '../helpers/next-version.js';
 import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
 
 // Mock file and bucket stored for access
@@ -331,25 +333,28 @@ describe('UseCacheGcsHandler', () => {
         const handler = new UseCacheGcsHandler();
         await handler.get('k', []);
 
-        tagsManifest.set('tag1', { expired: Date.now() });
+        setTagRevalidation('tag1', { expired: Date.now() });
         mockFile.exists.mockResolvedValue([false]);
 
         expect(await handler.get('k', [])).toBeUndefined();
       });
 
-      it('reports the revalidation from getExpiration, using the moment of a soft one', async () => {
-        const handler = new UseCacheGcsHandler();
-        const at = Date.now() - 500;
-        tagsManifest.set('soft', { stale: at, expired: Date.now() + 60_000 });
+      it.skipIf(!hasStaleTags)(
+        'reports the revalidation from getExpiration, using the moment of a soft one',
+        async () => {
+          const handler = new UseCacheGcsHandler();
+          const at = Date.now() - 500;
+          setTagRevalidation('soft', { stale: at, expired: Date.now() + 60_000 });
 
-        expect(await handler.getExpiration(['soft'])).toBe(at);
-      });
+          expect(await handler.getExpiration(['soft'])).toBe(at);
+        }
+      );
 
       it('ignores a revalidation older than the entry', async () => {
         mockFile.exists.mockResolvedValue([true]);
         mockFile.download.mockResolvedValue([Buffer.from(storedJson())]);
         const handler = new UseCacheGcsHandler();
-        tagsManifest.set('tag1', { expired: Date.now() - 10_000 });
+        setTagRevalidation('tag1', { expired: Date.now() - 10_000 });
 
         expect(await handler.get('k', [])).toBeDefined();
       });
@@ -582,6 +587,31 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('Next.js 15 calling convention', () => {
+    it('getExpiration accepts tags spread as arguments', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      const handler = new UseCacheGcsHandler();
+      await handler.updateTags(['tag1'], [0]);
+
+      const spread = await handler.getExpiration('tag1', 'tag2');
+      expect(spread).toBeGreaterThan(0);
+      expect(spread).toBe(await handler.getExpiration(['tag1', 'tag2']));
+    });
+
+    it('expireTags invalidates like updateTags', async () => {
+      mockFile.exists.mockResolvedValue([true]);
+      mockFile.download.mockResolvedValue([Buffer.from('{}')]);
+      const handler = new UseCacheGcsHandler();
+
+      const before = Date.now();
+      await handler.expireTags('blog', 'posts');
+
+      expect(await handler.getExpiration('blog')).toBeGreaterThanOrEqual(before);
+      expect(await handler.getExpiration('posts')).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe('updateTags', () => {
     it('should save tag timestamps to GCS', async () => {
       mockFile.exists.mockResolvedValue([true]);
@@ -770,6 +800,50 @@ describe('UseCacheGcsHandler', () => {
     });
   });
 
+  describe('build check', () => {
+    const buildMetaSaves = () =>
+      mockFile.save.mock.calls.filter(([json]) => {
+        const parsed = JSON.parse(json as string);
+        return 'buildId' in parsed && !('value' in parsed);
+      });
+
+    it('retries the build check when _build-meta.json cannot be read, without recording the generation', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      mockFile.download.mockRejectedValue(Object.assign(new Error('Service unavailable'), { code: 503 }));
+
+      const handler = new UseCacheGcsHandler();
+      await handler.get('k', []);
+
+      expect(buildMetaSaves()).toHaveLength(0);
+      expect(fetch).not.toHaveBeenCalled();
+
+      // GCS recovers and holds another build's metadata: the next read runs the check.
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ buildId: 'old-build', timestamp: 1 }))]);
+      await handler.get('k', []);
+
+      expect(fetch).toHaveBeenCalledWith(
+        'http://proxy.example.com:8080/rest/v0alpha1/cache',
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(buildMetaSaves()).toHaveLength(1);
+    });
+
+    it('treats _build-meta.json that is not valid JSON as a different build', async () => {
+      process.env.OUTBOUND_PROXY_ENDPOINT = 'proxy.example.com:8080';
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      mockFile.download.mockResolvedValue([Buffer.from('not json')]);
+
+      await new UseCacheGcsHandler().get('k', []);
+
+      expect(fetch).toHaveBeenCalledWith(
+        'http://proxy.example.com:8080/rest/v0alpha1/cache',
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(buildMetaSaves()).toHaveLength(1);
+    });
+  });
+
   describe('cache key sanitization', () => {
     it('should handle keys with special characters', async () => {
       mockFile.exists.mockResolvedValue([false]);
@@ -777,8 +851,10 @@ describe('UseCacheGcsHandler', () => {
       const handler = new UseCacheGcsHandler();
       await handler.get('/api/cache/test?param=value', []);
 
-      // Key should be sanitized
-      expect(mockBucket.file).toHaveBeenCalledWith('use-cache/_api_cache_test_param_value.json');
+      // Sanitized, plus a hash of the full key so similar keys don't share an object
+      expect(mockBucket.file).toHaveBeenCalledWith(
+        expect.stringMatching(/^use-cache\/_api_cache_test_param_value_[0-9a-f]{16}\.json$/)
+      );
     });
   });
 });

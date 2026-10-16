@@ -5,6 +5,7 @@ import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/st
 import { getBuildStore } from './build-store.js';
 import { createLogger } from '../../utils/logger.js';
 import { safeJoin } from '../../utils/path-safety.js';
+import { toObjectName } from '../../utils/object-names.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
 const log = createLogger('UseCacheFileHandler');
 
@@ -83,9 +84,7 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   private getCacheFilePath(cacheKey: string): string {
-    // Sanitize cache key for filesystem
-    const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    return safeJoin(this.cacheDir, `${safeKey}.json`);
+    return safeJoin(this.cacheDir, `${toObjectName(cacheKey)}.json`);
   }
 
   /**
@@ -215,9 +214,11 @@ export class UseCacheFileHandler implements UseCacheHandler {
   }
 
   /**
-   * Return maximum revalidation timestamp for given tags.
+   * Return maximum revalidation timestamp for given tags. Next.js 16 passes
+   * an array; Next.js 15 spreads the tags as arguments.
    */
-  async getExpiration(tags: string[]): Promise<number> {
+  async getExpiration(...args: (string | string[])[]): Promise<number> {
+    const tags = args.flat();
     let maxTimestamp = 0;
 
     for (const tag of tags) {
@@ -229,6 +230,11 @@ export class UseCacheFileHandler implements UseCacheHandler {
 
     log.debug(`GET EXPIRATION for [${tags.join(', ')}]: ${maxTimestamp}`);
     return maxTimestamp;
+  }
+
+  /** Next.js 15's name for {@link updateTags}, with the tags spread as arguments. */
+  async expireTags(...tags: string[]): Promise<void> {
+    await this.updateTags(tags, []);
   }
 
   /**

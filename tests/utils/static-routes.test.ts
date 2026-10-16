@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getStaticRoutes } from '../../src/utils/static-routes.js';
+import { toObjectName } from '../../src/utils/object-names.js';
 
 vi.mock('fs');
 
@@ -43,12 +44,12 @@ describe('static-routes', () => {
       const result = getStaticRoutes();
 
       expect(result.size).toBe(2);
-      expect(result.has('_ssg-page')).toBe(true);
-      expect(result.has('_another-static')).toBe(true);
-      expect(result.has('_isr-page')).toBe(false);
+      expect(result.has(toObjectName('/ssg-page'))).toBe(true);
+      expect(result.has(toObjectName('/another-static'))).toBe(true);
+      expect(result.has(toObjectName('/isr-page'))).toBe(false);
     });
 
-    it('should convert root route to _index', () => {
+    it("should store the root route under /index's name", () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.readFileSync).mockReturnValue(
         JSON.stringify({
@@ -60,10 +61,10 @@ describe('static-routes', () => {
 
       const result = getStaticRoutes();
 
-      expect(result.has('_index')).toBe(true);
+      expect(result.has(toObjectName('/index'))).toBe(true);
     });
 
-    it('should convert nested routes with slashes to underscores', () => {
+    it("should store nested routes under their path's name", () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.readFileSync).mockReturnValue(
         JSON.stringify({
@@ -75,7 +76,7 @@ describe('static-routes', () => {
 
       const result = getStaticRoutes();
 
-      expect(result.has('_blog_posts_my-post')).toBe(true);
+      expect(result.has(toObjectName('/blog/posts/my-post'))).toBe(true);
     });
 
     it('should exclude ISR routes (initialRevalidateSeconds is a number)', () => {
@@ -121,10 +122,12 @@ describe('static-routes', () => {
 
       const result = getStaticRoutes();
 
-      expect(result.has('_index')).toBe(true);
+      expect(result.has(toObjectName('/index'))).toBe(true);
       // How the handlers name the stored object (non-alphanumerics become `_`).
       expect(
-        result.has('_route-cache_APP_PAGE_c6377dd9ce6a1c2cd100eb4344e843eb4639b9ed26f84643f77680e9eb454c4b___index')
+        result.has(
+          toObjectName('/route-cache/APP_PAGE/c6377dd9ce6a1c2cd100eb4344e843eb4639b9ed26f84643f77680e9eb454c4b/$/index')
+        )
       ).toBe(true);
     });
 

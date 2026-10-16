@@ -8,7 +8,8 @@ import type {
 } from './types.js';
 import { serializeUseCacheEntry, deserializeUseCacheEntry } from '../../utils/stream-serialization.js';
 import { getBuildStore } from './build-store.js';
-import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { getTagRevalidation } from '../../utils/tags-manifest.js';
+import { toObjectName } from '../../utils/object-names.js';
 import { resolveTagsRefreshIntervalMs } from '../../utils/shared-revalidations.js';
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
@@ -19,6 +20,7 @@ import {
   readJsonObject,
   writeJsonObject,
   isPreconditionFailure,
+  isNotFound,
   getErrorStatusCode,
 } from '../../utils/gcs-json-object.js';
 
@@ -174,31 +176,39 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   private async checkBuildInvalidation(): Promise<void> {
     const file = this.bucket.file(this.buildMetaKey);
 
+    // undefined: none stored. Not valid JSON: an unknown previous generation.
+    let previousBuildId: string | undefined;
     try {
-      const [exists] = await file.exists();
-      if (exists) {
-        const [data] = await file.download();
-        const meta: BuildMeta = JSON.parse(data.toString());
-
-        if (meta.buildId && meta.buildId !== this.buildId) {
-          log.info(`New build detected (${meta.buildId} -> ${this.buildId}), clearing edge cache`);
-
-          // Awaited, not the usual fire-and-forget nukeCacheInBackground used
-          // for ordinary tag revalidation elsewhere: get()/set() block on
-          // initPromise (via ensureInitialized()) before touching the store,
-          // so this guarantees the purge request has been issued before this
-          // process starts serving real traffic. Bounded by nukeCache()'s own
-          // internal timeout.
-          if (this.edgeCacheClearer) {
-            const result = await this.edgeCacheClearer.nukeCache();
-            if (!result.success) {
-              log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
-            }
-          }
-        }
+      const [data] = await file.download();
+      try {
+        previousBuildId = (JSON.parse(data.toString()) as BuildMeta).buildId;
+      } catch {
+        log.warn('Stored build metadata is not valid JSON; treating it as a different build');
+        previousBuildId = '';
       }
     } catch (error) {
-      log.warn('Error checking build invalidation:', error);
+      if (!isNotFound(error)) {
+        // Not a first run: leave the check, and _build-meta.json, to the retry.
+        log.warn('Could not read build metadata; the build check is retried on the next cache read or write:', error);
+        throw error;
+      }
+    }
+
+    if (previousBuildId !== undefined && previousBuildId !== this.buildId) {
+      log.info(`New build detected (${previousBuildId || '(unreadable)'} -> ${this.buildId}), clearing edge cache`);
+
+      // Awaited, not the usual fire-and-forget nukeCacheInBackground used
+      // for ordinary tag revalidation elsewhere: get()/set() block on
+      // initPromise (via ensureInitialized()) before touching the store,
+      // so this guarantees the purge request has been issued before this
+      // process starts serving real traffic. Bounded by nukeCache()'s own
+      // internal timeout.
+      if (this.edgeCacheClearer) {
+        const result = await this.edgeCacheClearer.nukeCache();
+        if (!result.success) {
+          log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
+        }
+      }
     }
 
     try {
@@ -212,6 +222,10 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   private async ensureInitialized(): Promise<void> {
+    // A failed initialize() (the build metadata couldn't be read) is retried.
+    if (!this.initialized && !this.initPromise) {
+      this.initPromise = this.initialize().catch(() => {});
+    }
     if (this.initPromise) {
       await this.initPromise;
       this.initPromise = null;
@@ -343,8 +357,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
   private getCacheKey(cacheKey: string): string {
     // Sanitize cache key for GCS object naming
-    const safeKey = cacheKey.replace(/[^a-zA-Z0-9-]/g, '_');
-    return `${this.cachePrefix}${safeKey}.json`;
+    return `${this.cachePrefix}${toObjectName(cacheKey)}.json`;
   }
 
   /**
@@ -358,7 +371,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
    */
   private invalidatedAt(tag: string): number {
     const known = this.tagTimestamps.get(tag) ?? 0;
-    const revalidation = tagsManifest.get(tag);
+    const revalidation = getTagRevalidation(tag);
     if (!revalidation) {
       return known;
     }
@@ -555,9 +568,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   /**
-   * Return maximum revalidation timestamp for given tags.
+   * Return maximum revalidation timestamp for given tags. Next.js 16 passes
+   * an array; Next.js 15 spreads the tags as arguments.
    */
-  async getExpiration(tags: string[]): Promise<number> {
+  async getExpiration(...args: (string | string[])[]): Promise<number> {
+    const tags = args.flat();
     let maxTimestamp = 0;
 
     for (const tag of tags) {
@@ -569,6 +584,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     log.debug(`GET EXPIRATION for [${tags.join(', ')}]: ${maxTimestamp}`);
     return maxTimestamp;
+  }
+
+  /** Next.js 15's name for {@link updateTags}, with the tags spread as arguments. */
+  async expireTags(...tags: string[]): Promise<void> {
+    await this.updateTags(tags, []);
   }
 
   /**

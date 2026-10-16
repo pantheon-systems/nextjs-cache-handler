@@ -1,6 +1,6 @@
 import type { Bucket } from '@google-cloud/storage';
-import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { createLogger } from './logger.js';
+import { setTagRevalidation } from './tags-manifest.js';
 import {
   getErrorStatusCode,
   isNotFound,
@@ -402,7 +402,7 @@ export class SharedRevalidations {
         continue;
       }
       this.known.set(tag, entry);
-      tagsManifest.set(tag, {
+      setTagRevalidation(tag, {
         ...(entry.stale !== undefined ? { stale: entry.stale } : {}),
         ...(entry.expired !== undefined ? { expired: entry.expired } : {}),
       });

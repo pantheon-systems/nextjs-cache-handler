@@ -57,6 +57,7 @@ class EdgeNoopUseCacheHandler {
     return 0;
   }
   async updateTags(): Promise<void> {}
+  async expireTags(): Promise<void> {}
   async getStats(): Promise<UseCacheStats> {
     return { size: 0, entries: [], keys: [] };
   }

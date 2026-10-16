@@ -155,6 +155,12 @@ export interface UseCacheHandler {
    * - Entries with matching tags should be considered invalid
    */
   updateTags(tags: string[], durations: number[]): Promise<void>;
+
+  /**
+   * Next.js 15's name for {@link updateTags}, with the tags spread as
+   * arguments. Next.js 16 does not call it.
+   */
+  expireTags?(...tags: string[]): Promise<void>;
 }
 
 /**

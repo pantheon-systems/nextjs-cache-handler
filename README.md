@@ -2,6 +2,13 @@
 
 Custom cache handler for Next.js with support for Google Cloud Storage and file-based caching. Designed for Pantheon's Next.js hosting platform.
 
+## Supported versions
+
+[![Next.js 15](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-15.yml/badge.svg?branch=main&event=push)](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-15.yml?query=branch%3Amain)
+[![Next.js 16](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-16.yml/badge.svg?branch=main&event=push)](https://github.com/pantheon-systems/nextjs-cache-handler/actions/workflows/next-16.yml?query=branch%3Amain)
+
+Each badge shows whether the tests on `main` pass against the newest Next.js 15 and 16 releases.
+
 ## Features
 
 - **Dual Cache Handlers**: Support for both GCS (production) and file-based (development) caching
@@ -105,7 +112,7 @@ interface CacheHandlerConfig {
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
 | `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries (the `memoryMb` option of `createUseCacheHandler` takes precedence) it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
-| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for two intervals after storing a revalidation. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
+| `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for one interval plus up to 1 s (the interval again, capped at 1 s) after the first, 2 s by default. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
 
@@ -412,9 +419,9 @@ output (`required-server-files.json` and `BUILD_ID`).
 `clearEdgeCachePaths()` gives the paths you pass the trailing slash the site
 serves them with: added with `trailingSlash: true`, removed without it, and
 drops any query string or fragment, since the CDN keys a page by its path alone.
-Purging a Pages Router page's URL yourself (`clearEdgeCachePaths()`also clears 
-its data route, except a default-locale page's unprefixed URL: purge the prefixed 
-path too (`/en/blog` as well as `/blog`).
+`clearEdgeCachePaths()` purges only the paths you pass. To purge a Pages Router
+page yourself, also pass its data route (`/_next/data/<buildId>/blog.json`) and,
+for a default-locale page, both URLs (`/en/blog` as well as `/blog`).
 
 The `use cache` GCS handler writes its tag timestamps (`use-cache/_tags.json`)
 synchronously on `updateTags()` so other instances see revalidations promptly,

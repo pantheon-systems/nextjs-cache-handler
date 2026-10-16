@@ -14,7 +14,7 @@ import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js'
 import { createLogger, type Logger } from '../utils/logger.js';
 import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
 import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
-import { areTagsExpired, tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
+import { areTagsExpired, getTagRevalidation, nextChecksFetchTags, setTagRevalidation } from '../utils/tags-manifest.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
 let buildInvalidationPromise: Promise<void> | null = null;
@@ -152,7 +152,8 @@ export abstract class BaseCacheHandler {
     cacheType: CacheEntryType
   ): Promise<void>;
 
-  protected abstract readBuildMeta(): Promise<BuildMeta>;
+  /** The stored build metadata, or null when none is stored. Throws when it can't be read. */
+  protected abstract readBuildMeta(): Promise<BuildMeta | null>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
   protected abstract invalidateRouteCache(): Promise<void>;
 
@@ -213,20 +214,39 @@ export abstract class BaseCacheHandler {
     const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
     const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
 
+    let buildMeta: BuildMeta | null;
     try {
-      const buildMeta = await this.readBuildMeta();
+      buildMeta = await this.readBuildMeta();
+    } catch (error) {
+      // Not a first run: the previous generation is unknown, so the check
+      // (and any wipe and purge) is left to the next handler.
+      this.log.warn('Could not read build metadata; the build check is retried on the next request:', error);
+      throw error;
+    }
 
-      if (buildMeta.buildId !== currentBuildId) {
-        this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
-
-        await this.invalidateRouteCache();
-        await this.onNewGeneration(buildMeta);
-
-        await this.writeBuildMeta(currentMeta);
-      }
-    } catch {
-      // No previous build metadata - first run, just save current build ID
+    if (!buildMeta) {
+      // First run: nothing to invalidate.
       await this.writeBuildMeta(currentMeta);
+      return;
+    }
+
+    if (buildMeta.buildId !== currentBuildId) {
+      this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
+
+      await this.invalidateRouteCache();
+      await this.onNewGeneration(buildMeta);
+
+      await this.writeBuildMeta(currentMeta);
+    }
+  }
+
+  /** Stored build metadata that isn't valid JSON counts as an unknown previous generation. */
+  protected parseBuildMeta(data: string): BuildMeta {
+    try {
+      return JSON.parse(data) as BuildMeta;
+    } catch {
+      this.log.warn('Stored build metadata is not valid JSON; treating it as a different build');
+      return { buildId: '', timestamp: 0 };
     }
   }
 
@@ -332,7 +352,7 @@ export abstract class BaseCacheHandler {
 
   /**
    * Whether a page, route handler or Pages Router entry carries a tag whose
-   * expiry has passed. Fetch entries are left to Next.js, which checks them itself.
+   * expiry has passed. Fetch entries are checked by hasExpiredFetchTags().
    */
   private hasExpiredRouteTags(entry: CacheHandlerValue): boolean {
     const value = entry.value as { kind?: string; headers?: Record<string, unknown> } | null;
@@ -343,6 +363,21 @@ export abstract class BaseCacheHandler {
     const header = value.headers?.['x-next-cache-tags'];
     const tags = new Set([...(entry.tags ?? []), ...(typeof header === 'string' ? header.split(',') : [])]);
     return tags.size > 0 && areTagsExpired([...tags], entry.lastModified);
+  }
+
+  /**
+   * Whether a fetch entry carries a tag, or an implicit tag of the requesting
+   * route, revalidated after it was written. Next.js 16 checks this itself;
+   * Next.js 15 leaves it to the FileSystemCache this handler replaces.
+   */
+  private hasExpiredFetchTags(entry: CacheHandlerValue, ctx?: CacheHandlerParametersGet[1]): boolean {
+    if (nextChecksFetchTags || (entry.value as { kind?: string } | null)?.kind !== 'FETCH' || !ctx) {
+      return false;
+    }
+
+    const fetchCtx = ctx as { tags?: string[]; softTags?: string[] };
+    const tags = [...(fetchCtx.tags ?? []), ...(fetchCtx.softTags ?? [])];
+    return tags.length > 0 && areTagsExpired(tags, entry.lastModified);
   }
 
   // ============================================================================
@@ -396,7 +431,7 @@ export abstract class BaseCacheHandler {
       // revalidateTag keeps entries so a stale one can be served while it
       // regenerates. An expired one must not be: Next.js 16.2 serves it as stale
       // anyway, and 16.3 re-renders the whole route. FileSystemCache returns null.
-      if (this.hasExpiredRouteTags(entry)) {
+      if (this.hasExpiredRouteTags(entry) || this.hasExpiredFetchTags(entry, ctx)) {
         this.log.debug(`MISS: ${cacheKey} (${cacheType}, expired tag)`);
         return null;
       }
@@ -543,7 +578,7 @@ export abstract class BaseCacheHandler {
     const now = Date.now();
     const revalidations: SharedRevalidationMap = {};
     for (const currentTag of tagArray) {
-      const existingEntry = tagsManifest.get(currentTag) ?? {};
+      const existingEntry = getTagRevalidation(currentTag) ?? {};
       let updates: { stale?: number; expired?: number };
       if (durations) {
         updates = { ...existingEntry, stale: now };
@@ -553,7 +588,7 @@ export abstract class BaseCacheHandler {
       } else {
         updates = { ...existingEntry, expired: now };
       }
-      tagsManifest.set(currentTag, updates);
+      setTagRevalidation(currentTag, updates);
       revalidations[currentTag] = { ...updates, at: now };
     }
 
