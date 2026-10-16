@@ -53,7 +53,14 @@ flowchart LR
   expires the tag at once. `src/utils/tags-manifest.ts` reads and writes whichever format the
   running Next.js uses; `revalidations.json` keeps the 16 shape on both, and an instance on 15
   applies an entry by the later of its `stale` and `expired` times that has passed, or by `stale`
-  when neither has (a soft revalidation from 16 keeps the tag's earlier `expired`).
+  when neither has (a soft revalidation from 16 keeps the tag's earlier `expired`). A time still
+  ahead of this instance's clock is recorded as now: Next.js 15 expires every entry older than
+  the timestamp, with no check that it has passed.
+- `get()` returns a miss for an entry carrying a tag revalidated after the entry was written. For
+  pages, route handlers and Pages Router entries the tags come from the entry. For `fetch` and
+  `unstable_cache` entries on Next.js 15 they are the fetch's tags plus the requesting route's
+  implicit tags, from `ctx`. Next.js 16 checks fetch entries itself, but Next.js 15 leaves that
+  to the FileSystemCache this handler replaces.
 - `servedAt` holds the public paths this process served from GCS entries, up to 5000 (the oldest
   are dropped first). It is filled only when `OUTBOUND_PROXY_ENDPOINT` is set, and never for
   images or build-prerender hits. Its only use is deciding which pages to purge when this process
@@ -62,7 +69,7 @@ flowchart LR
   default). A memory hit skips the GCS round trip but goes through the same tag and revalidate
   expiry checks.
 - Build-time prerendered pages are not in GCS. They are served from `.next/server` when GCS
-  misses (`base.ts:405`), and their tags are indexed per process from the build output
+  misses (`base.ts:420`), and their tags are indexed per process from the build output
   (`loadBuildPrerenderTags`), never written to `tags.json`.
 - The CDN caches whatever `Cache-Control` Next sends (for a static page, `s-maxage=31536000`); the
   handler never changes that header. Before its `s-maxage` runs out, only a purge makes the CDN
@@ -169,7 +176,7 @@ What each step depends on:
 
 | Step | Code | If it fails or is late |
 |---|---|---|
-| Store revalidation | `shared-revalidations.ts`, `base.ts:582` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:543`). Other instances keep serving the old page until it lands. |
+| Store revalidation | `shared-revalidations.ts`, `base.ts:597` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:543`). Other instances keep serving the old page until it lands. |
 | Read tags map | `gcs.ts:310` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
 | First purge | `gcs.ts:593` (`purgeTags`), `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
 | Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `gcs.ts:548` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
@@ -301,7 +308,7 @@ so each such cold start would wipe `route-cache/` and fully purge the CDN.
 |---|---|---|
 | Second and background purges run on timers | Late under request-based CPU; lost on shutdown without `flushSharedTagsMapping()`. Even with it, a second purge whose revalidation is stored only during the flush, and a `tags.json`-flush purge (`purgeMissedRevalidations`) that is already due, are started but not awaited. The purge each instance sends when it learns of a revalidation covers most of this | README "Revalidations across processes" |
 | Revalidation first seen on an instance's first read of `revalidations.json` | That instance sends no purge for pages it served before, or while, its first read was in flight (`get()` serves after 2 s without waiting for the read to finish). Only the second purge covers them | – |
-| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path in `base.ts:429`, not on the prerender return at `base.ts:408`. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
+| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path in `base.ts:444`, not on the prerender return at `base.ts:423`. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
 | `use cache` tag reload is background | A tag revalidated on another instance can be missed by this instance's `use cache` reads for up to about one refresh interval plus the reload's GCS round trip (see below) | README `CACHE_TAGS_REFRESH_INTERVAL_MS` |
 | GCS stall longer than the second-purge delay | An instance still serving without the revalidation can re-cache the old page after the last purge | – |
 | Route-cache wipe fails part-way | One failed delete skips the full purge, with nothing logged (`gcs.ts:448`). Old pages stay in the CDN and, where not deleted, in GCS | – |
