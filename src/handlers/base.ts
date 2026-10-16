@@ -14,7 +14,7 @@ import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js'
 import { createLogger, type Logger } from '../utils/logger.js';
 import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
 import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
-import { areTagsExpired, getTagRevalidation, setTagRevalidation } from '../utils/tags-manifest.js';
+import { areTagsExpired, getTagRevalidation, nextChecksFetchTags, setTagRevalidation } from '../utils/tags-manifest.js';
 
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
 let buildInvalidationPromise: Promise<void> | null = null;
@@ -352,7 +352,7 @@ export abstract class BaseCacheHandler {
 
   /**
    * Whether a page, route handler or Pages Router entry carries a tag whose
-   * expiry has passed. Fetch entries are left to Next.js, which checks them itself.
+   * expiry has passed. Fetch entries are checked by hasExpiredFetchTags().
    */
   private hasExpiredRouteTags(entry: CacheHandlerValue): boolean {
     const value = entry.value as { kind?: string; headers?: Record<string, unknown> } | null;
@@ -363,6 +363,21 @@ export abstract class BaseCacheHandler {
     const header = value.headers?.['x-next-cache-tags'];
     const tags = new Set([...(entry.tags ?? []), ...(typeof header === 'string' ? header.split(',') : [])]);
     return tags.size > 0 && areTagsExpired([...tags], entry.lastModified);
+  }
+
+  /**
+   * Whether a fetch entry carries a tag, or an implicit tag of the requesting
+   * route, revalidated after it was written. Next.js 16 checks this itself;
+   * Next.js 15 leaves it to the FileSystemCache this handler replaces.
+   */
+  private hasExpiredFetchTags(entry: CacheHandlerValue, ctx?: CacheHandlerParametersGet[1]): boolean {
+    if (nextChecksFetchTags || (entry.value as { kind?: string } | null)?.kind !== 'FETCH' || !ctx) {
+      return false;
+    }
+
+    const fetchCtx = ctx as { tags?: string[]; softTags?: string[] };
+    const tags = [...(fetchCtx.tags ?? []), ...(fetchCtx.softTags ?? [])];
+    return tags.length > 0 && areTagsExpired(tags, entry.lastModified);
   }
 
   // ============================================================================
@@ -416,7 +431,7 @@ export abstract class BaseCacheHandler {
       // revalidateTag keeps entries so a stale one can be served while it
       // regenerates. An expired one must not be: Next.js 16.2 serves it as stale
       // anyway, and 16.3 re-renders the whole route. FileSystemCache returns null.
-      if (this.hasExpiredRouteTags(entry)) {
+      if (this.hasExpiredRouteTags(entry) || this.hasExpiredFetchTags(entry, ctx)) {
         this.log.debug(`MISS: ${cacheKey} (${cacheType}, expired tag)`);
         return null;
       }
