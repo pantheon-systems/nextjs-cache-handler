@@ -59,6 +59,16 @@ describe('tags-manifest compatibility', () => {
       setTagRevalidation('posts', { stale: now, expired: now + 60_000 });
 
       expect(next.tagsManifest.get('posts')).toBe(now);
+      expect(next.isStale?.(['posts'], now + 1)).toBe(false);
+    });
+
+    it('keeps the recorded revalidation when an older one arrives', () => {
+      const now = Date.now();
+      setTagRevalidation('posts', { expired: now });
+      setTagRevalidation('posts', { expired: now - 60_000 });
+
+      expect(next.tagsManifest.get('posts')).toBe(now);
+      expect(next.isStale?.(['posts'], now - 1000)).toBe(true);
     });
 
     it("records the expiry as a timestamp, which Next's own isStale reads", () => {

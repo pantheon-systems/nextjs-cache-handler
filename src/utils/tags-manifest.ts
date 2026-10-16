@@ -44,7 +44,8 @@ export function getTagRevalidation(tag: string): TagRevalidation | undefined {
  * Next.js 16 keeps the tag's earlier `expired` and sets a new `stale`, and its
  * `expired` may still be ahead; either way `stale` marks when it happened.
  * Next.js 15's isStale has no `<= now` guard, so a timestamp still ahead (from
- * an instance whose clock is ahead) is recorded as now.
+ * an instance whose clock is ahead) is recorded as now. A revalidation older
+ * than the one recorded keeps the recorded one: entries it expired stay expired.
  */
 export function setTagRevalidation(tag: string, revalidation: TagRevalidation): void {
   if (usesTimestamps) {
@@ -54,7 +55,8 @@ export function setTagRevalidation(tag: string, revalidation: TagRevalidation): 
     );
     const timestamp = passed.length > 0 ? Math.max(...passed) : (revalidation.stale ?? revalidation.expired);
     if (timestamp !== undefined) {
-      tagsManifest.set(tag, Math.min(timestamp, now));
+      const recorded = tagsManifest.get(tag);
+      tagsManifest.set(tag, Math.max(Math.min(timestamp, now), typeof recorded === 'number' ? recorded : 0));
     }
     return;
   }
