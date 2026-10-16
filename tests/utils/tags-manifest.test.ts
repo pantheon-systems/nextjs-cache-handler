@@ -75,5 +75,33 @@ describe('tags-manifest compatibility', () => {
 
       expect(next.tagsManifest.get('posts')).toBe(now);
     });
+
+    // Next.js 15's isStale is `revalidatedAt >= timestamp` with no check against
+    // the current time, so a timestamp still ahead would mark every entry written
+    // before it stale, including the one regenerated in response.
+    const futureRevalidations = [
+      { name: 'an expiry from an instance whose clock is ahead', revalidation: { expired: 3_000 } },
+      { name: 'a soft revalidation from an instance whose clock is ahead', revalidation: { stale: 3_000 } },
+      {
+        name: 'a soft revalidation whose stale time and expiry are both ahead',
+        revalidation: { stale: 3_000, expired: 60_000 },
+      },
+    ];
+
+    for (const { name, revalidation } of futureRevalidations) {
+      it(`treats an entry written after applying ${name} as fresh`, () => {
+        const writtenBefore = Date.now() - 1000;
+        const now = Date.now();
+        setTagRevalidation('posts', {
+          ...(revalidation.stale !== undefined ? { stale: now + revalidation.stale } : {}),
+          ...(revalidation.expired !== undefined ? { expired: now + revalidation.expired } : {}),
+        });
+        // isStale counts a revalidation at the same millisecond, so write a moment later.
+        const writtenAfter = Date.now() + 1;
+
+        expect(next.isStale?.(['posts'], writtenBefore)).toBe(true);
+        expect(next.isStale?.(['posts'], writtenAfter)).toBe(false);
+      });
+    }
   });
 });
