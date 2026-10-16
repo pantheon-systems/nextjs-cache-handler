@@ -6,6 +6,7 @@ import {
   createCacheHandler,
   createUseCacheHandler,
   getSharedCacheStats,
+  getSharedCacheCounts,
   getUseCacheStats,
   clearSharedCache,
   clearEdgeCache,
@@ -75,6 +76,13 @@ describe('edge entry — no-op handler behavior', () => {
 
   it('stats and clear helpers are inert at the edge', async () => {
     await expect(getSharedCacheStats()).resolves.toEqual({ size: 0, keys: [], entries: [] });
+    await expect(getSharedCacheCounts()).resolves.toEqual({
+      route: { objects: 0, byGeneration: {} },
+      fetch: { objects: 0 },
+      image: { objects: 0 },
+      tagsMap: null,
+      buildMeta: null,
+    });
     await expect(getUseCacheStats()).resolves.toEqual({ size: 0, entries: [], keys: [] });
     await expect(clearSharedCache()).resolves.toBe(0);
     await expect(clearEdgeCache()).resolves.toBeNull();

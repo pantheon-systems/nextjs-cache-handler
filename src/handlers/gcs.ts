@@ -1,12 +1,14 @@
-import type { Bucket } from '@google-cloud/storage';
+import type { Bucket, File } from '@google-cloud/storage';
 import type {
   CacheEntryType,
   CacheStats,
   CacheEntryInfo,
   CacheHandlerValue,
   FileSystemCacheContext,
+  SharedCacheCounts,
+  SharedCacheStatsOptions,
 } from '../types.js';
-import { BaseCacheHandler, type BuildMeta } from './base.js';
+import { BaseCacheHandler, getProcessGeneration, isFallbackGeneration, type BuildMeta } from './base.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import {
@@ -43,6 +45,19 @@ import {
 import { isBuildPhase } from '../utils/build-detection.js';
 import { toObjectName } from '../utils/object-names.js';
 import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
+import {
+  DEFAULT_DELETE_CONCURRENCY,
+  ListPrefixError,
+  deletePrefix,
+  describeFailures,
+  errorLabel,
+  errorMessage,
+  listPrefixPages,
+  mapInBatches,
+  resolveBuildInvalidationMode,
+  resolveDeleteConcurrency,
+  type DeletePrefixResult,
+} from '../utils/gcs-delete-prefix.js';
 
 const gcsLog = createLogger('GcsCacheHandler');
 
@@ -94,6 +109,36 @@ const FETCH_DELETE_BATCH_SIZE = 50;
 
 // Re-purges once every instance has applied a revalidation, per process.
 const delayedPurges = new DelayedPurges();
+
+/**
+ * Whether a route entry stamped with `generation` belongs to the running build.
+ * A process that can't read its build ID serves any entry, as before stamping:
+ * its fallback generation is unique, so it would otherwise never hit.
+ */
+function isCurrentGeneration(generation: unknown): boolean {
+  const current = getProcessGeneration();
+  return isFallbackGeneration(current) || generation === current;
+}
+
+/**
+ * What an operator can do about failed deletes or listings, from their error
+ * labels (see errorLabel): grant delete permission, or ease throttling.
+ */
+function deleteFailureHints(bucketName: string, labels: string[]): string[] {
+  const hints: string[] = [];
+  if (labels.some((label) => label === '401' || label === '403')) {
+    hints.push(
+      `Permission denied: the service account needs storage.objects.delete and storage.objects.list on gs://${bucketName}.`
+    );
+  }
+  if (labels.some((label) => label !== '401' && label !== '403' && !/^4\d\d$/.test(label))) {
+    hints.push(
+      `GCS throttled or was unavailable after retries; a lower CACHE_INVALIDATION_DELETE_CONCURRENCY ` +
+        `(now ${resolveDeleteConcurrency()}) reduces throttling.`
+    );
+  }
+  return hints;
+}
 
 /** Most route paths remembered as served; the oldest are forgotten first. */
 const MAX_SERVED_PATHS = 5000;
@@ -238,6 +283,7 @@ export function resetGcsSharedState(): void {
  * Stores cache entries in a GCS bucket.
  */
 export class GcsCacheHandler extends BaseCacheHandler {
+  private readonly bucketName: string;
   private readonly bucket: Bucket;
   private readonly tagsBucket: Bucket;
   private readonly fetchCachePrefix: string;
@@ -259,6 +305,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       throw new Error('CACHE_BUCKET environment variable is required for GCS cache handler');
     }
 
+    this.bucketName = bucketName;
     // Two clients on purpose: unconditional entry writes disable retries on
     // their client's shared state, which must not leak into tag-map writes.
     this.bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
@@ -373,7 +420,15 @@ export class GcsCacheHandler extends BaseCacheHandler {
       }
 
       const [data] = await file.download();
-      const parsedData = JSON.parse(data.toString());
+      const { generation, ...parsedData } = JSON.parse(data.toString());
+
+      // A route entry from another build can reference that build's assets,
+      // which this deploy no longer serves: one a failed delete left behind,
+      // or one an instance of another revision wrote during a rollout.
+      if (cacheType === 'route' && !isCurrentGeneration(generation)) {
+        this.log.debug(`MISS: ${cacheKey} (route, stored by ${generation ?? 'an unstamped earlier version'})`);
+        return null;
+      }
 
       return (this.deserializeFromStorage({ [cacheKey]: parsedData })[cacheKey] as CacheHandlerValue) || null;
     } catch {
@@ -391,10 +446,21 @@ export class GcsCacheHandler extends BaseCacheHandler {
       const file = this.bucket.file(gcsKey);
 
       const serializedData = this.serializeForStorage({ [cacheKey]: cacheValue });
+      // Route entries carry their build (see readCacheEntry). Fetch and image
+      // entries don't depend on the build and are kept across deploys.
+      const stored =
+        cacheType === 'route'
+          ? { ...(serializedData[cacheKey] as object), generation: getProcessGeneration() }
+          : serializedData[cacheKey];
 
-      await file.save(JSON.stringify(serializedData[cacheKey], null, 2), {
+      await file.save(JSON.stringify(stored, null, 2), {
         resumable: false,
-        metadata: { contentType: 'application/json' },
+        metadata: {
+          contentType: 'application/json',
+          // Also as object metadata, which listings return: getSharedCacheCounts
+          // counts route entries by build without downloading them.
+          ...(cacheType === 'route' ? { metadata: { generation: getProcessGeneration() } } : {}),
+        },
       });
     } catch (error) {
       this.log.error(`Error writing cache entry ${cacheKey}:`, error);
@@ -427,27 +493,129 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected async invalidateRouteCache(): Promise<void> {
-    try {
-      const [files] = await this.bucket.getFiles({ prefix: this.routeCachePrefix });
-      const deletePromises = files.map((file) => file.delete());
-      await Promise.all(deletePromises);
-
-      // Awaited, unlike the background purges elsewhere: this runs
-      // during startup-time build invalidation, which get()/set() now block
-      // on via ensureInitialized() before touching the store. Awaiting here
-      // means the edge purge request has actually been ISSUED (not just
-      // queued) before this process starts serving real traffic that could
-      // otherwise race a still-cached page from the previous build. Bounded
-      // by nukeCache()'s own internal timeout, so this can't hang startup.
-      if (this.edgeCacheClearer) {
-        const result = await this.edgeCacheClearer.nukeCache();
-        if (!result.success) {
-          this.log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
-        }
-      }
-    } catch {
-      // Silently fail - cache invalidation is best effort
+    const location = `gs://${this.bucketName}/${this.routeCachePrefix}`;
+    if (resolveBuildInvalidationMode() === 'off') {
+      this.log.warn(
+        `CACHE_BUILD_INVALIDATION=off: ${location} was not deleted for the new build. Its entries from earlier ` +
+          `builds are not served (they count as cache misses), but stay in storage until a deploy runs without ` +
+          `CACHE_BUILD_INVALIDATION=off.`
+      );
+    } else {
+      await this.deleteRouteCache(location);
     }
+
+    // Awaited, unlike the background purges elsewhere: this runs
+    // during startup-time build invalidation, which get()/set() now block
+    // on via ensureInitialized() before touching the store. Awaiting here
+    // means the edge purge request has actually been ISSUED (not just
+    // queued) before this process starts serving real traffic that could
+    // otherwise race a still-cached page from the previous build. Bounded
+    // by nukeCache()'s own internal timeout, so this can't hang startup.
+    if (this.edgeCacheClearer) {
+      const result = await this.edgeCacheClearer.nukeCache();
+      if (!result.success) {
+        this.log.error(
+          `Edge cache purge on build invalidation failed: ${result.error}. Pages from the previous build stay ` +
+            `in the CDN until they expire or the site's edge cache is cleared.`
+        );
+      }
+    }
+
+    // After the purge, so tags.json traffic can't delay it. Whether or not they
+    // were deleted, the previous build's route entries are no longer served
+    // (see readCacheEntry), so their keys are not needed.
+    await this.removeRouteKeysFromTagsMap();
+  }
+
+  /**
+   * Delete the route cache one page at a time with a bounded number of deletes
+   * in flight. Never throws: failures are logged with how to fix them, and
+   * startup carries on. Objects left behind are never served (see
+   * readCacheEntry), so a failure costs storage, not correctness.
+   */
+  private async deleteRouteCache(location: string): Promise<void> {
+    const leftovers =
+      `The objects left in ${location} are not served (route entries from another build count as cache ` +
+      `misses). Startup continues, and the next deploy deletes them.`;
+    // A permission problem fails every deploy the same way, so the bucket only
+    // grows until someone fixes it; transient failures clean up next deploy.
+    const report = (labels: string[], message: string) => {
+      const denied = labels.some((label) => label === '401' || label === '403');
+      const text = [message, leftovers, ...deleteFailureHints(this.bucketName, labels)].join(' ');
+      if (denied) {
+        this.log.error(text);
+      } else {
+        this.log.warn(text);
+      }
+    };
+
+    try {
+      const r = await deletePrefix(this.bucket, this.routeCachePrefix, { concurrency: resolveDeleteConcurrency() });
+      const summary = `Route cache invalidation: deleted ${r.deleted}/${r.listed} objects in ${r.durationMs}ms`;
+      if (r.failed === 0) {
+        // warn, not info: once per deploy, and must be visible without CACHE_DEBUG
+        this.log.warn(summary);
+        return;
+      }
+      report(
+        Object.keys(r.failures),
+        `${summary}; ${r.failed} could not be deleted (${describeFailures(r.failures)}; ` +
+          `first error: ${errorMessage(r.firstError)}).`
+      );
+    } catch (error) {
+      if (error instanceof ListPrefixError) {
+        const p = error.progress ?? { listed: 0, deleted: 0, failed: 0, failures: {} };
+        report(
+          [errorLabel(error.reason), ...Object.keys(p.failures)],
+          `Route cache invalidation stopped: ${error.message}, after deleting ${p.deleted} of the ` +
+            `${p.listed} objects listed so far` +
+            (p.failed ? ` (${p.failed} could not be deleted: ${describeFailures(p.failures)})` : '') +
+            '.'
+        );
+      } else {
+        this.log.error(`Route cache invalidation failed. ${leftovers}`, error);
+      }
+    }
+  }
+
+  /**
+   * Remove the previous build's route keys from the tags map. Nothing else
+   * removes them, so without this the map grows with every URL ever cached,
+   * and each tag revalidation purges the CDN for pages that no longer exist. Fetch keys stay: those entries survive
+   * deploys. Goes through the shared buffer, whose conditional writes merge
+   * with other instances; a key set again after this is kept (deletes apply
+   * before adds). Never throws.
+   */
+  private async removeRouteKeysFromTagsMap(): Promise<void> {
+    const location = `gs://${this.bucketName}/${this.tagsMapKey}`;
+    let mapping: TagsMapping;
+    try {
+      ({ mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey));
+    } catch (error) {
+      this.log.error(
+        `Could not read ${location} to remove the previous build's route keys (${errorLabel(error)}: ` +
+          `${errorMessage(error)}). They stay in it until the next deploy; until then tag revalidations also ` +
+          `purge the CDN for pages that no longer exist.`
+      );
+      return;
+    }
+
+    // Route keys start with `/`; fetch keys are hashes.
+    const routeKeys = [...new Set(Object.values(mapping).flat())].filter((key) => key.startsWith('/'));
+    if (routeKeys.length === 0) {
+      return;
+    }
+    this.tagsBuffer.deleteKeys(routeKeys);
+    await this.tagsBuffer.flush();
+    if (this.tagsBuffer.hasPending) {
+      // The buffer logged why; it keeps retrying in this process.
+      this.log.warn(
+        `Removing ${routeKeys.length} route keys of the previous build from ${location} failed; it is retried ` +
+          `with the next write of that file, and at the next deploy if this process stops first.`
+      );
+      return;
+    }
+    this.log.warn(`Removed ${routeKeys.length} route keys of the previous build from ${location}`);
   }
 
   // ============================================================================
@@ -650,7 +818,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
 /**
  * Get cache statistics for the GCS-based cache.
  */
-export async function getSharedCacheStats(): Promise<CacheStats> {
+export async function getSharedCacheStats(options: SharedCacheStatsOptions = {}): Promise<CacheStats> {
   const bucketName = process.env.CACHE_BUCKET;
   if (!bucketName) {
     gcsLog.debug('CACHE_BUCKET environment variable not found');
@@ -664,14 +832,15 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   const fetchCachePrefix = `${envPrefix}fetch-cache/`;
   const routeCachePrefix = `${envPrefix}route-cache/`;
   const imageCachePrefix = `${envPrefix}image-cache/`;
+  const limit = options.limit ?? Infinity;
 
   const keys: string[] = [];
   const entries: CacheEntryInfo[] = [];
 
   try {
-    await processGcsCachePrefix(bucket, fetchCachePrefix, 'fetch', keys, entries);
-    await processGcsCachePrefix(bucket, routeCachePrefix, 'route', keys, entries);
-    await processGcsCachePrefix(bucket, imageCachePrefix, 'image', keys, entries);
+    await processGcsCachePrefix(bucket, fetchCachePrefix, 'fetch', keys, entries, limit);
+    await processGcsCachePrefix(bucket, routeCachePrefix, 'route', keys, entries, limit);
+    await processGcsCachePrefix(bucket, imageCachePrefix, 'image', keys, entries, limit);
 
     gcsLog.debug(
       `Found ${keys.length} cache entries ` +
@@ -687,53 +856,145 @@ export async function getSharedCacheStats(): Promise<CacheStats> {
   }
 }
 
+/** Read up to `limit` entries under `prefix`, one listed page at a time, with bounded downloads in flight. */
 async function processGcsCachePrefix(
   bucket: Bucket,
   prefix: string,
   cacheType: CacheEntryType,
   keys: string[],
-  entries: CacheEntryInfo[]
+  entries: CacheEntryInfo[],
+  limit: number
 ): Promise<void> {
+  let read = 0;
   try {
-    const [files] = await bucket.getFiles({ prefix });
-    const jsonFiles = files.filter((file) => file.name.endsWith('.json'));
-
-    for (const file of jsonFiles) {
-      await processGcsFile(file, prefix, cacheType, keys, entries);
+    for await (const files of listPrefixPages(bucket, prefix)) {
+      const jsonFiles = files.filter((file) => file.name.endsWith('.json')).slice(0, limit - read);
+      read += jsonFiles.length;
+      const infos = await mapInBatches(jsonFiles, DEFAULT_DELETE_CONCURRENCY, (file) =>
+        readGcsEntryInfo(file, prefix, cacheType)
+      );
+      for (const info of infos) {
+        // readGcsEntryInfo never rejects.
+        if (info.status === 'fulfilled') {
+          keys.push(info.value.key);
+          entries.push(info.value);
+        }
+      }
+      if (read >= limit) {
+        return;
+      }
     }
   } catch (error) {
     gcsLog.warn(`Error reading ${cacheType} cache:`, error);
   }
 }
 
-async function processGcsFile(
+async function readGcsEntryInfo(
   file: { name: string; download: () => Promise<[Buffer]> },
   prefix: string,
-  cacheType: CacheEntryType,
-  keys: string[],
-  entries: CacheEntryInfo[]
-): Promise<void> {
+  cacheType: CacheEntryType
+): Promise<CacheEntryInfo> {
   const cacheKey = file.name.replace(prefix, '').replace('.json', '').replace(/_/g, '-');
   const displayKey = `${cacheType}:${cacheKey}`;
-  keys.push(displayKey);
 
   try {
     const [data] = await file.download();
     const cacheData = JSON.parse(data.toString());
 
-    entries.push({
+    return {
       key: displayKey,
       tags: cacheData.tags || [],
       lastModified: cacheData.lastModified || Date.now(),
       type: cacheType,
-    });
+    };
   } catch {
-    entries.push({
+    return {
       key: displayKey,
       tags: [],
       type: cacheType,
-    });
+    };
   }
+}
+
+/**
+ * Count the objects in each cache and read the size of the tags map and the
+ * recorded build, without downloading entries: one GCS list request per 1,000
+ * objects, plus two small reads. Route objects are also counted by the build
+ * that wrote them, so leftovers from earlier builds show up. Rejects when GCS
+ * can't be read, rather than reporting zeros.
+ *
+ * Each call lists the whole cache: protect any route that exposes it.
+ */
+export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
+  const bucketName = process.env.CACHE_BUCKET;
+  if (!bucketName) {
+    gcsLog.debug('CACHE_BUCKET environment variable not found');
+    return emptySharedCacheCounts();
+  }
+  const bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
+  const envPrefix = getEnvironmentPrefix();
+
+  const byGeneration: Record<string, number> = {};
+  const routeObjects = await countObjects(bucket, `${envPrefix}route-cache/`, (file) => {
+    const generation = (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation;
+    const key = typeof generation === 'string' ? generation : 'unstamped';
+    byGeneration[key] = (byGeneration[key] ?? 0) + 1;
+  });
+
+  return {
+    route: { objects: routeObjects, byGeneration },
+    fetch: { objects: await countObjects(bucket, `${envPrefix}fetch-cache/`) },
+    image: { objects: await countObjects(bucket, `${envPrefix}image-cache/`) },
+    tagsMap: await readObjectSize(bucket, `${envPrefix}cache/tags/tags.json`),
+    buildMeta: await readStoredBuildMeta(bucket, `${envPrefix}build-meta.json`),
+  };
+}
+
+/** Counts with nothing in them, for when there is no cache to read. */
+function emptySharedCacheCounts(): SharedCacheCounts {
+  return {
+    route: { objects: 0, byGeneration: {} },
+    fetch: { objects: 0 },
+    image: { objects: 0 },
+    tagsMap: null,
+    buildMeta: null,
+  };
+}
+
+async function countObjects(bucket: Bucket, prefix: string, onFile?: (file: File) => void): Promise<number> {
+  let count = 0;
+  for await (const files of listPrefixPages(bucket, prefix)) {
+    count += files.length;
+    if (onFile) {
+      files.forEach(onFile);
+    }
+  }
+  return count;
+}
+
+async function readObjectSize(bucket: Bucket, key: string): Promise<{ bytes: number } | null> {
+  try {
+    const [metadata] = await bucket.file(key).getMetadata();
+    return { bytes: Number(metadata.size ?? 0) };
+  } catch (error) {
+    if (isNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function readStoredBuildMeta(bucket: Bucket, key: string): Promise<BuildMeta | null> {
+  let data: Buffer;
+  try {
+    [data] = await bucket.file(key).download();
+  } catch (error) {
+    if (isNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+  return JSON.parse(data.toString()) as BuildMeta;
 }
 
 /**
@@ -760,14 +1021,14 @@ export async function clearSharedCache(): Promise<number> {
 
   try {
     // Clear fetch cache (data cache - always clearable)
-    clearedCount += await clearGcsFetchCache(bucket, fetchCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, fetchCachePrefix);
 
     // Clear route cache (skip static routes)
-    const routeResult = await clearGcsRouteCache(bucket, routeCachePrefix, staticRoutes);
+    const routeResult = await clearGcsRouteCache(bucket, bucketName, routeCachePrefix, staticRoutes);
     clearedCount += routeResult.cleared;
 
     // Clear image cache (content-derived, no build/static-route scoping needed)
-    clearedCount += await clearGcsFetchCache(bucket, imageCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, imageCachePrefix);
 
     // Clear tags mapping
     await clearGcsTagsMapping(bucket, tagsFilePath);
@@ -789,16 +1050,16 @@ export async function clearSharedCache(): Promise<number> {
   }
 }
 
-async function clearGcsFetchCache(bucket: Bucket, prefix: string): Promise<number> {
+async function clearGcsFetchCache(bucket: Bucket, bucketName: string, prefix: string): Promise<number> {
   try {
-    const [files] = await bucket.getFiles({ prefix });
-    const jsonFiles = files.filter((file) => file.name.endsWith('.json'));
+    const r = await deletePrefix(bucket, prefix, {
+      concurrency: resolveDeleteConcurrency(),
+      shouldDelete: (file) => file.name.endsWith('.json'),
+    });
+    logClearFailures(bucketName, prefix, r);
 
-    const deletePromises = jsonFiles.map((file) => file.delete());
-    await Promise.all(deletePromises);
-
-    gcsLog.debug(`Cleared ${jsonFiles.length} fetch cache entries`);
-    return jsonFiles.length;
+    gcsLog.debug(`Cleared ${r.deleted} fetch cache entries`);
+    return r.deleted;
   } catch (error) {
     gcsLog.warn('Error clearing fetch cache:', error);
     return 0;
@@ -807,6 +1068,7 @@ async function clearGcsFetchCache(bucket: Bucket, prefix: string): Promise<numbe
 
 async function clearGcsRouteCache(
   bucket: Bucket,
+  bucketName: string,
   prefix: string,
   staticRoutes: Set<string>
 ): Promise<{ cleared: number; preserved: number }> {
@@ -814,24 +1076,21 @@ async function clearGcsRouteCache(
   let preserved = 0;
 
   try {
-    const [files] = await bucket.getFiles({ prefix });
-    const jsonFiles = files.filter((file) => file.name.endsWith('.json'));
-
-    const filesToDelete: typeof files = [];
-    for (const file of jsonFiles) {
-      const cacheKey = file.name.replace(prefix, '').replace('.json', '');
-
-      if (staticRoutes.has(cacheKey)) {
-        preserved++;
-        continue;
-      }
-
-      filesToDelete.push(file);
-    }
-
-    const deletePromises = filesToDelete.map((file) => file.delete());
-    await Promise.all(deletePromises);
-    cleared = filesToDelete.length;
+    const r = await deletePrefix(bucket, prefix, {
+      concurrency: resolveDeleteConcurrency(),
+      shouldDelete: (file) => {
+        if (!file.name.endsWith('.json')) {
+          return false;
+        }
+        if (staticRoutes.has(file.name.replace(prefix, '').replace('.json', ''))) {
+          preserved++;
+          return false;
+        }
+        return true;
+      },
+    });
+    cleared = r.deleted;
+    logClearFailures(bucketName, prefix, r);
 
     gcsLog.debug(`Route cache: cleared ${cleared}, preserved ${preserved} static routes`);
   } catch (error) {
@@ -839,6 +1098,20 @@ async function clearGcsRouteCache(
   }
 
   return { cleared, preserved };
+}
+
+function logClearFailures(bucketName: string, prefix: string, r: DeletePrefixResult): void {
+  if (r.failed === 0) {
+    return;
+  }
+  gcsLog.error(
+    [
+      `clearSharedCache: ${r.failed} of the objects under gs://${bucketName}/${prefix} could not be deleted ` +
+        `(${describeFailures(r.failures)}; first error: ${errorMessage(r.firstError)}) and are still served.`,
+      ...deleteFailureHints(bucketName, Object.keys(r.failures)),
+      'Run clearSharedCache() again to retry them.',
+    ].join(' ')
+  );
 }
 
 async function clearGcsTagsMapping(bucket: Bucket, tagsFilePath: string): Promise<void> {

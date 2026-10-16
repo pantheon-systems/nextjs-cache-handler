@@ -101,6 +101,36 @@ export interface CacheStats {
   entries: CacheEntryInfo[];
 }
 
+/**
+ * Object counts and sizes from listings and metadata, without reading entries
+ * (see getSharedCacheCounts).
+ */
+export interface SharedCacheCounts {
+  route: {
+    objects: number;
+    /**
+     * GCS only: route objects by the build that wrote them (`BUILD_ID` or
+     * `BUILD_ID:deploymentId`), `unstamped` for those written before 0.13.4.
+     * Any key other than `buildMeta.buildId` is left over and never served.
+     */
+    byGeneration?: Record<string, number>;
+  };
+  fetch: { objects: number };
+  image: { objects: number };
+  /** Size of the tag-to-keys mapping, or null when there is none. */
+  tagsMap: { bytes: number } | null;
+  /** The build the route cache was last invalidated for, or null when none is recorded. */
+  buildMeta: { buildId: string; timestamp: number; builtAt?: number } | null;
+}
+
+export interface SharedCacheStatsOptions {
+  /**
+   * Most entries to read per cache type (fetch, route, image). Default: all.
+   * Each entry is read, so a large cache takes one read per object.
+   */
+  limit?: number;
+}
+
 // ============================================================================
 // Cache Handler Interface Types
 // ============================================================================

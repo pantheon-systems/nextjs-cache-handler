@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileCacheHandler, getSharedCacheStats, clearSharedCache } from '../../src/handlers/file.js';
+import {
+  FileCacheHandler,
+  getSharedCacheStats,
+  getSharedCacheCounts,
+  clearSharedCache,
+} from '../../src/handlers/file.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { getTagRevalidation } from '../../src/utils/tags-manifest.js';
 import { hasStaleTags } from '../helpers/next-version.js';
@@ -597,5 +602,53 @@ describe('clearSharedCache', () => {
   it('should return 0 when no entries exist', async () => {
     const cleared = await clearSharedCache();
     expect(cleared).toBe(0);
+  });
+});
+
+describe('getSharedCacheCounts', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cache-counts-test-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tempDir);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('counts files and reads the tags map size and build meta without reading entries', async () => {
+    const cache = path.join(tempDir, '.next', 'cache');
+    for (const [dir, count] of [
+      ['route-cache', 3],
+      ['fetch-cache', 2],
+    ] as const) {
+      fs.mkdirSync(path.join(cache, dir), { recursive: true });
+      for (let i = 0; i < count; i++) fs.writeFileSync(path.join(cache, dir, `${i}.json`), 'not read');
+    }
+    fs.mkdirSync(path.join(cache, 'route-cache', 'subdir'));
+    fs.mkdirSync(path.join(cache, 'tags'), { recursive: true });
+    fs.writeFileSync(path.join(cache, 'tags', 'tags.json'), '{"t":["/a"]}');
+    fs.mkdirSync(path.join(tempDir, '.cache'));
+    fs.writeFileSync(path.join(tempDir, '.cache', 'build-meta.json'), JSON.stringify({ buildId: 'b1', timestamp: 2 }));
+
+    expect(await getSharedCacheCounts()).toEqual({
+      route: { objects: 3 },
+      fetch: { objects: 2 },
+      image: { objects: 0 },
+      tagsMap: { bytes: 12 },
+      buildMeta: { buildId: 'b1', timestamp: 2 },
+    });
+  });
+
+  it('reports zeros and nulls for an empty cache', async () => {
+    expect(await getSharedCacheCounts()).toEqual({
+      route: { objects: 0 },
+      fetch: { objects: 0 },
+      image: { objects: 0 },
+      tagsMap: null,
+      buildMeta: null,
+    });
   });
 });
