@@ -853,7 +853,7 @@ describe('UseCacheGcsHandler', () => {
 
       // Sanitized, plus a hash of the full key so similar keys don't share an object
       expect(mockBucket.file).toHaveBeenCalledWith(
-        expect.stringMatching(/^use-cache\/_api_cache_test_param_value-[0-9a-f]{16}\.json$/)
+        expect.stringMatching(/^use-cache\/_api_cache_test_param_value_[0-9a-f]{16}\.json$/)
       );
     });
   });
