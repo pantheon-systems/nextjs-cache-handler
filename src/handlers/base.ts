@@ -19,6 +19,21 @@ import { areTagsExpired, getTagRevalidation, nextChecksFetchTags, setTagRevalida
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
 let buildInvalidationPromise: Promise<void> | null = null;
 
+// This process's generation, read once: the fallback is a fresh timestamp on
+// every call, and route entries are stamped with it (see GcsCacheHandler).
+let processGeneration: string | null = null;
+
+/** Generation ID of the running build (build ID + deployment ID), or `fallback-<ms>` when unreadable. */
+export function getProcessGeneration(): string {
+  processGeneration ??= getCacheGenerationId();
+  return processGeneration;
+}
+
+/** Whether `generation` is a fallback, unique to its process because the build ID could not be read. */
+export function isFallbackGeneration(generation: string): boolean {
+  return generation.startsWith('fallback-');
+}
+
 /** Entry kinds that Next.js's FileSystemCache drops when one of their tags has expired. */
 const ROUTE_KINDS = new Set(['APP_PAGE', 'APP_ROUTE', 'PAGES']);
 
@@ -55,6 +70,7 @@ function loadFileSystemCacheCtor(): Promise<FileSystemCacheCtor | null> {
  */
 export function resetBuildInvalidationCheck(): void {
   buildInvalidationPromise = null;
+  processGeneration = null;
 }
 
 export interface BuildMeta {
@@ -210,7 +226,18 @@ export abstract class BaseCacheHandler {
 
   private async checkBuildInvalidation(): Promise<void> {
     // `buildId` holds the generation ID (build ID + deployment ID).
-    const currentBuildId = getCacheGenerationId();
+    const currentBuildId = getProcessGeneration();
+    if (isFallbackGeneration(currentBuildId)) {
+      // Unique to this process, so it would wipe the route cache and purge the
+      // CDN on every cold start. Nothing is recorded either.
+      this.log.warn(
+        `BUILD_ID unreadable (generation ${currentBuildId}); skipping build invalidation. Neither ` +
+          `.next/BUILD_ID nor .next/build-manifest.json is readable under ${process.cwd()}, so a new build is ` +
+          `not detected: on a deploy the route cache is not deleted, the CDN is not purged, and route entries ` +
+          `from earlier builds are served. Start the server from the directory that contains .next.`
+      );
+      return;
+    }
     const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
     const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
 
@@ -231,11 +258,14 @@ export abstract class BaseCacheHandler {
     }
 
     if (buildMeta.buildId !== currentBuildId) {
-      this.log.info(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
+      // warn, not info: once per deploy, and must be visible without CACHE_DEBUG
+      this.log.warn(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
 
       await this.invalidateRouteCache();
       await this.onNewGeneration(buildMeta);
 
+      // Last, so a process that dies part-way leaves the new build undetected
+      // and the next start resumes the invalidation.
       await this.writeBuildMeta(currentMeta);
     }
   }

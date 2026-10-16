@@ -6,11 +6,13 @@ export { BaseCacheHandler } from './base.js';
 export {
   FileCacheHandler,
   getSharedCacheStats as getFileSharedCacheStats,
+  getSharedCacheCounts as getFileSharedCacheCounts,
   clearSharedCache as clearFileSharedCache,
 } from './file.js';
 export {
   GcsCacheHandler,
   getSharedCacheStats as getGcsSharedCacheStats,
+  getSharedCacheCounts as getGcsSharedCacheCounts,
   clearSharedCache as clearGcsSharedCache,
   flushGcsTagsMapping,
   type FlushTagsMappingOptions,

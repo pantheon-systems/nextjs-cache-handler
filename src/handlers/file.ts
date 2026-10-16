@@ -7,6 +7,8 @@ import type {
   CacheEntryInfo,
   CacheHandlerValue,
   FileSystemCacheContext,
+  SharedCacheCounts,
+  SharedCacheStatsOptions,
 } from '../types.js';
 import { BaseCacheHandler, type BuildMeta } from './base.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
@@ -226,20 +228,66 @@ export class FileCacheHandler extends BaseCacheHandler {
 // ============================================================================
 
 /**
+ * Count the files in each cache directory and read the size of the tags map
+ * and the recorded build, without reading entries. Entries on disk carry no
+ * build, so `route.byGeneration` is not reported.
+ */
+export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
+  const cacheDir = path.join(process.cwd(), '.next', 'cache');
+  let buildMeta: BuildMeta | null = null;
+  try {
+    buildMeta = JSON.parse(await readFile(path.join(process.cwd(), '.cache', 'build-meta.json'), 'utf-8')) as BuildMeta;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  }
+  let tagsMap: { bytes: number } | null = null;
+  try {
+    tagsMap = { bytes: (await fs.promises.stat(path.join(cacheDir, 'tags', 'tags.json'))).size };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  return {
+    route: { objects: await countFiles(path.join(cacheDir, 'route-cache')) },
+    fetch: { objects: await countFiles(path.join(cacheDir, 'fetch-cache')) },
+    image: { objects: await countFiles(path.join(cacheDir, 'image-cache')) },
+    tagsMap,
+    buildMeta,
+  };
+}
+
+async function countFiles(dir: string): Promise<number> {
+  try {
+    return (await fs.promises.readdir(dir, { withFileTypes: true })).filter((entry) => entry.isFile()).length;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return 0;
+    }
+    throw error;
+  }
+}
+
+/**
  * Get cache statistics for the file-based cache.
  */
-export async function getSharedCacheStats(): Promise<CacheStats> {
+export async function getSharedCacheStats(options: SharedCacheStatsOptions = {}): Promise<CacheStats> {
   const fetchCacheDir = path.join(process.cwd(), '.next', 'cache', 'fetch-cache');
   const routeCacheDir = path.join(process.cwd(), '.next', 'cache', 'route-cache');
   const imageCacheDir = path.join(process.cwd(), '.next', 'cache', 'image-cache');
+
+  const limit = options.limit ?? Infinity;
 
   const keys: string[] = [];
   const entries: CacheEntryInfo[] = [];
 
   try {
-    await processCacheDirectory(fetchCacheDir, 'fetch', keys, entries);
-    await processCacheDirectory(routeCacheDir, 'route', keys, entries);
-    await processCacheDirectory(imageCacheDir, 'image', keys, entries);
+    await processCacheDirectory(fetchCacheDir, 'fetch', keys, entries, limit);
+    await processCacheDirectory(routeCacheDir, 'route', keys, entries, limit);
+    await processCacheDirectory(imageCacheDir, 'image', keys, entries, limit);
 
     fileLog.debug(
       `Found ${keys.length} cache entries ` +
@@ -259,11 +307,12 @@ async function processCacheDirectory(
   dir: string,
   cacheType: CacheEntryType,
   keys: string[],
-  entries: CacheEntryInfo[]
+  entries: CacheEntryInfo[],
+  limit: number
 ): Promise<void> {
   try {
     const files = await fs.promises.readdir(dir);
-    const jsonFiles = files.filter((file) => file.endsWith('.json'));
+    const jsonFiles = files.filter((file) => file.endsWith('.json')).slice(0, limit);
 
     for (const file of jsonFiles) {
       await processJsonCacheFile(dir, file, cacheType, keys, entries);
