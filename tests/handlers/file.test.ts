@@ -226,14 +226,18 @@ describe('FileCacheHandler', () => {
         }
       );
 
-      it('preserves the existing expiry when durations is present but expire is undefined', async () => {
-        await handler.revalidateTag('profile-tag', { expire: 120 });
-        const softExpired = getTagRevalidation('profile-tag')?.expired;
+      // Next.js 15 keeps one timestamp per tag, which the second revalidation moves.
+      it.skipIf(!hasStaleTags)(
+        'preserves the existing expiry when durations is present but expire is undefined',
+        async () => {
+          await handler.revalidateTag('profile-tag', { expire: 120 });
+          const softExpired = getTagRevalidation('profile-tag')?.expired;
 
-        await handler.revalidateTag('profile-tag', {});
+          await handler.revalidateTag('profile-tag', {});
 
-        expect(getTagRevalidation('profile-tag')?.expired).toBe(softExpired);
-      });
+          expect(getTagRevalidation('profile-tag')?.expired).toBe(softExpired);
+        }
+      );
     });
   });
 
