@@ -585,6 +585,12 @@ export class GcsCacheHandler extends BaseCacheHandler {
    * deploys. Goes through the shared buffer, whose conditional writes merge
    * with other instances; a key set again after this is kept (deletes apply
    * before adds). Never throws.
+   *
+   * Skipped when another instance has already recorded this build: it pruned
+   * before recording, and may now be serving and writing this build's keys,
+   * which share their paths with the previous build's. Until the build is
+   * recorded no instance serves it, so no key of this build can be removed,
+   * apart from one written between the check and the flush below.
    */
   private async removeRouteKeysFromTagsMap(): Promise<void> {
     const location = `gs://${this.bucketName}/${this.tagsMapKey}`;
@@ -603,6 +609,21 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // Route keys start with `/`; fetch keys are hashes.
     const routeKeys = [...new Set(Object.values(mapping).flat())].filter((key) => key.startsWith('/'));
     if (routeKeys.length === 0) {
+      return;
+    }
+    try {
+      if ((await this.readBuildMeta())?.buildId === getProcessGeneration()) {
+        this.log.info(
+          `Another instance already recorded this build and removed the previous build's route keys from ${location}`
+        );
+        return;
+      }
+    } catch (error) {
+      this.log.warn(
+        `Could not read build metadata to check whether another instance already removed the previous build's ` +
+          `route keys from ${location} (${errorLabel(error)}: ${errorMessage(error)}). They are left in it until ` +
+          `the next deploy, so this build's keys are not removed.`
+      );
       return;
     }
     this.tagsBuffer.deleteKeys(routeKeys);

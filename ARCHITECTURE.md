@@ -289,7 +289,7 @@ sequenceDiagram
     N->>G: delete route-cache/* one listed page (1,000) at a time, at most CACHE_INVALIDATION_DELETE_CONCURRENCY (50) in flight; skipped with CACHE_BUILD_INVALIDATION=off. Transient failures are retried (listing twice, deletes once); what still fails is logged with the fix, not thrown. Objects left behind are never served (route entries are stamped with their generation; another generation's is a miss)
     N->>P: full purge (awaited, before serving), even if deletes failed
     P->>CDN: purge everything
-    N->>G: remove route keys (starting with /) from tags.json through the tags buffer (conditional write, merged with other instances); fetch keys stay
+    N->>G: remove route keys (starting with /) from tags.json through the tags buffer (conditional write, merged with other instances); fetch keys stay. Skipped if build-meta.json, read again first, already records this generation (or cannot be read): another instance finished its check, so it may be serving this build, whose keys share their paths with the previous build's
     N->>G: prune revalidations.json to those since the previous build was built, deleting fetch-cache entries under the pruned tags first (background, skipped if the previous build-meta.json has no builtAt)
     N->>G: write build-meta.json
   else build-meta.json missing

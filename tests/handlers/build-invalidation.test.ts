@@ -387,6 +387,46 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['a1b2c3'] });
     });
 
+    it('keeps tags.json route keys when another instance recorded this build during the check', async () => {
+      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
+      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
+      const objects = pagedObjects(routePrefix, 10);
+      // Another instance finishes its check while this one is deleting, and
+      // serves `/en/blog` for build-B (the same key the previous build used).
+      mockBucket.getFiles.mockImplementation(async (query) => {
+        store[metaKey] = JSON.stringify({ buildId: 'build-B', timestamp: 2 });
+        return objects.getFiles(query);
+      });
+
+      await new GcsCacheHandler({} as any).get('k');
+
+      expect(objects.live.size).toBe(0);
+      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['/en/blog', 'a1b2c3'] });
+      expect(logged(warn)).not.toContainEqual(expect.stringContaining('Removed'));
+      expect(error).not.toHaveBeenCalled();
+    });
+
+    it('keeps tags.json route keys when build-meta.json cannot be read before removing them', async () => {
+      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
+      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
+      const objects = pagedObjects(routePrefix, 10);
+      // Readable for the build check, unreadable by the time the keys are removed.
+      mockBucket.getFiles.mockImplementation(async (query) => {
+        failingReads.add(metaKey);
+        return objects.getFiles(query);
+      });
+
+      await new GcsCacheHandler({} as any).get('k');
+
+      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['/en/blog', 'a1b2c3'] });
+      expect(logged(warn)).toContain(
+        "[GcsCacheHandler] Could not read build metadata to check whether another instance already removed the previous build's " +
+          `route keys from gs://test-bucket/${tagsKey} (503: Service unavailable). They are left in it until ` +
+          "the next deploy, so this build's keys are not removed."
+      );
+      expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+    });
+
     it('logs what an unreadable tags.json leaves behind', async () => {
       const tagsKey = 'environments/pr-42/cache/tags/tags.json';
       store[tagsKey] = JSON.stringify({ posts: ['/en/blog'] });
