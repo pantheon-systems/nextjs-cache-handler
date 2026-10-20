@@ -492,4 +492,20 @@ describe('FileCacheHandler build invalidation', () => {
     expect(writeBuildMeta).not.toHaveBeenCalled();
     expect(fs.existsSync(sentinel)).toBe(true);
   });
+
+  it('retries the build check with the next handler after build metadata could not be read', async () => {
+    const { metaFile, sentinel } = setUp((f) => fs.mkdirSync(f));
+    mockGenerationId = 'build-A';
+
+    await new FileCacheHandler({} as any).get('k');
+    expect(fs.existsSync(sentinel)).toBe(true);
+
+    // The read recovers; Next.js constructs a new handler for the next request.
+    fs.rmdirSync(metaFile);
+    fs.writeFileSync(metaFile, JSON.stringify({ buildId: 'build-old', timestamp: 1 }));
+    await new FileCacheHandler({} as any).get('k');
+
+    expect(fs.existsSync(sentinel)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8')).buildId).toBe('build-A');
+  });
 });

@@ -246,8 +246,12 @@ export abstract class BaseCacheHandler {
       buildMeta = await this.readBuildMeta();
     } catch (error) {
       // Not a first run: the previous generation is unknown, so the check
-      // (and any wipe and purge) is left to the next handler.
-      this.log.warn('Could not read build metadata; the build check is retried on the next request:', error);
+      // (and any wipe and purge) is left to the next handler. Next.js
+      // constructs one per request (IncrementalCache is request-scoped).
+      this.log.warn(
+        'Could not read build metadata; the build check is retried by the next request that uses the cache:',
+        error
+      );
       throw error;
     }
 
