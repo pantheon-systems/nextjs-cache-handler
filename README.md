@@ -112,6 +112,8 @@ interface CacheHandlerConfig {
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
 | `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries (the `memoryMb` option of `createUseCacheHandler` takes precedence) it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
+| `CACHE_INVALIDATION_DELETE_CONCURRENCY` | Deletes in flight at once when a new build deletes `route-cache/`, and when `clearSharedCache()` runs (default `50`, clamped to `1`–`200`). Raising it shortens the delete a new build waits for before serving. See [Build Invalidation](#build-invalidation). | Optional |
+| `CACHE_BUILD_INVALIDATION` | `off` stops a new build from deleting `route-cache/` (it still records the build and purges the CDN), for when the delete itself is the problem. Entries from earlier builds are still never served; they only take up storage until a deploy runs without `off`. Any other value, or unset, deletes as usual. | Optional |
 | `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for one interval plus up to 1 s (the interval again, capped at 1 s) after the first, 2 s by default. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
@@ -133,14 +135,14 @@ const FileCacheHandler = createCacheHandler({ type: 'file' });
 const GcsCacheHandler = createCacheHandler({ type: 'gcs' });
 ```
 
-### `getSharedCacheStats()`
+### `getSharedCacheStats(options?)`
 
-Returns cache statistics for the current environment.
+Returns cache statistics for the current environment. Every entry is read, so on a large cache pass `{ limit }` to read at most that many entries per cache type (fetch, route, image).
 
 ```typescript
 import { getSharedCacheStats } from '@pantheon-systems/nextjs-cache-handler';
 
-const stats = await getSharedCacheStats();
+const stats = await getSharedCacheStats(); // or getSharedCacheStats({ limit: 100 })
 console.log(stats);
 // {
 //   size: 10,
@@ -150,6 +152,31 @@ console.log(stats);
 //   ]
 // }
 ```
+
+### `getSharedCacheCounts()`
+
+Counts the objects in each cache and reads the size of the tag-to-keys mapping and the recorded
+build, without reading any entry. On GCS that is one list request per 1,000 objects plus two small
+reads, so it suits a large cache where `getSharedCacheStats()` would download every object. Route
+objects are also counted by the build that wrote them (GCS only): any key other than
+`buildMeta.buildId` is left over from an earlier build and never served, and `unstamped` counts
+entries written before 0.13.4. Rejects when the cache can't be read, rather than reporting zeros.
+
+```typescript
+import { getSharedCacheCounts } from '@pantheon-systems/nextjs-cache-handler';
+
+const counts = await getSharedCacheCounts();
+// {
+//   route: { objects: 1912, byGeneration: { 'a1B2c3:dpl-9': 1890, unstamped: 22 } },
+//   fetch: { objects: 340 },
+//   image: { objects: 57 },
+//   tagsMap: { bytes: 48211 },
+//   buildMeta: { buildId: 'a1B2c3:dpl-9', timestamp: 1791201540000, builtAt: 1791201480000 }
+// }
+```
+
+Each call lists the whole cache. If you expose it through a route, require authentication: it
+reveals how the cache is structured, and unauthenticated callers could run up list requests.
 
 ### `clearSharedCache()`
 
@@ -434,8 +461,11 @@ When deployed on Pantheon, the cache handlers automatically clear the CDN edge c
 
 - `revalidateTag()` calls (clears matching surrogate keys and paths)
 - `revalidatePath()` calls (clears the specific path from the CDN)
+- ISR regeneration storing a page (clears that page's paths)
+- A new build, when a starting process detects it (clears the whole CDN)
+- Another instance's revalidation, once this process reads it (clears the paths this process served from cache since)
 
-Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). It runs in the background and does not block cache operations.
+Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). `revalidateTag()` and `revalidatePath()` wait for the first purge, and a new build's full purge finishes before the process serves its first request; the other purges run in the background. A failed purge never fails the cache operation.
 
 ## Build Invalidation
 
@@ -446,6 +476,35 @@ On each new build, the handler automatically:
 3. Preserves the data cache (Fetch Cache)
 
 This matches Next.js's expected behavior where route cache is invalidated on each deploy but data cache persists.
+
+The GCS handler deletes `route-cache/` one listed page (1,000 objects) at a time, with at most
+`CACHE_INVALIDATION_DELETE_CONCURRENCY` deletes in flight, so memory stays flat however large the
+cache is. Requests wait for the whole check (the delete, a full CDN purge, and removing the
+previous build's keys from the tags map); the new build ID is written to `build-meta.json` last. A process that stops part-way keeps what it deleted, and
+the next one to start deletes the rest. Each run logs a warning such as
+`Route cache invalidation: deleted <deleted>/<listed> objects in <ms>ms`.
+
+The GCS handler also stamps each route entry with the build that wrote it, and a route entry from
+any other build is a cache miss (the build's prerender is used if there is one, otherwise the page is rendered again).
+Entries a failed delete leaves behind, or that an instance of another revision writes during a
+rollout, are therefore never served: they only take up storage until a later deploy deletes them.
+Fetch and image entries are not tied to a build and are kept across deploys. Entries written
+before 0.13.4 carry no build and miss once.
+
+A listing that fails with throttling, a timeout, a server error or a network error is retried
+twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still
+fails is logged with the failure counts by status (`503 x8, 403 x2`), the first error, and what to
+change: delete permission on the bucket (logged as an error, since every deploy fails the same way
+until it is fixed), or a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling.
+
+The previous build's route keys are also removed from the tag-to-keys mapping
+(`cache/tags/tags.json`); fetch keys stay.
+
+If the build ID can't be read (no `.next/BUILD_ID` or build manifest in the working directory),
+the process gets a generation of its own, so the check is skipped with a warning instead of wiping
+the cache and purging the CDN on every cold start. Such a process can't tell builds apart: a deploy
+neither deletes the route cache nor purges the CDN, and it serves route entries from any build.
+Start the server from the directory that contains `.next`.
 
 ## Debugging
 

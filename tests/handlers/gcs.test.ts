@@ -33,6 +33,13 @@ vi.mock('@google-cloud/storage', () => {
   };
 });
 
+// A real build ID: without .next/BUILD_ID in the working directory the
+// generation is a fallback-* value, for which the build check does nothing.
+vi.mock('../../src/utils/build-detection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/utils/build-detection.js')>()),
+  getCacheGenerationId: () => 'test-build',
+}));
+
 // Import after mock is set up
 import {
   GcsCacheHandler,
@@ -106,6 +113,8 @@ describe('GcsCacheHandler', () => {
     });
 
     it('should not touch the tags mapping on construction', async () => {
+      // The same build: a new one reads the mapping to remove its route keys.
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify({ buildId: 'test-build', timestamp: 1 }))]);
       new GcsCacheHandler({} as any);
 
       // Wait for async initialization
@@ -114,6 +123,36 @@ describe('GcsCacheHandler', () => {
       // The first flush creates the object with an ifGenerationMatch: 0 precondition instead.
       expect(mockBucket.file).not.toHaveBeenCalledWith('cache/tags/tags.json');
       expect(tagsMappingSaves()).toHaveLength(0);
+    });
+  });
+
+  describe('build stamp', () => {
+    it('stamps route entries with their build, in the JSON and the object metadata; fetch entries not at all', async () => {
+      const handler = new GcsCacheHandler({} as any);
+      await handler.set(
+        '/route-cache/APP_PAGE/h/$/x',
+        { kind: 'APP_PAGE', html: '', headers: {} } as any,
+        {
+          tags: [],
+        } as any
+      );
+      await handler.set(
+        'f1',
+        { kind: 'FETCH', data: { headers: {}, body: '', status: 200 } } as any,
+        {
+          tags: [],
+        } as any
+      );
+
+      const saves = mockFile.save.mock.calls.filter(([data]) => 'lastModified' in JSON.parse(data as string));
+      expect(saves).toHaveLength(2);
+      expect(JSON.parse(saves[0][0] as string).generation).toBe('test-build');
+      expect((saves[0][1] as any).metadata).toEqual({
+        contentType: 'application/json',
+        metadata: { generation: 'test-build' },
+      });
+      expect(JSON.parse(saves[1][0] as string)).not.toHaveProperty('generation');
+      expect((saves[1][1] as any).metadata).toEqual({ contentType: 'application/json' });
     });
   });
 
@@ -489,7 +528,9 @@ describe('GcsCacheHandler environment prefix', () => {
     await new Promise((r) => setTimeout(r, 50));
 
     // Build invalidation should list files only under the env prefix
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-42/route-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'environments/pr-42/route-cache/', autoPaginate: false })
+    );
   });
 
   it('should not touch other environments cache during invalidation', async () => {
@@ -554,8 +595,12 @@ describe('GCS standalone functions environment prefix', () => {
 
     await getSharedCacheStats();
 
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/fetch-cache/' });
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/route-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'environments/pr-99/fetch-cache/', autoPaginate: false })
+    );
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'environments/pr-99/route-cache/', autoPaginate: false })
+    );
   });
 
   it('clearSharedCache should use prefixed paths for multidev', async () => {
@@ -564,8 +609,12 @@ describe('GCS standalone functions environment prefix', () => {
 
     await clearSharedCache();
 
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/fetch-cache/' });
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'environments/pr-99/route-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'environments/pr-99/fetch-cache/', autoPaginate: false })
+    );
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'environments/pr-99/route-cache/', autoPaginate: false })
+    );
     expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-99/cache/tags/tags.json');
   });
 
@@ -575,8 +624,12 @@ describe('GCS standalone functions environment prefix', () => {
 
     await clearSharedCache();
 
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'fetch-cache/' });
-    expect(mockBucket.getFiles).toHaveBeenCalledWith({ prefix: 'route-cache/' });
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'fetch-cache/', autoPaginate: false })
+    );
+    expect(mockBucket.getFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ prefix: 'route-cache/', autoPaginate: false })
+    );
     expect(mockBucket.file).toHaveBeenCalledWith('cache/tags/tags.json');
   });
 });

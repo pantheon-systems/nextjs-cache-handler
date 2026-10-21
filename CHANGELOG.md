@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.13.4
+
+### Added
+
+- `CACHE_INVALIDATION_DELETE_CONCURRENCY` sets how many deletes are in flight at once when a new build deletes `route-cache/` and when `clearSharedCache()` runs (default `50`, clamped to `1`–`200`).
+- `CACHE_BUILD_INVALIDATION=off` stops a new build from deleting `route-cache/`, for when the delete itself is the problem; the build is still recorded and the CDN still purged. Entries from earlier builds are still not served (see below).
+- `getSharedCacheStats({ limit })` reads at most `limit` entries per cache type (fetch, route, image) instead of every object.
+- `getSharedCacheCounts()` returns the number of objects in each cache, route objects by the build that wrote them, the size of the tag-to-keys mapping and the recorded build, without reading any entry (on GCS, one list request per 1,000 objects plus two small reads). Use it to watch a large cache grow, or to see how many objects an earlier build left behind. Route entries now also carry their build as GCS object metadata (`generation`), which listings return.
+
+### Fixed
+
+- A new build no longer runs instances out of memory when `route-cache/` is large. The handler listed every object under `route-cache/` into memory, then sent one delete request per object at once; on a site with about 69,000 objects, instances ran out of memory before the delete finished, and since `build-meta.json` is written after it, every restart saw the new build again and started over. Objects are now listed 1,000 at a time and deleted with at most `CACHE_INVALIDATION_DELETE_CONCURRENCY` in flight, so memory stays flat however many there are. A process that stops part-way keeps what it deleted, and the next one deletes only what is left.
+- The route-cache delete on a new build is logged as a warning with its counts and duration (`Route cache invalidation: deleted <deleted>/<listed> objects in <ms>ms`), and so is the new build itself. Failures used to be swallowed without a log.
+- Route entries from another build are no longer served. Each route entry now records the build that wrote it, and one from a different build is a cache miss. Entries a failed delete left behind, or that the other revision wrote during a rollout or rollback, could serve HTML that loads another build's scripts. Fetch and image entries are unchanged.
+- Transient GCS failures (throttling, timeouts, server and network errors) are retried: page listings twice with backoff, deletes once. What still fails is logged with counts by status code, the first error, and the fix: delete permission on the bucket for 401/403 (logged as an error), or a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling.
+- A failed delete no longer skips the full CDN purge on a new build. One failure used to skip it, leaving the previous build's pages in the CDN.
+- A process whose build ID can't be read (`fallback-<timestamp>`, when neither `.next/BUILD_ID` nor the build manifest is readable from the working directory) skips the build check with a warning. Every such cold start used to delete `route-cache/` and purge the whole CDN. Such a process can't tell builds apart, so a deploy no longer deletes or purges anything for it, and it serves route entries from any build; the warning says to start the server from the directory that contains `.next`.
+- A new build removes the previous build's route keys from `cache/tags/tags.json`. Nothing removed them before, so the file grew with every URL ever cached, and each tag revalidation purged the CDN for pages that no longer exist. Fetch keys stay, since fetch entries survive deploys. An instance whose check finishes after another instance has already recorded the new build leaves the file alone, since the new build's pages use the same keys and may already be in it.
+- `clearSharedCache()` and `getSharedCacheStats()` list and delete or download a page at a time with a bounded number of requests in flight, instead of everything at once.
+
 ## 0.13.3
 
 ### Added

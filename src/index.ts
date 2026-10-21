@@ -1,10 +1,12 @@
-import type { CacheHandlerConfig, CacheStats } from './types.js';
+import type { CacheHandlerConfig, CacheStats, SharedCacheCounts, SharedCacheStatsOptions } from './types.js';
 import type { UseCacheHandlerConfig, UseCacheStats } from './handlers/use-cache/types.js';
 import {
   FileCacheHandler,
   GcsCacheHandler,
   getFileSharedCacheStats,
   getGcsSharedCacheStats,
+  getFileSharedCacheCounts,
+  getGcsSharedCacheCounts,
   clearFileSharedCache,
   clearGcsSharedCache,
   flushGcsTagsMapping,
@@ -103,11 +105,24 @@ function shouldUseGcs(type: 'auto' | 'file' | 'gcs'): boolean {
  * Get cache statistics for the current environment.
  * Automatically detects whether to use file-based or GCS cache stats.
  */
-export async function getSharedCacheStats(): Promise<CacheStats> {
+export async function getSharedCacheStats(options?: SharedCacheStatsOptions): Promise<CacheStats> {
   if (process.env.CACHE_BUCKET) {
-    return getGcsSharedCacheStats();
+    return getGcsSharedCacheStats(options);
   }
-  return getFileSharedCacheStats();
+  return getFileSharedCacheStats(options);
+}
+
+/**
+ * Count cache objects and read the size of the tags map and the recorded build,
+ * without reading entries. Cheap enough for a large cache, unlike
+ * getSharedCacheStats(). Rejects when the cache can't be read.
+ * Automatically detects whether to use file-based or GCS storage.
+ */
+export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
+  if (process.env.CACHE_BUCKET) {
+    return getGcsSharedCacheCounts();
+  }
+  return getFileSharedCacheCounts();
 }
 
 /**
@@ -217,6 +232,8 @@ export type {
   // Legacy types
   CacheHandlerConfig,
   CacheStats,
+  SharedCacheCounts,
+  SharedCacheStatsOptions,
   CacheEntryInfo,
   CacheContext,
   CacheEntry,

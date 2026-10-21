@@ -19,7 +19,13 @@
 // `@google-cloud/storage`, or other Node-only modules — that is the entire
 // point of the file.
 
-import type { CacheHandlerConfig, CacheStats, CacheHandlerValue } from './types.js';
+import type {
+  CacheHandlerConfig,
+  CacheStats,
+  CacheHandlerValue,
+  SharedCacheCounts,
+  SharedCacheStatsOptions,
+} from './types.js';
 import type { UseCacheHandlerConfig, UseCacheStats, UseCacheEntry } from './handlers/use-cache/types.js';
 import type { CacheClearResult } from './edge/edge-cache-clear.js';
 
@@ -88,8 +94,18 @@ export function createUseCacheHandler(_config?: UseCacheHandlerConfig): typeof E
 // Stats & cache management (edge-safe stubs)
 // ============================================================================
 
-export async function getSharedCacheStats(): Promise<CacheStats> {
+export async function getSharedCacheStats(_options?: SharedCacheStatsOptions): Promise<CacheStats> {
   return { size: 0, keys: [], entries: [] };
+}
+
+export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
+  return {
+    route: { objects: 0, byGeneration: {} },
+    fetch: { objects: 0 },
+    image: { objects: 0 },
+    tagsMap: null,
+    buildMeta: null,
+  };
 }
 
 export async function getUseCacheStats(): Promise<UseCacheStats> {
@@ -127,6 +143,8 @@ export async function flushSharedTagsMapping(_options?: { timeoutMs?: number }):
 export type {
   CacheHandlerConfig,
   CacheStats,
+  SharedCacheCounts,
+  SharedCacheStatsOptions,
   CacheEntryInfo,
   CacheContext,
   CacheEntry,

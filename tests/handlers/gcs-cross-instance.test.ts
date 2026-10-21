@@ -14,6 +14,14 @@ vi.mock('@google-cloud/storage', () => ({
   RETRYABLE_ERR_FN_DEFAULT: () => false,
 }));
 
+// A real build ID: without .next/BUILD_ID in the working directory the
+// generation is a fallback-* value, for which the build check does nothing.
+const generation = vi.hoisted(() => ({ id: 'test-build' }));
+vi.mock('../../src/utils/build-detection.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/utils/build-detection.js')>()),
+  getCacheGenerationId: () => generation.id,
+}));
+
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { hasStaleTags, nextMajor } from '../helpers/next-version.js';
 import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
@@ -89,6 +97,66 @@ describe('GcsCacheHandler across instances', () => {
   });
 
   const newHandler = () => new GcsCacheHandler({ serverDistDir } as any);
+
+  describe('route entries from another build', () => {
+    const key = '/route-cache/APP_PAGE/h/$/stamped';
+
+    /** Store a route entry through set(), then give it `stamp` (null: no stamp, undefined: as written). */
+    async function storeRoute(stamp?: string | null): Promise<string> {
+      await newHandler().set(key, page([]) as any, { tags: [] } as any);
+      const name = [...bucket.objects.keys()].find((n) => n.startsWith('route-cache/'))!;
+      if (stamp !== undefined) {
+        const entry = bucket.json(name) as Record<string, unknown>;
+        if (stamp === null) delete entry.generation;
+        else entry.generation = stamp;
+        bucket.putJson(name, entry);
+      }
+      return name;
+    }
+
+    afterEach(() => {
+      generation.id = 'test-build';
+      resetBuildInvalidationCheck();
+    });
+
+    it('stamps a route entry with this build and serves it without the stamp', async () => {
+      const name = await storeRoute();
+
+      expect(bucket.json(name)).toMatchObject({ generation: 'test-build' });
+      const entry = await newHandler().get(key, { kind: 'APP_PAGE' } as any);
+      expect(entry).toMatchObject({ value: { kind: 'APP_PAGE' } });
+      expect(entry).not.toHaveProperty('generation');
+    });
+
+    it('misses a route entry from another build', async () => {
+      await storeRoute('other-build');
+
+      expect(await newHandler().get(key, { kind: 'APP_PAGE' } as any)).toBeNull();
+    });
+
+    it('misses an unstamped route entry, as written before 0.13.4', async () => {
+      await storeRoute(null);
+
+      expect(await newHandler().get(key, { kind: 'APP_PAGE' } as any)).toBeNull();
+    });
+
+    it('serves fetch entries whatever build wrote them, and does not stamp them', async () => {
+      const value = { kind: 'FETCH', data: { headers: {}, body: 'x', status: 200 }, revalidate: 60 };
+      bucket.putJson('fetch-cache/abc123.json', { value, lastModified: Date.now(), tags: [] });
+      await newHandler().set('def456', value as any, { tags: [] } as any);
+
+      expect(await newHandler().get('abc123', { fetchCache: true } as any)).toMatchObject({ value });
+      expect(bucket.json('fetch-cache/def456.json')).not.toHaveProperty('generation');
+    });
+
+    it('serves any route entry in a process whose build ID is unreadable', async () => {
+      generation.id = 'fallback-1';
+      resetBuildInvalidationCheck();
+      await storeRoute('other-build');
+
+      expect(await newHandler().get(key, { kind: 'APP_PAGE' } as any)).toMatchObject({ value: { kind: 'APP_PAGE' } });
+    });
+  });
 
   describe('revalidations made on another instance (gap B)', () => {
     it('stores each revalidation for other instances', async () => {
@@ -435,6 +503,21 @@ describe('GcsCacheHandler across instances', () => {
       });
       expect(bucket.objects.has(oldFetch)).toBe(false);
       expect(bucket.objects.has(recentFetch)).toBe(true);
+    });
+
+    it("removes the previous build's route keys from tags.json, keeping fetch keys", async () => {
+      await deploy();
+
+      // The route key is gone; fetch keys stay (a1b2c3 leaves later, with the revalidation pruning).
+      expect(bucket.json(TAGS_MAP)).toEqual({ old: ['a1b2c3'], recent: ['d4e5f6'] });
+    });
+
+    it('keeps a route key the new build sets after the removal', async () => {
+      await deploy();
+      await newHandler().set('/route-cache/APP_PAGE/h/$/tags', page(['old']) as any, { tags: ['old'] } as any);
+      await flushGcsTagsMapping();
+
+      expect((bucket.json(TAGS_MAP) as Record<string, string[]>).old).toContain('/route-cache/APP_PAGE/h/$/tags');
     });
 
     it("records this build's prerender time for the next deploy", async () => {
