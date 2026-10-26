@@ -15,8 +15,10 @@ export interface PagedObjectsOptions {
 
 /**
  * Objects listed the way `getFiles({ autoPaginate: false })` lists them: in
- * name order, `maxResults` per page, resuming after `pageToken`. Records the
- * largest page and the most deletes and downloads in flight at once.
+ * name order, `maxResults` per page, from `startOffset` (inclusive), resuming
+ * after `pageToken`. Each object has a GCS generation, which `rewrite()` bumps
+ * and `delete({ ifGenerationMatch })` checks. Records the largest page and the
+ * most deletes and downloads in flight at once.
  */
 export function pagedObjects(prefix: string, total: number, opts: PagedObjectsOptions = {}) {
   const names = Array.from({ length: total }, (_, i) => `${prefix}${String(i).padStart(7, '0')}.json`);
@@ -30,6 +32,11 @@ export function pagedObjectsNamed(names: string[], opts: PagedObjectsOptions = {
   const deleted = new Set<string>();
   /** Delete calls per object name. */
   const deleteAttempts = new Map<string, number>();
+  /** GCS object generation per name. */
+  const generations = new Map(sorted.map((name, i) => [name, i + 1]));
+  let nextGeneration = sorted.length + 1;
+  /** Custom metadata set by rewrite(), over opts.customMetadata. */
+  const customByName = new Map<string, Record<string, string> | undefined>();
   let inFlight = 0;
   let maxInFlight = 0;
   let maxPage = 0;
@@ -49,8 +56,12 @@ export function pagedObjectsNamed(names: string[], opts: PagedObjectsOptions = {
     const i = index.get(name)!;
     return {
       name,
-      metadata: { updated: new Date(opts.updatedAt?.(i) ?? 0).toISOString(), metadata: opts.customMetadata?.(i) },
-      delete: () =>
+      metadata: {
+        generation: String(generations.get(name)),
+        updated: new Date(opts.updatedAt?.(i) ?? 0).toISOString(),
+        metadata: customByName.has(name) ? customByName.get(name) : opts.customMetadata?.(i),
+      },
+      delete: (options?: { ifGenerationMatch?: string | number }) =>
         track(() => {
           const attempt = (deleteAttempts.get(name) ?? 0) + 1;
           deleteAttempts.set(name, attempt);
@@ -58,6 +69,13 @@ export function pagedObjectsNamed(names: string[], opts: PagedObjectsOptions = {
           if (status !== undefined) throw error(status);
           if (opts.failDelete?.(i)) throw error(503);
           if (opts.notFoundDelete?.(i)) throw error(404);
+          if (!live.has(name)) throw error(404);
+          if (
+            options?.ifGenerationMatch !== undefined &&
+            String(options.ifGenerationMatch) !== String(generations.get(name))
+          ) {
+            throw error(412);
+          }
           live.delete(name);
           deleted.add(name);
         }),
@@ -70,25 +88,42 @@ export function pagedObjectsNamed(names: string[], opts: PagedObjectsOptions = {
       prefix,
       maxResults,
       pageToken,
+      startOffset,
       autoPaginate,
     }: {
       prefix: string;
       maxResults: number;
       pageToken?: string;
+      startOffset?: string;
       autoPaginate?: boolean;
     }) => {
       expect(autoPaginate).toBe(false);
       pages++;
-      const remaining = [...live].filter((n) => n.startsWith(prefix) && (!pageToken || n > pageToken));
+      const remaining = [...live]
+        .sort()
+        .filter((n) => n.startsWith(prefix) && (!pageToken || n > pageToken) && (!startOffset || n >= startOffset));
       const page = remaining.slice(0, maxResults);
       maxPage = Math.max(maxPage, page.length);
-      const next = remaining.length > maxResults ? { prefix, maxResults, pageToken: page[page.length - 1] } : null;
+      const next =
+        remaining.length > maxResults ? { prefix, maxResults, startOffset, pageToken: page[page.length - 1] } : null;
       return [page.map(file), next, {}];
     }
   );
 
+  /** Rewrite (or create) an object, as another instance's write would: it gets a new generation. */
+  const rewrite = (name: string, customMetadata?: Record<string, string>) => {
+    customByName.set(name, customMetadata);
+    if (!index.has(name)) {
+      index.set(name, index.size);
+    }
+    live.add(name);
+    deleted.delete(name);
+    generations.set(name, nextGeneration++);
+  };
+
   return {
     getFiles,
+    rewrite,
     live,
     deleted,
     deleteAttempts,

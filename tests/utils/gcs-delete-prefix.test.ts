@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
+  type DeletePrefixProgress,
   LIST_ATTEMPTS,
   ListPrefixError,
   deletePrefix,
@@ -144,17 +145,66 @@ describe('deletePrefix', () => {
 
   it('reports progress after each page', async () => {
     const objects = pagedObjects(PREFIX, 2500);
-    const progress: Array<{ listed: number; deleted: number }> = [];
+    const progress: DeletePrefixProgress[] = [];
     await deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
       pageSize: 1000,
       onPage: (p) => progress.push(p),
     });
 
     expect(progress).toEqual([
-      { listed: 1000, deleted: 1000 },
-      { listed: 2000, deleted: 2000 },
-      { listed: 2500, deleted: 2500 },
+      { listed: 1000, deleted: 1000, failed: 0, lastName: `${PREFIX}0000999.json` },
+      { listed: 2000, deleted: 2000, failed: 0, lastName: `${PREFIX}0001999.json` },
+      { listed: 2500, deleted: 2500, failed: 0, lastName: `${PREFIX}0002499.json` },
     ]);
+  });
+
+  it('resumes from startOffset without listing the names before it', async () => {
+    const objects = pagedObjects(PREFIX, 2500);
+    const r = await deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
+      pageSize: 1000,
+      startOffset: `${PREFIX}0002000.json`,
+    });
+
+    expect(r).toMatchObject({ listed: 500, deleted: 500 });
+    expect(objects.live.size).toBe(2000);
+    expect(objects.live.has(`${PREFIX}0001999.json`)).toBe(true);
+    expect(objects.getFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts objects shouldDelete leaves alone as skipped', async () => {
+    const objects = pagedObjects(PREFIX, 100);
+    const r = await deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
+      shouldDelete: (file) => !file.name.endsWith('5.json'),
+    });
+
+    expect(r).toMatchObject({ listed: 100, deleted: 90, skipped: 10, changed: 0 });
+  });
+
+  it('with ifUnchanged, keeps an object rewritten after it was listed', async () => {
+    const objects = pagedObjects(PREFIX, 10);
+    const rewritten = `${PREFIX}0000003.json`;
+    const getFiles = vi.fn(async (query: any) => {
+      const response = await objects.getFiles(query);
+      objects.rewrite(rewritten); // another instance writes it between the listing and the delete
+      return response;
+    });
+    const r = await deletePrefix({ getFiles } as any, PREFIX, { ifUnchanged: true });
+
+    expect(r).toMatchObject({ listed: 10, deleted: 9, changed: 1, failed: 0 });
+    expect([...objects.live]).toEqual([rewritten]);
+  });
+
+  it('without ifUnchanged, deletes an object rewritten after it was listed', async () => {
+    const objects = pagedObjects(PREFIX, 10);
+    const getFiles = vi.fn(async (query: any) => {
+      const response = await objects.getFiles(query);
+      objects.rewrite(`${PREFIX}0000003.json`);
+      return response;
+    });
+    const r = await deletePrefix({ getFiles } as any, PREFIX);
+
+    expect(r).toMatchObject({ deleted: 10, changed: 0 });
+    expect(objects.live.size).toBe(0);
   });
 
   it('lists once and deletes nothing under an empty prefix', async () => {

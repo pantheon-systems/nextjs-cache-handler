@@ -1,5 +1,5 @@
-import type { Bucket, File, GetFilesResponse } from '@google-cloud/storage';
-import { getErrorStatusCode, isNotFound } from './gcs-json-object.js';
+import type { Bucket, DeleteFileOptions, File, GetFilesResponse } from '@google-cloud/storage';
+import { getErrorStatusCode, isNotFound, isPreconditionFailure } from './gcs-json-object.js';
 
 /**
  * Listing and deleting every object under a prefix one page at a time, so
@@ -90,17 +90,25 @@ export class ListPrefixError extends Error {
 
 /**
  * Pages of objects under `prefix`, `pageSize` at a time; only one page is held
- * at once. A transient listing failure is retried with backoff; one that keeps
- * failing, or a permanent one (403), throws ListPrefixError.
+ * at once. With `startOffset`, the listing starts at that name (inclusive), in
+ * name order. A transient listing failure is retried with backoff; one that
+ * keeps failing, or a permanent one (403), throws ListPrefixError.
  */
 export async function* listPrefixPages(
   bucket: Bucket,
   prefix: string,
-  pageSize = DEFAULT_LIST_PAGE_SIZE
+  pageSize = DEFAULT_LIST_PAGE_SIZE,
+  startOffset?: string
 ): AsyncGenerator<File[]> {
   let pageToken: string | undefined;
   do {
-    const query = { prefix, maxResults: pageSize, autoPaginate: false, pageToken };
+    const query = {
+      prefix,
+      maxResults: pageSize,
+      autoPaginate: false,
+      pageToken,
+      ...(startOffset ? { startOffset } : {}),
+    };
     let response: GetFilesResponse | undefined;
     for (let attempt = 1; !response; attempt++) {
       try {
@@ -138,14 +146,34 @@ export interface DeletePrefixOptions {
   concurrency?: number;
   /** Delete only matching objects (e.g. static-route preservation). */
   shouldDelete?: (file: File) => boolean;
+  /** Start listing at this object name (inclusive), to resume an earlier run. */
+  startOffset?: string;
+  /**
+   * Delete an object only if it is still the version listed (its GCS
+   * generation), so one rewritten after the listing is kept and counted as
+   * `changed`.
+   */
+  ifUnchanged?: boolean;
   /** Called after each page; may throw to stop. */
-  onPage?: (progress: { listed: number; deleted: number }) => Promise<void> | void;
+  onPage?: (progress: DeletePrefixProgress) => Promise<void> | void;
+}
+
+export interface DeletePrefixProgress {
+  listed: number;
+  deleted: number;
+  failed: number;
+  /** Name of the last object listed so far; a later run can resume from it with `startOffset`. */
+  lastName?: string;
 }
 
 export interface DeletePrefixResult {
   listed: number;
   /** Deleted, or already gone (404). */
   deleted: number;
+  /** Left alone by `shouldDelete`. */
+  skipped: number;
+  /** Rewritten after it was listed, so kept (`ifUnchanged`). */
+  changed: number;
   /** Still not deleted after a retry (transient errors) or at once (others). */
   failed: number;
   /** Failed deletes by errorLabel(), e.g. `{ '503': 8, '403': 2 }`. */
@@ -171,9 +199,18 @@ export async function deletePrefix(
   const started = Date.now();
   let listed = 0;
   let deleted = 0;
+  let skipped = 0;
+  let changed = 0;
   let failed = 0;
+  let lastName: string | undefined;
   const failures: Record<string, number> = {};
   let firstError: unknown;
+
+  // The SDK sends delete() options as query parameters; its type omits the preconditions.
+  const del = (file: File): Promise<unknown> =>
+    opts.ifUnchanged && file.metadata?.generation !== undefined
+      ? file.delete({ ifGenerationMatch: file.metadata.generation } as DeleteFileOptions)
+      : file.delete();
 
   const recordFailure = (error: unknown) => {
     failed++;
@@ -183,14 +220,18 @@ export async function deletePrefix(
   };
 
   try {
-    for await (const files of listPrefixPages(bucket, prefix, opts.pageSize)) {
+    for await (const files of listPrefixPages(bucket, prefix, opts.pageSize, opts.startOffset)) {
       listed += files.length;
+      lastName = files.at(-1)?.name ?? lastName;
       const targets = opts.shouldDelete ? files.filter(opts.shouldDelete) : files;
+      skipped += files.length - targets.length;
 
       const retry: File[] = [];
-      (await mapInBatches(targets, concurrency, (file) => file.delete())).forEach((result, i) => {
+      (await mapInBatches(targets, concurrency, del)).forEach((result, i) => {
         if (result.status === 'fulfilled' || isNotFound(result.reason)) {
           deleted++;
+        } else if (opts.ifUnchanged && isPreconditionFailure(result.reason)) {
+          changed++;
         } else if (isTransientError(result.reason)) {
           retry.push(targets[i]);
         } else {
@@ -200,16 +241,18 @@ export async function deletePrefix(
 
       if (retry.length > 0) {
         await sleep(retryBaseDelayMs);
-        for (const result of await mapInBatches(retry, concurrency, (file) => file.delete())) {
+        for (const result of await mapInBatches(retry, concurrency, del)) {
           if (result.status === 'fulfilled' || isNotFound(result.reason)) {
             deleted++;
+          } else if (opts.ifUnchanged && isPreconditionFailure(result.reason)) {
+            changed++;
           } else {
             recordFailure(result.reason);
           }
         }
       }
 
-      await opts.onPage?.({ listed, deleted });
+      await opts.onPage?.({ listed, deleted, failed, lastName });
     }
   } catch (error) {
     if (error instanceof ListPrefixError) {
@@ -218,7 +261,7 @@ export async function deletePrefix(
     throw error;
   }
 
-  return { listed, deleted, failed, failures, firstError, durationMs: Date.now() - started };
+  return { listed, deleted, skipped, changed, failed, failures, firstError, durationMs: Date.now() - started };
 }
 
 /** Failure counts as `503 x8, 403 x2`, most frequent first. */

@@ -47,9 +47,44 @@ import {
   clearSharedCache,
   resetGcsSharedState,
   flushGcsTagsMapping,
+  waitForRouteCacheCleanupsForTests,
 } from '../../src/handlers/gcs.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { DEFAULT_TAGS_FLUSH_INTERVAL_MS } from '../../src/utils/tags-buffer.js';
+
+/**
+ * A clean-up job object that keeps what is written to it (the shared mockFile
+ * returns build meta for every key), so a new build's job can be read back,
+ * and no tags map.
+ */
+function statefulCleanupJob() {
+  let data: string | null = null;
+  let generation = 0;
+  const notFound = () => Object.assign(new Error('Not Found'), { code: 404 });
+  const file = {
+    ...mockFile,
+    getMetadata: vi.fn(async () => {
+      if (data === null) throw notFound();
+      return [{ generation: String(generation) }];
+    }),
+    download: vi.fn(async () => {
+      if (data === null) throw notFound();
+      return [Buffer.from(data)];
+    }),
+    save: vi.fn(async (written: string) => {
+      data = written;
+      generation++;
+    }),
+    delete: vi.fn(async () => {
+      data = null;
+    }),
+  };
+  // No tags map, so the clean-up's pruning reads nothing.
+  const noTagsMap = { ...mockFile, getMetadata: vi.fn(async () => Promise.reject(notFound())) };
+  mockBucket.file.mockImplementation(((key: string) =>
+    key.endsWith('route-cache-cleanup.json') ? file : key.endsWith('tags/tags.json') ? noTagsMap : mockFile) as any);
+  return file;
+}
 
 /** save() calls that wrote the tags mapping (tag -> keys), not an entry, build meta or revalidations. */
 function tagsMappingSaves() {
@@ -523,11 +558,14 @@ describe('GcsCacheHandler environment prefix', () => {
 
     const buildMeta = { buildId: 'old-build', timestamp: 1 };
     mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(buildMeta))]);
+    statefulCleanupJob();
 
     new GcsCacheHandler({} as any);
     await new Promise((r) => setTimeout(r, 50));
+    await waitForRouteCacheCleanupsForTests();
 
     // Build invalidation should list files only under the env prefix
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/route-cache-cleanup.json');
     expect(mockBucket.getFiles).toHaveBeenCalledWith(
       expect.objectContaining({ prefix: 'environments/pr-42/route-cache/', autoPaginate: false })
     );
@@ -1049,12 +1087,18 @@ describe('GcsCacheHandler build invalidation on a cold start', () => {
   });
 
   it('runs the check once even when several handlers are constructed concurrently', async () => {
+    const job = statefulCleanupJob();
     new GcsCacheHandler({} as any);
     new GcsCacheHandler({} as any);
     new GcsCacheHandler({} as any);
     await new Promise((r) => setTimeout(r, 50));
+    await waitForRouteCacheCleanupsForTests();
 
-    const routeCacheWipes = mockBucket.getFiles.mock.calls.filter(([args]) => args.prefix === 'route-cache/');
-    expect(routeCacheWipes).toHaveLength(1);
+    // One job recorded, and one clean-up: a listing to delete, then one to prune the tags map.
+    const created = job.save.mock.calls.filter(([data]) => JSON.parse(data as string).totals?.runs === 0);
+    expect(created).toHaveLength(1);
+    const routeCacheListings = mockBucket.getFiles.mock.calls.filter(([args]) => args.prefix === 'route-cache/');
+    expect(routeCacheListings).toHaveLength(2);
+    expect(job.delete).toHaveBeenCalledTimes(1);
   });
 });

@@ -171,6 +171,11 @@ export abstract class BaseCacheHandler {
   /** The stored build metadata, or null when none is stored. Throws when it can't be read. */
   protected abstract readBuildMeta(): Promise<BuildMeta | null>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
+  /**
+   * Make a new build's route cache safe to serve from, before the build is
+   * recorded. Entries from other builds are already misses; work that only
+   * frees storage can wait for onBuildCurrent().
+   */
   protected abstract invalidateRouteCache(): Promise<void>;
 
   // ============================================================================
@@ -272,6 +277,7 @@ export abstract class BaseCacheHandler {
       // and the next start resumes the invalidation.
       await this.writeBuildMeta(currentMeta);
     }
+    this.onBuildCurrent();
   }
 
   /** Stored build metadata that isn't valid JSON counts as an unknown previous generation. */
@@ -282,6 +288,15 @@ export abstract class BaseCacheHandler {
       this.log.warn('Stored build metadata is not valid JSON; treating it as a different build');
       return { buildId: '', timestamp: 0 };
     }
+  }
+
+  /**
+   * Called once the stored build is this process's, with nothing awaiting it:
+   * work that must not hold up requests starts here. Not called on a first run.
+   * Default: nothing.
+   */
+  protected onBuildCurrent(): void {
+    // Default implementation does nothing
   }
 
   /**

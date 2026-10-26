@@ -24,7 +24,13 @@ vi.mock('../../src/utils/build-detection.js', async (importOriginal) => ({
 
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { hasStaleTags, nextMajor } from '../helpers/next-version.js';
-import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
+import {
+  GcsCacheHandler,
+  resetGcsSharedState,
+  flushGcsTagsMapping,
+  waitForRouteCacheCleanupsForTests,
+} from '../../src/handlers/gcs.js';
+import { toObjectName } from '../../src/utils/object-names.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
 import { resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
@@ -508,8 +514,9 @@ describe('GcsCacheHandler across instances', () => {
     it("removes the previous build's route keys from tags.json, keeping fetch keys", async () => {
       await deploy();
 
-      // The route key is gone; fetch keys stay (a1b2c3 leaves later, with the revalidation pruning).
-      expect(bucket.json(TAGS_MAP)).toEqual({ old: ['a1b2c3'], recent: ['d4e5f6'] });
+      // The route key is gone and d4e5f6 stays; a1b2c3 leaves with the revalidation
+      // pruning, which also runs in the background.
+      expect(bucket.json(TAGS_MAP)).toEqual({ recent: ['d4e5f6'] });
     });
 
     it('keeps a route key the new build sets after the removal', async () => {
@@ -564,6 +571,57 @@ describe('GcsCacheHandler across instances', () => {
       await deploy();
 
       expect(bucket.json(REVALIDATIONS)).toHaveProperty('older');
+    });
+  });
+
+  describe('deploy hand-over: deleting the route cache in the background', () => {
+    const shared = '/route-cache/APP_PAGE/shared';
+    const old = '/route-cache/APP_PAGE/old';
+    const objectOf = (key: string) => `route-cache/${toObjectName(key)}.json`;
+
+    beforeEach(() => {
+      resetBuildInvalidationCheck();
+      bucket.putJson('build-meta.json', { buildId: 'previous-build', timestamp: 1 });
+      for (const key of [shared, old]) {
+        bucket.putJson(
+          objectOf(key),
+          { value: page(['posts']), lastModified: 1, tags: ['posts'] },
+          {
+            generation: 'previous-build',
+          }
+        );
+      }
+      bucket.putJson(TAGS_MAP, { posts: [shared, old] });
+    });
+
+    afterEach(() => resetBuildInvalidationCheck());
+
+    it('keeps a page, and its tags map key, that the new build caches while the delete waits', async () => {
+      // The clean-up's first listing waits until released.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      const getFiles = bucket.getFiles.bind(bucket);
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        await released;
+        return getFiles(query);
+      });
+
+      // The first request is answered while the delete has not started.
+      expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).toBeNull();
+      expect(bucket.json('build-meta.json')).toMatchObject({ buildId: 'test-build' });
+
+      // A new-build instance caches `shared` again, before the delete reaches it.
+      await newHandler().set(shared, page(['posts']) as any, { tags: ['posts'] } as any);
+      await flushGcsTagsMapping();
+
+      release();
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.has(objectOf(old))).toBe(false);
+      expect(bucket.objects.get(objectOf(shared))?.custom).toEqual({ generation: 'test-build' });
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).not.toBeNull();
     });
   });
 

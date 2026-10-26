@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { pagedObjects } from '../helpers/paged-objects.js';
+import { pagedObjects, pagedObjectsNamed } from '../helpers/paged-objects.js';
+import { toObjectName } from '../../src/utils/object-names.js';
 import { setRetryBaseDelayForTests } from '../../src/utils/gcs-delete-prefix.js';
 
 // Route/ISR invalidation keyed on the generation ID (build ID + optional deployment ID).
@@ -45,7 +46,8 @@ vi.mock('@google-cloud/storage', () => ({
 }));
 vi.stubGlobal('fetch', vi.fn());
 
-const { GcsCacheHandler } = await import('../../src/handlers/gcs.js');
+const { GcsCacheHandler, resetGcsSharedState, waitForRouteCacheCleanupsForTests } =
+  await import('../../src/handlers/gcs.js');
 const { FileCacheHandler } = await import('../../src/handlers/file.js');
 const { resetBuildInvalidationCheck } = await import('../../src/handlers/base.js');
 
@@ -73,6 +75,7 @@ describe('GcsCacheHandler build invalidation', () => {
     vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
     mockBucket.getFiles.mockResolvedValue([[]]);
     resetBuildInvalidationCheck();
+    resetGcsSharedState();
   });
 
   afterEach(() => {
@@ -88,6 +91,7 @@ describe('GcsCacheHandler build invalidation', () => {
 
     const handler = new GcsCacheHandler({} as any);
     await handler.get('k');
+    await waitForRouteCacheCleanupsForTests();
 
     if (invalidates) {
       expect(mockBucket.getFiles).toHaveBeenCalledWith(
@@ -115,6 +119,7 @@ describe('GcsCacheHandler build invalidation', () => {
     failingReads.add(metaKey);
 
     await new GcsCacheHandler({} as any).get('k');
+    await waitForRouteCacheCleanupsForTests();
 
     // Not treated as a first run: no new generation recorded, nothing wiped or purged yet.
     expect(JSON.parse(store[metaKey]).buildId).toBe('build-A');
@@ -123,6 +128,7 @@ describe('GcsCacheHandler build invalidation', () => {
 
     failingReads.delete(metaKey);
     await new GcsCacheHandler({} as any).get('k');
+    await waitForRouteCacheCleanupsForTests();
 
     expect(mockBucket.getFiles).toHaveBeenCalledWith(
       expect.objectContaining({ prefix: 'environments/pr-42/route-cache/', autoPaginate: false })
@@ -140,6 +146,7 @@ describe('GcsCacheHandler build invalidation', () => {
     mockGenerationId = 'build-A';
 
     await new GcsCacheHandler({} as any).get('k');
+    await waitForRouteCacheCleanupsForTests();
 
     expect(mockBucket.getFiles).toHaveBeenCalledWith(
       expect.objectContaining({ prefix: 'environments/pr-42/route-cache/', autoPaginate: false })
@@ -150,13 +157,13 @@ describe('GcsCacheHandler build invalidation', () => {
 
   describe('at scale', () => {
     const metaKey = 'environments/pr-42/build-meta.json';
+    const jobKey = 'environments/pr-42/route-cache-cleanup.json';
+    const tagsKey = 'environments/pr-42/cache/tags/tags.json';
     const routePrefix = 'environments/pr-42/route-cache/';
     const fullPurges = () =>
       vi.mocked(fetch).mock.calls.filter(([url]) => url === 'http://proxy.example.com:8080/rest/v0alpha1/cache');
     const location = 'gs://test-bucket/environments/pr-42/route-cache/';
-    const leftovers =
-      `The objects left in ${location} are not served (route entries from another build count as cache ` +
-      'misses). Startup continues, and the next deploy deletes them.';
+    const leftovers = 'The objects left behind are not served; the next deploy deletes them.';
     const throttled =
       'GCS throttled or was unavailable after retries; a lower CACHE_INVALIDATION_DELETE_CONCURRENCY (now 50) reduces throttling.';
     const denied =
@@ -166,6 +173,15 @@ describe('GcsCacheHandler build invalidation', () => {
     /** Messages logged to `spy`, with durations replaced by N. */
     const logged = (spy: ReturnType<typeof vi.spyOn>) =>
       spy.mock.calls.map(([message]) => String(message).replace(/in \d+ms/, 'in Nms'));
+    const finished = (deleted: number, listed: number, kept = 0, failed = 0, runs = 1) =>
+      `[GcsCacheHandler] Route cache clean-up for build build-B finished: deleted ${deleted} objects of earlier ` +
+      `builds (${listed} listed, ${kept} of this build kept, 0 rewritten during the delete kept), ${failed} failed, ` +
+      `in Nms over ${runs} run${runs === 1 ? '' : 's'}`;
+    /** Serve one request on a fresh handler, then wait for the clean-up it started. */
+    const serve = async () => {
+      await new GcsCacheHandler({} as any).get('k');
+      await waitForRouteCacheCleanupsForTests();
+    };
 
     beforeAll(() => setRetryBaseDelayForTests(0));
     afterAll(() => setRetryBaseDelayForTests(1000));
@@ -202,44 +218,69 @@ describe('GcsCacheHandler build invalidation', () => {
       return { writes, restore: () => mockBucket.file.mockImplementation(original) };
     }
 
-    it('deletes a page at a time within the concurrency limit, then purges and records the build', async () => {
+    it('records the build and answers before the delete, then deletes a page at a time in the background', async () => {
       process.env.CACHE_INVALIDATION_DELETE_CONCURRENCY = '20';
       const objects = pagedObjects(routePrefix, 3500);
-      mockBucket.getFiles.mockImplementation(objects.getFiles);
+      // Listings wait until released, so the request can be shown to finish first.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      mockBucket.getFiles.mockImplementation(async (query) => {
+        await released;
+        return objects.getFiles(query);
+      });
       const meta = recordMetaWrites(objects);
 
       try {
         await new GcsCacheHandler({} as any).get('k');
+        expect(meta.writes).toEqual([3500]); // recorded before anything was deleted
+        expect(fullPurges()).toHaveLength(1);
+        expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+        expect(objects.live.size).toBe(3500);
+
+        release();
+        await waitForRouteCacheCleanupsForTests();
       } finally {
         meta.restore();
       }
 
       expect(objects.live.size).toBe(0);
-      expect(objects.stats()).toMatchObject({ maxInFlight: 20, maxPage: 1000, pages: 4 });
+      expect(objects.stats()).toMatchObject({ maxInFlight: 20, maxPage: 1000, pages: 5 }); // 4 to delete, 1 to prune
       for (const [args] of mockBucket.getFiles.mock.calls) {
         expect(args).toMatchObject({ prefix: routePrefix, autoPaginate: false, maxResults: 1000 });
       }
-      expect(meta.writes).toEqual([0]); // once, after every delete
+      expect(logged(warn)).toContain(finished(3500, 3500));
+      expect(store[jobKey]).toBeUndefined();
       expect(fullPurges()).toHaveLength(1);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringMatching(/Route cache invalidation: deleted 3500\/3500 objects in \d+ms$/)
-      );
-      expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
     });
 
-    it('warns about deletes that still fail after a retry, with the fix, and still purges and records the build', async () => {
+    it("keeps the current build's objects, and their keys in tags.json", async () => {
+      const current = `${routePrefix}${toObjectName('/en/blog')}.json`;
+      const objects = pagedObjectsNamed(
+        Array.from({ length: 10 }, (_, i) => `${routePrefix}old-${i}.json`),
+        { customMetadata: () => ({ generation: 'build-A' }) }
+      );
+      objects.rewrite(current, { generation: 'build-B' }); // cached by an instance of the new build
+      mockBucket.getFiles.mockImplementation(objects.getFiles);
+      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', '/en/old', 'a1b2c3'] });
+
+      await serve();
+
+      expect([...objects.live]).toEqual([current]);
+      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['/en/blog', 'a1b2c3'] });
+      expect(logged(warn)).toContain(
+        `[GcsCacheHandler] Removed 1 route keys of earlier builds from gs://test-bucket/${tagsKey}`
+      );
+    });
+
+    it('warns about deletes that still fail after a retry, with the fix', async () => {
       const objects = pagedObjects(routePrefix, 100, { failDelete: (i) => i < 3 });
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
-      expect(logged(warn)).toContain(
-        '[GcsCacheHandler] Route cache invalidation: deleted 97/100 objects in Nms; 3 could not be deleted ' +
-          `(503 x3; first error: HTTP 503). ${leftovers} ${throttled}`
-      );
+      expect(logged(warn)).toContain(`${finished(97, 100, 0, 3)} (503 x3). ${leftovers} ${throttled}`);
       expect(error).not.toHaveBeenCalled(); // transient: the next deploy cleans up
       expect(objects.deleteAttempts.get(`${routePrefix}0000000.json`)).toBe(2);
-      expect(fullPurges()).toHaveLength(1);
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
     });
 
@@ -247,12 +288,9 @@ describe('GcsCacheHandler build invalidation', () => {
       const objects = pagedObjects(routePrefix, 10, { deleteStatus: () => 403 });
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
-      expect(logged(error)).toEqual([
-        '[GcsCacheHandler] Route cache invalidation: deleted 0/10 objects in Nms; 10 could not be deleted ' +
-          `(403 x10; first error: HTTP 403). ${leftovers} ${denied}`,
-      ]);
+      expect(logged(error)).toEqual([`${finished(0, 10, 0, 10)} (403 x10). ${leftovers} ${denied}`]);
       expect(objects.deleteAttempts.get(`${routePrefix}0000000.json`)).toBe(1); // not retried
     });
 
@@ -262,51 +300,59 @@ describe('GcsCacheHandler build invalidation', () => {
       });
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(error).not.toHaveBeenCalled();
-      expect(logged(warn)).toContain('[GcsCacheHandler] Route cache invalidation: deleted 10/10 objects in Nms');
+      expect(logged(warn)).toContain(finished(10, 10));
     });
 
-    it('resumes on the next start when a process dies part-way through the delete', async () => {
+    it('a later instance finishes when the instance deleting dies part-way', async () => {
       const objects = pagedObjects(routePrefix, 3500);
       // Run 1: the third page never comes back, standing in for the process dying.
       mockBucket.getFiles.mockImplementation(async (query) =>
         objects.stats().pages < 2 ? objects.getFiles(query) : new Promise(() => {})
       );
-      new GcsCacheHandler({} as any);
+      await new GcsCacheHandler({} as any).get('k');
       await vi.waitFor(() => expect(objects.deleted.size).toBe(2000));
 
-      expect(JSON.parse(store[metaKey]).buildId).toBe('build-A'); // the new build is not recorded yet
-      expect(fullPurges()).toHaveLength(0);
+      expect(JSON.parse(store[metaKey]).buildId).toBe('build-B'); // recorded before the delete
+      expect(fullPurges()).toHaveLength(1);
 
-      // Run 2: a fresh process.
+      // Run 2: a fresh process, after the dead one's lock expired.
+      resetGcsSharedState();
       resetBuildInvalidationCheck();
+      store[jobKey] = JSON.stringify({ ...JSON.parse(store[jobKey]), expiresAt: 0 });
       mockBucket.getFiles.mockImplementation(objects.getFiles);
       const listedBefore = objects.getFiles.mock.calls.length;
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(objects.live.size).toBe(0);
-      expect(objects.getFiles.mock.calls.length - listedBefore).toBe(2); // only the 1500 left
-      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/deleted 1500\/1500 objects/));
-      expect(fullPurges()).toHaveLength(1);
-      expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+      expect(objects.getFiles.mock.calls.length - listedBefore).toBe(3); // the 1500 left, then the pruning listing
+      expect(logged(warn)).toContain(finished(1500, 1500, 0, 0, 2));
+      expect(fullPurges()).toHaveLength(1); // the build was already recorded and purged
+      expect(store[jobKey]).toBeUndefined();
     });
 
-    it('logs how far it got when listing keeps failing, and still purges and records the build', async () => {
+    it('logs how far it got when listing keeps failing, and keeps the job for a later instance', async () => {
       const objects = pagedObjects(routePrefix, 2500, { deleteStatus: (i) => (i === 0 ? 403 : undefined) });
       mockBucket.getFiles
         .mockImplementationOnce(objects.getFiles)
         .mockRejectedValue(Object.assign(new Error('unavailable'), { code: 503 }));
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(mockBucket.getFiles).toHaveBeenCalledTimes(4); // one page, then three attempts at the next
-      expect(logged(error)).toEqual([
-        `[GcsCacheHandler] Route cache invalidation stopped: listing ${routePrefix} failed after 3 attempts ` +
-          '(503: unavailable), after deleting 999 of the 1000 objects listed so far (1 could not be deleted: 403 x1). ' +
-          `${leftovers} ${denied} ${throttled}`,
-      ]);
+      expect(logged(warn)).toContain(
+        `[GcsCacheHandler] Route cache clean-up for build build-B stopped (listing ${routePrefix} failed after 3 ` +
+          `attempts (503: unavailable)); a later instance resumes it from ${routePrefix}0000999.json. Objects left ` +
+          `behind are not served. ${throttled}`
+      );
+      expect(JSON.parse(store[jobKey])).toMatchObject({
+        keep: 'build-B',
+        cursor: `${routePrefix}0000999.json`,
+        totals: { deleted: 999, failed: 1, runs: 1 },
+      });
+      expect(JSON.parse(store[jobKey]).owner).toBeUndefined();
       expect(fullPurges()).toHaveLength(1);
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
     });
@@ -314,7 +360,7 @@ describe('GcsCacheHandler build invalidation', () => {
     it('does nothing for a fallback build ID', async () => {
       mockGenerationId = 'fallback-123';
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(mockBucket.getFiles).not.toHaveBeenCalled();
       expect(fetch).not.toHaveBeenCalled();
@@ -330,128 +376,91 @@ describe('GcsCacheHandler build invalidation', () => {
     it('does nothing for a fallback build ID with a deployment ID', async () => {
       mockGenerationId = 'fallback-123:dpl-1';
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(mockBucket.getFiles).not.toHaveBeenCalled();
       expect(fetch).not.toHaveBeenCalled();
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-A');
     });
 
-    it('deletes nothing with CACHE_BUILD_INVALIDATION=off, but purges and records the build', async () => {
+    it('deletes nothing with CACHE_BUILD_INVALIDATION=off, but purges, records the build and prunes tags.json', async () => {
       process.env.CACHE_BUILD_INVALIDATION = 'off';
+      const objects = pagedObjects(routePrefix, 10);
+      mockBucket.getFiles.mockImplementation(objects.getFiles);
+      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
-      expect(mockBucket.getFiles).not.toHaveBeenCalled();
+      expect(objects.deleted.size).toBe(0);
+      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['a1b2c3'] });
       expect(fullPurges()).toHaveLength(1);
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
       expect(logged(warn)).toContain(
-        `[GcsCacheHandler] CACHE_BUILD_INVALIDATION=off: ${location} was not deleted for the new build. Its ` +
+        `[GcsCacheHandler] CACHE_BUILD_INVALIDATION=off: ${location} is not deleted for the new build. Its ` +
           'entries from earlier builds are not served (they count as cache misses), but stay in storage until a ' +
           'deploy runs without CACHE_BUILD_INVALIDATION=off.'
       );
     });
 
     it("removes the previous build's route keys from tags.json once every object is deleted", async () => {
-      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
       store[tagsKey] = JSON.stringify({ posts: ['/en/blog', '/EN/Blog', 'a1b2c3'], nav: ['/en/blog'] });
       const objects = pagedObjects(routePrefix, 10);
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['a1b2c3'] }); // fetch keys survive deploys
       expect(logged(warn)).toContain(
-        '[GcsCacheHandler] Removed 2 route keys of the previous build from gs://test-bucket/' + tagsKey
+        '[GcsCacheHandler] Removed 2 route keys of earlier builds from gs://test-bucket/' + tagsKey
       );
       expect(error).not.toHaveBeenCalled();
     });
 
-    it('removes route keys from tags.json even when some objects could not be deleted, or with off', async () => {
-      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
+    it('removes route keys from tags.json even when some objects could not be deleted', async () => {
       store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
       const objects = pagedObjects(routePrefix, 10, { deleteStatus: (i) => (i === 0 ? 403 : undefined) });
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
-
-      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['a1b2c3'] });
-
-      // Another deploy, with deletion off.
-      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
-      mockGenerationId = 'build-C';
-      process.env.CACHE_BUILD_INVALIDATION = 'off';
-      resetBuildInvalidationCheck();
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['a1b2c3'] });
     });
 
-    it('keeps tags.json route keys when another instance recorded this build during the check', async () => {
-      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
-      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
-      const objects = pagedObjects(routePrefix, 10);
-      // Another instance finishes its check while this one is deleting, and
-      // serves `/en/blog` for build-B (the same key the previous build used).
-      mockBucket.getFiles.mockImplementation(async (query) => {
-        store[metaKey] = JSON.stringify({ buildId: 'build-B', timestamp: 2 });
-        return objects.getFiles(query);
-      });
-
-      await new GcsCacheHandler({} as any).get('k');
-
-      expect(objects.live.size).toBe(0);
-      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['/en/blog', 'a1b2c3'] });
-      expect(logged(warn)).not.toContainEqual(expect.stringContaining('Removed'));
-      expect(error).not.toHaveBeenCalled();
-    });
-
-    it('keeps tags.json route keys when build-meta.json cannot be read before removing them', async () => {
-      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
-      store[tagsKey] = JSON.stringify({ posts: ['/en/blog', 'a1b2c3'] });
-      const objects = pagedObjects(routePrefix, 10);
-      // Readable for the build check, unreadable by the time the keys are removed.
-      mockBucket.getFiles.mockImplementation(async (query) => {
-        failingReads.add(metaKey);
-        return objects.getFiles(query);
-      });
-
-      await new GcsCacheHandler({} as any).get('k');
-
-      expect(JSON.parse(store[tagsKey])).toEqual({ posts: ['/en/blog', 'a1b2c3'] });
-      expect(logged(warn)).toContain(
-        "[GcsCacheHandler] Could not read build metadata to check whether another instance already removed the previous build's " +
-          `route keys from gs://test-bucket/${tagsKey} (503: Service unavailable). They are left in it until ` +
-          "the next deploy, so this build's keys are not removed."
-      );
-      expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
-    });
-
-    it('logs what an unreadable tags.json leaves behind', async () => {
-      const tagsKey = 'environments/pr-42/cache/tags/tags.json';
+    it('keeps the job when tags.json is unreadable, and a later instance prunes it', async () => {
       store[tagsKey] = JSON.stringify({ posts: ['/en/blog'] });
       failingReads.add(tagsKey);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
-      expect(logged(error)).toEqual([
-        `[GcsCacheHandler] Could not read gs://test-bucket/${tagsKey} to remove the previous build's route keys ` +
-          '(503: Service unavailable). They stay in it until the next deploy; until then tag revalidations also ' +
-          'purge the CDN for pages that no longer exist.',
-      ]);
+      expect(logged(warn)).toContain(
+        '[GcsCacheHandler] Route cache clean-up for build build-B stopped (503: Service unavailable); a later ' +
+          `instance resumes it from the start. Objects left behind are not served. ${throttled}`
+      );
+      expect(JSON.parse(store[jobKey])).toMatchObject({ keep: 'build-B', deleted: true });
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
+
+      failingReads.delete(tagsKey);
+      resetGcsSharedState();
+      resetBuildInvalidationCheck();
+      await serve();
+      expect(JSON.parse(store[tagsKey])).toEqual({});
+      expect(store[jobKey]).toBeUndefined();
     });
 
-    it('says what a failed CDN purge leaves behind', async () => {
-      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
+    it('retries a failed CDN purge in the background', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(logged(error)).toEqual([
         expect.stringMatching(
-          /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. Pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared\.$/
+          /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. It is retried in the background; until it succeeds, pages from the previous build stay in the CDN\.$/
         ),
       ]);
+      expect(fullPurges()).toHaveLength(2);
+      expect(logged(warn)).toContain(
+        '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
+      );
     });
 
     it('clamps CACHE_INVALIDATION_DELETE_CONCURRENCY to 200', async () => {
@@ -459,7 +468,7 @@ describe('GcsCacheHandler build invalidation', () => {
       const objects = pagedObjects(routePrefix, 1000);
       mockBucket.getFiles.mockImplementation(objects.getFiles);
 
-      await new GcsCacheHandler({} as any).get('k');
+      await serve();
 
       expect(objects.live.size).toBe(0);
       expect(objects.stats().maxInFlight).toBe(200);

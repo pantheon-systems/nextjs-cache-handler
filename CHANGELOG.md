@@ -2,6 +2,19 @@
 
 ## 0.14.0
 
+### Changed
+
+- A new build no longer makes requests wait for the previous builds' route entries to be deleted.
+- Only one instance at a time deletes the earlier builds' route entries.
+- Earlier builds' route keys are removed from `cache/tags/tags.json` by the background clean-up, after the delete, and only for keys whose entries are not the running build's. 
+`CACHE_BUILD_INVALIDATION=off` skips the delete but now still prunes the tags map.
+
+### Fixed
+
+- The delete on a new build no longer removes pages that instances of the new build cached during the deploy. It skips objects stamped with the running build, and each delete is conditional on the object not having changed since it was listed.
+- Removing earlier builds' keys from `cache/tags/tags.json` no longer removes keys the new build wrote, so revalidating their tags purges those pages from the CDN.
+- A full CDN purge that fails when a new build is recorded is retried in the background until it succeeds, instead of only being logged.
+
 ## 0.13.4
 
 ### Added
