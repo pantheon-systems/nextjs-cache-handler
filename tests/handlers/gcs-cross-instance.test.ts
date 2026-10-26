@@ -623,6 +623,72 @@ describe('GcsCacheHandler across instances', () => {
       expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
       expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).not.toBeNull();
     });
+
+    it("counts the prune as stored when other requests' updates arrive during its write", async () => {
+      // Each tags.json write queues another request's update, so the buffer is never empty after a flush.
+      const real = bucket.file.bind(bucket);
+      let queued = 0;
+      vi.spyOn(bucket, 'file').mockImplementation((name, options) => {
+        const file = real(name, options);
+        if (name !== TAGS_MAP) return file;
+        return {
+          ...file,
+          save: async (data: string, saveOptions?: any) => {
+            await file.save(data, saveOptions);
+            if (++queued <= 2) {
+              await newHandler().set(
+                `/route-cache/APP_PAGE/other-${queued}`,
+                page(['nav']) as any,
+                {
+                  tags: ['nav'],
+                } as any
+              );
+            }
+          },
+        };
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(shared, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect((bucket.json(TAGS_MAP) as Record<string, string[]>).posts ?? []).toEqual([]);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
+    });
+
+    it('does not count the prune as stored when the buffer drops its removals', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const getFiles = bucket.getFiles.bind(bucket);
+        vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+          await released;
+          return getFiles(query);
+        });
+        await newHandler().get(shared, { kind: 'APP_PAGE' } as any);
+
+        // tags.json writes keep failing, and a fetch entry's update has been waiting longer than the buffer
+        // keeps one. A fetch key, so the prune's removals all queue together and are dropped together.
+        bucket.failWrites.set(TAGS_MAP, { code: 503, times: 100 });
+        const fetched = { kind: 'FETCH', data: { headers: {}, body: '', status: 200, url: '' }, revalidate: 60 };
+        await newHandler().set('a1b2c3', fetched as any, { tags: ['nav'], fetchCache: true } as any);
+        vi.setSystemTime(Date.now() + 11 * 60_000);
+        const warn = vi.spyOn(console, 'warn');
+
+        release();
+        await waitForRouteCacheCleanupsForTests();
+
+        expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared, old] });
+        expect(bucket.json('route-cache-cleanup.json')).toMatchObject({ deleted: true });
+        expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+        expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(true);
+        expect(warn.mock.calls.some(([m]) => String(m).includes('Removed'))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('URLs the CDN caches', () => {

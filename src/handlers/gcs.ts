@@ -612,8 +612,14 @@ export class GcsCacheHandler extends BaseCacheHandler {
    */
   private cleanupTagsMap(): CleanupTagsMap {
     const { tagsBuffer } = this;
+    // The buffer is shared with every request in the process, so a prune
+    // judges only its own removals, and any updates dropped since it started.
+    let removing = new Set<string>();
+    let droppedBefore = 0;
     return {
       routeKeysByObject: async () => {
+        removing = new Set();
+        droppedBefore = tagsBuffer.droppedUpdates;
         const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
         const byObject = new Map<string, string[]>();
         for (const key of new Set(Object.values(mapping).flat())) {
@@ -625,13 +631,19 @@ export class GcsCacheHandler extends BaseCacheHandler {
         return byObject;
       },
       remove: async (keys) => {
+        for (const key of keys) {
+          removing.add(key);
+        }
         tagsBuffer.deleteKeys(keys);
         await tagsBuffer.flushIfDue();
       },
       flush: async () => {
         await tagsBuffer.flush();
-        // The buffer logged why; it keeps retrying in this process.
-        return !tagsBuffer.hasPending;
+        // A failed write leaves the removals queued (the buffer logged why); a
+        // drop may have discarded them.
+        return (
+          tagsBuffer.droppedUpdates === droppedBefore && ![...removing].some((key) => tagsBuffer.isDeletePending(key))
+        );
       },
       location: `gs://${this.bucketName}/${this.tagsMapKey}`,
     };

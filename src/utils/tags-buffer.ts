@@ -167,6 +167,11 @@ export class TagsBuffer {
     return this.pendingCount > 0;
   }
 
+  /** Whether a removal of `cacheKey` is queued and not yet written. */
+  isDeletePending(cacheKey: string): boolean {
+    return this.pending.deletes.has(cacheKey);
+  }
+
   /** Total updates dropped after exceeding maxPendingAgeMs (see onFlushFailure). */
   get droppedUpdates(): number {
     return this.droppedUpdatesTotal;
