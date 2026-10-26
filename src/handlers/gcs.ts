@@ -568,11 +568,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
       );
     }
 
-    // Awaited, unlike the background purges elsewhere: get()/set() wait for
-    // the build check, so the purge has been sent before this process serves
-    // a request that could race a still-cached page from the previous build.
-    // Bounded by nukeCache()'s own timeout. A failure is recorded on the job
-    // and retried in the background, so it does not hold up requests.
+    // Awaited, so the purge is sent before this process serves a request that
+    // could race a still-cached previous-build page. Bounded by nukeCache()'s
+    // timeout; a failure is recorded on the job and retried in the background.
     const purge = this.edgeCacheClearer ? await this.edgeCacheClearer.nukeCache() : { success: true };
     const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
     const stayInCdn =

@@ -17,8 +17,9 @@ import type { Logger } from './logger.js';
  * are already cache misses (see GcsCacheHandler.readCacheEntry), so this only
  * frees storage. A job object next to build-meta.json marks the work pending
  * and holds the lock and cursor, both renewed by one conditional write. A dead
- * holder's lock expires and a later instance resumes. A stalled holder sees the job's generation change and stops, unless
- * the change is only another instance of its build noting a failed purge.
+ * holder's lock expires and a later instance resumes. A stalled holder sees
+ * the job's generation change and stops, unless the change is only another
+ * instance of its build noting a failed purge.
  */
 
 /** How long a lock lasts without renewal. Long enough to ride out a throttled-CPU stall between requests. */

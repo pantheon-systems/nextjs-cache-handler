@@ -489,26 +489,25 @@ The background delete lists `route-cache/` 1,000 objects at a time with at most
 written by the running build, including ones cached since the deploy, and each delete is
 conditional on the object being the version listed, so an entry rewritten in between is kept.
 
-Only one instance at a time deletes the earlier builds' route entries. The job object is also a
-lock, taken with a conditional write and renewed every 15 s (checked between batches of deletes,
-so a slow page doesn't outlast it) with the last object name reached and the counts so far. If
-the holder stops, the lock lapses after 60 s and the next instance to check resumes from that name.
-Instances check when they start and at most once a minute on route-cache reads. A newer deploy
-replaces the job, and an instance still working on the old one stops at its next lock renewal
-(within about 15 s) or at the end of its current page. Another instance of the same build noting
-a failed CDN purge on the job does not stop the holder. On Cloud
-Run with request-based billing an instance gets almost no CPU between requests, so the delete only
-progresses while requests arrive, and a paused holder loses its lock the same way.
+Only one instance at a time deletes. The job object is also a lock, taken with a conditional write
+and renewed every 15 s (also between batches of deletes, so a slow page doesn't outlast it) with
+the last object name reached and the counts so far. If the holder stops, the lock lapses after
+60 s and the next instance to check resumes from that name. Instances check when they start and
+at most once a minute on route-cache reads. A newer deploy replaces the job, and an instance still
+working on the old one stops at its next renewal (within about 15 s) or the end of its page.
+Another instance of the same build noting a failed CDN purge on the job does not stop the holder.
+On Cloud Run with request-based billing an instance gets almost no CPU between requests, so the
+delete only progresses while requests arrive, and a paused holder loses its lock the same way.
 
 When the delete finishes, the job lists `route-cache/` again and removes from the tags map
 (`cache/tags/tags.json`) the route keys whose entries are not the running build's; fetch keys stay.
-Each key is decided as the listing reaches its entry. The decided keys are saved in
-`route-cache-cleanup-removals.json`, next to the job, then removed from the tags map in one write.
-The new build is serving meanwhile, and a page it caches after its key was decided would lose the
-key, so once the removals are stored the job lists `route-cache/` again and adds back, with the tags
-the entry holds now, the keys of pages this build has cached since. A run that stops before the
-keys it adds back are stored leaves the saved removals, and the next run stores them again and adds
-back again from them. Then the job deletes the saved removals and itself, and logs a warning:
+Each key is decided as the listing reaches its entry, the decided keys are saved in
+`route-cache-cleanup-removals.json` next to the job, then removed in one write. The new build is
+serving meanwhile, and a page it caches after its key was decided would lose the key, so once the
+removals are stored the job lists `route-cache/` again and adds back, with the tags the entry holds
+now, the keys of pages this build cached since. A run that stops before the add-back is stored
+leaves the saved removals, and the next run stores them again and adds back again. Then the job
+deletes the saved removals and itself, and logs a warning:
 `Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
 With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
@@ -522,11 +521,11 @@ a retry also waits for an instance to check the job, at most once a minute on a 
 A listing that fails with throttling, a timeout, a server error or a network error is retried
 twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still
 fails is logged with the failure counts by status (`503 x8, 403 x2`) and what to change: delete
-permission on the bucket (logged as an error, since every deploy fails the same way until it is
-fixed), or a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling. A listing that still
-fails stops the run, which releases the lock with its progress for a later instance. Entries a
-failed delete leaves behind, or that another revision writes during a rollout, are not served and
-are deleted at a later deploy.
+permission on the bucket (an error, since every deploy fails the same way until it is fixed), or
+a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling. A listing that still fails stops
+the run, which releases the lock with its progress for a later instance. Entries left behind by a
+failed delete, or written by another revision during a rollout, are not served and are deleted at
+a later deploy.
 
 If the build ID can't be read (no `.next/BUILD_ID` or build manifest in the working directory),
 the process gets a generation of its own, so the check is skipped with a warning instead of deleting

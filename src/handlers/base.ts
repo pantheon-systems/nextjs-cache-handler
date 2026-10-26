@@ -97,14 +97,10 @@ export abstract class BaseCacheHandler {
   // the not-yet-assigned instance field as null (a false miss).
   private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
-  // Tracks the in-flight initialize() call so get()/set() can await it before
-  // touching the store. Without this, a request could race ahead of
-  // checkBuildInvalidation() below: served before this process sent a new
-  // build's CDN purge, or, on the file handler, reading a route entry of the
-  // previous build before it is deleted. initialize() itself can't be awaited
-  // from the constructor (JS constructors can't be async), so this is the only
-  // place that gap can close. Cleared to null once awaited so later get()/set()
-  // calls short-circuit.
+  // The in-flight initialize(), awaited by get()/set() so no request races
+  // ahead of checkBuildInvalidation(): served before a new build's CDN purge
+  // was sent, or (file handler) reading a previous build's route entry before
+  // it is deleted. The constructor can't await it. Cleared once awaited.
   private initPromise: Promise<void> | null = null;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
@@ -442,10 +438,7 @@ export abstract class BaseCacheHandler {
   ): Promise<CacheHandlerValue | null> {
     this.log.debug(`GET: ${cacheKey}`);
 
-    // Without this, a request racing the very first GET on a cold instance
-    // could be served before checkBuildInvalidation() (in initialize()) sent
-    // a new build's CDN purge, or, on the file handler, read a route entry of
-    // the previous build before it is deleted.
+    // Waits for the build check (see initPromise).
     await this.ensureInitialized();
     // Before any tag check: Next's own checks run on what get() returns.
     await this.refreshRevalidations();
@@ -557,8 +550,7 @@ export abstract class BaseCacheHandler {
       revalidate?: Revalidate;
     }
   ): Promise<void> {
-    // Same race as get() above: on the file handler, an entry written before
-    // a new build's delete would be deleted with it.
+    // Waits for the build check, so a write isn't deleted by a new build's delete.
     await this.ensureInitialized();
 
     const cacheType = this.determineCacheTypeFromValue(incrementalCacheValue);
