@@ -489,21 +489,27 @@ written by the running build, including ones cached since the deploy, and each d
 conditional on the object being the version listed, so an entry rewritten in between is kept.
 
 Only one instance at a time deletes the earlier builds' route entries. The job object is also a
-lock, taken with a conditional write and renewed every 15 s with the last object name reached. If
+lock, taken with a conditional write and renewed every 15 s (checked between batches of deletes,
+so a slow page doesn't outlast it) with the last object name reached and the counts so far. If
 the holder stops, the lock lapses after 60 s and the next instance to check resumes from that name.
 Instances check when they start and at most once a minute on route-cache reads. A newer deploy
-replaces the job, and an instance still working on the old one stops at its next page. On Cloud
+replaces the job, and an instance still working on the old one stops after its current batch or
+page. On Cloud
 Run with request-based billing an instance gets almost no CPU between requests, so the delete only
 progresses while requests arrive, and a paused holder loses its lock the same way.
 
-When the delete finishes, the job lists `route-cache/` again, removes from the tags map
-(`cache/tags/tags.json`) the route keys whose entries are not the running build's (fetch keys
-stay), deletes itself and logs a warning:
+When the delete finishes, the job lists `route-cache/` again and removes from the tags map
+(`cache/tags/tags.json`) the route keys whose entries are not the running build's; fetch keys stay.
+Each key is decided as the listing reaches its entry, and removals are written at the tags map's
+flush interval, so a key is removed wrongly only when the new build caches that page again within
+about one interval (5 s by default) of the check. Until the page is cached again, revalidating its
+tags doesn't purge it from the CDN. Then the job deletes itself and logs a warning:
 `Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> runs`.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
 only up to its last renewal.
 
-A failed full CDN purge is logged as an error and retried by each run of the job until it succeeds.
+A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
+until the purge succeeds or 5 runs have tried, when it gives up with an error.
 
 A listing that fails with throttling, a timeout, a server error or a network error is retried
 twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still
