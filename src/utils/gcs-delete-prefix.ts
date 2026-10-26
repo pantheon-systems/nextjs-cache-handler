@@ -213,7 +213,8 @@ export async function deletePrefix(
   let skipped = 0;
   let changed = 0;
   let failed = 0;
-  let lastName: string | undefined;
+  // A resumed listing's first page can hold only `startAfter`, which stays the position reached.
+  let lastName = opts.startAfter;
   const failures: Record<string, number> = {};
   let firstError: unknown;
 

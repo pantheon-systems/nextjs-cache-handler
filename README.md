@@ -495,17 +495,20 @@ so a slow page doesn't outlast it) with the last object name reached and the cou
 the holder stops, the lock lapses after 60 s and the next instance to check resumes from that name.
 Instances check when they start and at most once a minute on route-cache reads. A newer deploy
 replaces the job, and an instance still working on the old one stops at its next lock renewal
-(within about 15 s) or at the end of its current page. On Cloud
+(within about 15 s) or at the end of its current page. Another instance of the same build noting
+a failed CDN purge on the job does not stop the holder. On Cloud
 Run with request-based billing an instance gets almost no CPU between requests, so the delete only
 progresses while requests arrive, and a paused holder loses its lock the same way.
 
 When the delete finishes, the job lists `route-cache/` again and removes from the tags map
 (`cache/tags/tags.json`) the route keys whose entries are not the running build's; fetch keys stay.
-Each key is decided as the listing reaches its entry, and removals are written at the tags map's
-flush interval. The new build is serving meanwhile, and a page it caches after its key was decided
-would lose the key, so once the removals are stored the job lists `route-cache/` again and
-adds back, with the tags the entry holds now, the keys of pages this build has cached since. Then
-the job deletes itself and logs a warning:
+Each key is decided as the listing reaches its entry. The decided keys are saved in
+`route-cache-cleanup-removals.json`, next to the job, then removed from the tags map in one write.
+The new build is serving meanwhile, and a page it caches after its key was decided would lose the
+key, so once the removals are stored the job lists `route-cache/` again and adds back, with the tags
+the entry holds now, the keys of pages this build has cached since. A run that stops before the
+keys it adds back are stored leaves the saved removals, and the next run stores them again and adds
+back again from them. Then the job deletes the saved removals and itself, and logs a warning:
 `Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
 With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts

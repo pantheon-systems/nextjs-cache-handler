@@ -16,6 +16,7 @@ import { pagedObjects } from '../helpers/paged-objects.js';
 
 const PREFIX = 'route-cache/';
 const JOB = 'route-cache-cleanup.json';
+const REMOVALS = 'route-cache-cleanup-removals.json';
 const OLD = 'build-A';
 const NEW = 'build-B';
 
@@ -53,6 +54,7 @@ function setup(opts: { total?: number; current?: number; pageSize?: number } = {
       bucket,
       jobBucket: jobBucket as unknown as Bucket,
       jobKey: JOB,
+      removalsKey: REMOVALS,
       prefix: PREFIX,
       generationOf: (file: File) => (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation,
       concurrency: () => 50,
@@ -330,12 +332,17 @@ describe('RouteCacheCleanup', () => {
     expect(t.job()).toMatchObject({ deleted: true, totals: { deleted: 100 } });
     expect(t.job()!.owner).toBeUndefined();
 
+    // The removals run "a" decided are saved for the next run.
+    expect(Object.keys((t.jobBucket.json(REMOVALS) as { byObject: object }).byObject)).toHaveLength(100);
+
     const calls = t.objects.getFiles.mock.calls.length;
     await t.cleanup('b').resume(NEW);
-    expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(2);
-    // The pruning listing and its second listing for pages cached meanwhile; no deleting listing.
-    expect(t.objects.getFiles.mock.calls.length).toBe(calls + 2);
+    // Stores the saved removals instead of reading the map again; lists only for pages cached meanwhile.
+    expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
+    expect(t.tagsMap.remove).toHaveBeenCalledTimes(2);
+    expect(t.objects.getFiles.mock.calls.length).toBe(calls + 1);
     expect(t.job()).toBeUndefined();
+    expect(t.jobBucket.objects.has(REMOVALS)).toBe(false);
   });
 
   it('under CACHE_BUILD_INVALIDATION=off deletes nothing but still prunes the tags map', async () => {
@@ -585,7 +592,7 @@ describe('RouteCacheCleanup', () => {
   });
 
   describe('tags map pruning', () => {
-    it('removes keys page by page, as the listing covers their objects', async () => {
+    it('decides keys page by page, as the listing covers their objects, and removes them together', async () => {
       const t = setup({ total: 0, current: 2500 });
       await t.create({ deleteEntries: false });
       // Keys for objects that are gone, between and after the listed ones.
@@ -595,8 +602,9 @@ describe('RouteCacheCleanup', () => {
       await t.cleanup('a').resume(NEW);
 
       const calls = t.tagsMap.remove.mock.calls.map(([keys]) => keys);
-      expect(calls).toEqual([[`${PREFIX}0000500x.json`], [], [`${PREFIX}0002000x.json`], [`${PREFIX}zzz.json`]]);
+      expect(calls).toEqual([[`${PREFIX}0000500x.json`, `${PREFIX}0002000x.json`, `${PREFIX}zzz.json`]]);
       expect(t.tagsMap.flush).toHaveBeenCalledTimes(1);
+      expect(t.jobBucket.objects.has(REMOVALS)).toBe(false);
     });
 
     it('keeps a key whose object the new build writes before its page is listed', async () => {
@@ -725,5 +733,223 @@ describe('RouteCacheCleanup', () => {
 
     expect(t.job()).toMatchObject({ deleted: true, pruned: true });
     expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('; the next run finishes it.'));
+  });
+});
+
+/**
+ * A tags map that behaves like the stored one: removals are stored as soon as
+ * they are queued, reads see what is stored, and a page the new build caches
+ * adds its key only if it is missing (as applyBatch does).
+ */
+function storedTagsMap(names: Iterable<string>) {
+  const stored = new Set(names);
+  return {
+    stored,
+    /** The new build caches a page: its add writes nothing when the key is already there. */
+    cache: (key: string) => stored.add(key),
+    tagsMap: {
+      routeKeysByObject: vi.fn(async () => new Map([...stored].map((name): [string, string[]] => [name, [name]]))),
+      remove: async (keys: string[]) => {
+        for (const key of keys) stored.delete(key);
+      },
+      flush: vi.fn(async () => true),
+      restore: async (byObject: Map<string, string[]>) => {
+        for (const keys of byObject.values()) for (const key of keys) stored.add(key);
+        return byObject.size;
+      },
+      location: 'gs://test-bucket/tags.json',
+    },
+  };
+}
+
+describe('a prune that stops part-way', () => {
+  const denied = () => Object.assign(new Error('HTTP 403'), { code: 403 });
+
+  /** 2,500 objects of the old build, kept in place (CACHE_BUILD_INVALIDATION=off) so every listing is the prune's. */
+  function setupStored() {
+    const t = setup({ total: 2500 });
+    const map = storedTagsMap(t.objects.live);
+    const late = `${PREFIX}0000100.json`; // on the first page
+    /** The new build caches `late`: the object is rewritten, and its add finds the key in the map. */
+    const cacheLate = () => {
+      t.objects.rewrite(late, { generation: NEW });
+      map.cache(late);
+    };
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    /** `hook` runs on each listing, by number, after the page is fetched; it may throw to fail the listing. */
+    const onListing = (hook: (n: number) => void) => {
+      let listings = 0;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        const response = await getFiles(query);
+        hook(++listings);
+        return response;
+      });
+    };
+    return { t, map, late, cacheLate, onListing, run: (owner: string) => t.cleanup(owner, { tagsMap: map.tagsMap }) };
+  }
+
+  it('keeps the key of a page the new build cached after its removal was decided, when the deciding listing fails', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.onListing((n) => {
+      if (n === 1) s.cacheLate(); // page 1 listed `late` as the old build's
+      if (n === 2) throw denied(); // run 1 stops on page 2
+    });
+    await s.run('a').resume(NEW);
+    expect(s.t.job()!.pruned).toBeFalsy();
+
+    // Run 1 removed nothing, so run 2 decides afresh and sees `late` as the new build's.
+    await s.run('b').resume(NEW);
+    expect(s.t.job()).toBeUndefined();
+    expect(s.map.stored.has(s.late)).toBe(true);
+  });
+
+  it('keeps that key when the run stops after the removals are stored, before adding back', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.onListing((n) => {
+      if (n === 1) s.cacheLate();
+      if (n === 4) throw denied(); // the add-back listing (after three deciding pages)
+    });
+    await s.run('a').resume(NEW);
+    expect(s.map.stored.has(s.late)).toBe(false); // removed, not yet added back
+    expect(s.t.jobBucket.objects.has(REMOVALS)).toBe(true);
+
+    await s.run('b').resume(NEW);
+    expect(s.t.job()).toBeUndefined();
+    expect(s.map.stored.has(s.late)).toBe(true);
+    // Run "b" used the saved removals; the map no longer had the key to decide on.
+    expect(s.map.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the job when adding back is not stored, and a later run adds the key back', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.onListing((n) => {
+      if (n === 1) s.cacheLate();
+    });
+    // The removals are stored; the add-back is not, and the instance stops with it queued.
+    s.map.tagsMap.flush.mockResolvedValueOnce(true).mockImplementationOnce(async () => {
+      s.map.stored.delete(s.late);
+      return false;
+    });
+    const log = silentLog();
+    await s.t.cleanup('a', { tagsMap: s.map.tagsMap, log }).resume(NEW);
+    expect(s.t.job()!.pruned).toBeFalsy();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
+      expect.stringContaining('adding back 1 route keys this build cached during the prune')
+    );
+
+    await s.run('b').resume(NEW);
+    expect(s.t.job()).toBeUndefined();
+    expect(s.map.stored.has(s.late)).toBe(true);
+  });
+
+  it("ignores removals saved by an earlier build's prune", async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.t.jobBucket.putJson(REMOVALS, { keep: OLD, byObject: { [`${PREFIX}0000001.json`]: ['/kept'] } });
+    s.map.stored.add('/kept');
+    await s.run('a').resume(NEW);
+
+    expect(s.map.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
+    expect(s.map.stored.has('/kept')).toBe(false); // no object of that name: removed by the fresh decision
+    expect(s.t.jobBucket.objects.has(REMOVALS)).toBe(false);
+  });
+});
+
+describe('purge notes, resumed cursors and purge retries', () => {
+  it('a failed purge noted on a running job does not stop the instance that holds the lock', async () => {
+    const t = setup({ total: 5000 });
+    await t.create();
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    let listings = 0;
+    t.objects.getFiles.mockImplementation(async (query) => {
+      if (++listings === 2) {
+        // Another instance of the same build, whose startup purge failed, notes it on the job.
+        await t.create({ purgePending: true });
+      }
+      return getFiles(query);
+    });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(log.warn.mock.calls.some(([m]) => /stopped/.test(m))).toBe(false);
+    expect(t.objects.live.size).toBe(0);
+    // The note is kept: the job stays, released, for a run to send the purge.
+    expect(t.job()).toMatchObject({ pruned: true, purgePending: true, purgeRuns: 0 });
+    expect(t.job()!.owner).toBeUndefined();
+  });
+
+  it('keeps the lock, and the note, when a failed purge is noted just before a renewal', async () => {
+    const t = setup({ total: 5000 });
+    await t.create();
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    let listings = 0;
+    t.objects.getFiles.mockImplementation(async (query) => {
+      t.advance(RENEW_INTERVAL_MS); // the page's end renews, so its write meets the note's generation
+      if (++listings === 2) await t.create({ purgePending: true });
+      return getFiles(query);
+    });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(log.warn.mock.calls.some(([m]) => /stopped/.test(m))).toBe(false);
+    expect(t.objects.live.size).toBe(0);
+    expect(t.job()).toMatchObject({ purgePending: true });
+  });
+
+  it('leaves the purge owed when it is noted just before the finished job is removed', async () => {
+    const t = setup({ total: 10 });
+    await t.create();
+    const real = t.jobBucket.file.bind(t.jobBucket);
+    vi.spyOn(t.jobBucket, 'file').mockImplementation((name, options) => {
+      const file = real(name, options);
+      if (name !== REMOVALS) return file;
+      // Removing the saved removals is the last step before the job itself.
+      return {
+        ...file,
+        delete: async () => {
+          await t.create({ purgePending: true });
+          return file.delete();
+        },
+      };
+    });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(log.warn.mock.calls.some(([m]) => /stopped/.test(m))).toBe(false);
+    expect(t.job()).toMatchObject({ pruned: true, purgePending: true });
+    expect(t.job()!.owner).toBeUndefined();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('the CDN purge is still owed'));
+  });
+
+  it('keeps the cursor when the first page of a resumed run holds only the cursor object', async () => {
+    // The cursor object is the new build's, so it is kept, and pages hold one object.
+    const t = setup({ total: 0, current: 3, pageSize: 1 });
+    await t.create();
+    const cursor = `${PREFIX}0000000.json`;
+    t.jobBucket.putJson(JOB, { ...t.job()!, cursor });
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    let listings = 0;
+    t.objects.getFiles.mockImplementation(async (query) => {
+      if (++listings === 2) throw Object.assign(new Error('HTTP 403'), { code: 403 });
+      return getFiles(query);
+    });
+    await t.cleanup('a').resume(NEW);
+
+    expect(t.job()!.cursor).toBe(cursor);
+  });
+
+  it('gives a purge that fails again at startup a full set of retries after an earlier one gave up', async () => {
+    const t = setup({ total: 0 });
+    await t.create();
+    // An earlier purge used up its retries.
+    t.jobBucket.putJson(JOB, { ...t.job()!, purgePending: false, purgeRuns: MAX_PURGE_RUNS, pruned: true });
+    await t.create({ purgePending: true });
+    t.purge.mockResolvedValue(false);
+    await t.cleanup('a').resume(NEW);
+
+    expect(t.job()).toMatchObject({ purgePending: true, purgeRuns: 1 });
   });
 });

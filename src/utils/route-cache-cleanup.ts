@@ -13,18 +13,12 @@ import { isNotFound, isPreconditionFailure, readJsonObject, writeJsonObject } fr
 import type { Logger } from './logger.js';
 
 /**
- * Deleting the previous builds' route entries after a deploy, in the
- * background. Requests no longer wait for it: an entry from another build is a
- * cache miss (see GcsCacheHandler.readCacheEntry), so deleting it only frees
- * storage.
- *
- * The work is a job object next to build-meta.json. Its existence means the
- * clean-up is pending; it also holds the lock and the progress, so one
- * conditional write renews the lock and records how far the delete got. Only
- * the instance holding the lock deletes. If it dies, the lock expires and a
- * later instance resumes from the recorded object name. Every change to the
- * object bumps its GCS generation, so a holder that stalled past expiry finds
- * the generation changed at its next page and stops.
+ * Deletes earlier builds' route entries in the background after a deploy; they
+ * are already cache misses (see GcsCacheHandler.readCacheEntry), so this only
+ * frees storage. A job object next to build-meta.json marks the work pending
+ * and holds the lock and cursor, both renewed by one conditional write. A dead
+ * holder's lock expires and a later instance resumes. A stalled holder sees the job's generation change and stops, unless
+ * the change is only another instance of its build noting a failed purge.
  */
 
 /** How long a lock lasts without renewal. Long enough to ride out a throttled-CPU stall between requests. */
@@ -81,9 +75,9 @@ export interface CleanupJob {
 export interface CleanupTagsMap {
   /** The map's route keys by the name of the object each is stored under. */
   routeKeysByObject: () => Promise<Map<string, string[]>>;
-  /** Queue keys for removal; may write when the map's flush interval has passed. */
+  /** Queue a prune's removals, once per prune; may write when the map's flush interval has passed. */
   remove: (keys: string[]) => Promise<void>;
-  /** Write what is queued; resolves to whether everything was stored. */
+  /** Write what is queued; resolves to whether the removals, and any keys added back, were stored. */
   flush: () => Promise<boolean>;
   /**
    * Queue the keys of these objects again, with the tags the objects hold now;
@@ -100,6 +94,11 @@ export interface RouteCacheCleanupConfig {
   /** Reads and writes the job object, with preconditions. */
   jobBucket: Bucket;
   jobKey: string;
+  /**
+   * Holds a prune's removals from when they are decided until the keys of
+   * pages cached meanwhile are added back, so a later run can finish them.
+   */
+  removalsKey: string;
   /** e.g. `route-cache/`, with the environment prefix. */
   prefix: string;
   /** Generation stamped on a listed object (its custom metadata), or undefined. */
@@ -123,6 +122,12 @@ class LostJobError extends Error {
     super('the clean-up job was taken over, replaced or removed');
     this.name = 'LostJobError';
   }
+}
+
+/** A prune's decided removals: the map's route keys by object name. */
+interface PruneRemovals {
+  keep: string;
+  byObject: Record<string, string[]>;
 }
 
 const isDenied = (labels: string[]) => labels.some((label) => label === '401' || label === '403');
@@ -169,8 +174,8 @@ function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>
  * Record that `keep`'s clean-up is pending, replacing a job for another build
  * (which also deletes everything not of `keep`, so its progress does not
  * carry over). A job for `keep` already exists when another instance created
- * it; it is left as it is, except that a failed purge is noted on it. Throws
- * when the job can't be read or written.
+ * it; it is left as it is, except that a failed purge is noted on it, with
+ * a fresh set of retries. Throws when the job can't be read or written.
  */
 export async function createCleanupJob(
   jobBucket: Bucket,
@@ -185,7 +190,7 @@ export async function createCleanupJob(
       return 'exists';
     }
     const job: CleanupJob = exists
-      ? { ...value, purgePending: true }
+      ? { ...value, purgePending: true, purgeRuns: 0, purgeRetryAt: undefined }
       : {
           keep,
           createdAt: opts.now ?? Date.now(),
@@ -271,22 +276,38 @@ export class RouteCacheCleanup {
     let cursor = job.cursor;
     const totals = () => addRun(base, progress, this.now() - started);
 
-    // Write the job at the generation we hold, then learn the new one; a 412 means we lost it.
-    const renew = async (update: Partial<CleanupJob> = {}) => {
-      job = { ...job, ...update, cursor, totals: totals(), expiresAt: this.now() + LOCK_TTL_MS };
-      try {
-        await writeJsonObject(jobBucket, jobKey, job, generation);
-      } catch (error) {
-        if (isPreconditionFailure(error)) {
-          throw new LostJobError();
-        }
-        throw error;
-      }
-      const reread = await readJsonObject<CleanupJob>(jobBucket, jobKey);
-      if (reread.value?.owner !== this.owner || reread.value.keep !== keep) {
+    // Take the job as stored now, which must still be ours: another instance
+    // of this build may have noted a failed purge on it (createCleanupJob),
+    // which is kept. Any other change, or its removal, means we lost it.
+    const adopt = async () => {
+      const { value, generation: current } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
+      if (value?.owner !== this.owner || value.keep !== keep) {
         throw new LostJobError();
       }
-      generation = reread.generation;
+      if (value.purgePending && !job.purgePending) {
+        job = { ...job, purgePending: true, purgeRuns: value.purgeRuns, purgeRetryAt: value.purgeRetryAt };
+      }
+      generation = current;
+    };
+
+    // Write the job at the generation we hold, then learn the new one.
+    const renew = async (update: Partial<CleanupJob> = {}) => {
+      for (let attempt = 1; ; attempt++) {
+        job = { ...job, ...update, cursor, totals: totals(), expiresAt: this.now() + LOCK_TTL_MS };
+        try {
+          await writeJsonObject(jobBucket, jobKey, job, generation);
+          break;
+        } catch (error) {
+          if (!isPreconditionFailure(error)) {
+            throw error;
+          }
+          if (attempt >= 3) {
+            throw new LostJobError();
+          }
+          await adopt();
+        }
+      }
+      await adopt();
       lastRenew = this.now();
     };
     // Mid-page renewals record the previous page's cursor, so the page's end records its own.
@@ -306,7 +327,7 @@ export class RouteCacheCleanup {
         generation
       );
 
-    // Fails fast once someone else changed or removed the job; renews when due.
+    // Fails fast once someone else took, replaced or removed the job; renews when due.
     const check = async () => {
       if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
         await renew();
@@ -322,7 +343,7 @@ export class RouteCacheCleanup {
         throw error;
       }
       if (String(metadata.generation) !== String(generation)) {
-        throw new LostJobError();
+        await adopt();
       }
     };
 
@@ -387,10 +408,15 @@ export class RouteCacheCleanup {
       if (!job.pruned) {
         await this.pruneTagsMap(keep, check);
         await renew({ pruned: true });
+        // Left behind, it is only read for this build, whose prune is done.
+        await jobBucket
+          .file(this.config.removalsKey)
+          .delete()
+          .catch(() => {});
       }
 
-      if (job.purgePending) {
-        // Everything else is done; a later run retries the purge.
+      // Everything else is done; a later run retries the purge.
+      const leaveOwedPurge = async () => {
         await release();
         const done = job.deleteEntries ? 'entries deleted' : 'nothing deleted (CACHE_BUILD_INVALIDATION=off)';
         const retryAt = new Date(job.purgeRetryAt ?? this.now()).toISOString();
@@ -399,21 +425,37 @@ export class RouteCacheCleanup {
             `(${job.purgeRuns ?? 0} of ${MAX_PURGE_RUNS} background attempts made) and a run from ${retryAt} ` +
             `retries it`
         );
+      };
+      if (job.purgePending) {
+        await leaveOwedPurge();
         return;
       }
 
       const final = totals();
-      await jobBucket
+      const removed = await jobBucket
         .file(jobKey)
         .delete({ ifGenerationMatch: generation } as DeleteFileOptions)
-        .catch((error: unknown) => {
-          if (isPreconditionFailure(error)) {
-            throw new LostJobError();
-          }
-          if (!isNotFound(error)) {
+        .then(
+          () => true,
+          (error: unknown) => {
+            if (isNotFound(error)) {
+              return true;
+            }
+            if (isPreconditionFailure(error)) {
+              return false;
+            }
             throw error;
           }
-        });
+        );
+      if (!removed) {
+        // Changed since the last write: lost, unless a failed purge was noted on it.
+        await adopt();
+        if (!job.purgePending) {
+          throw new LostJobError();
+        }
+        await leaveOwedPurge();
+        return;
+      }
       this.report(keep, job.deleteEntries, final);
     } catch (error) {
       if (error instanceof LostJobError) {
@@ -457,53 +499,36 @@ export class RouteCacheCleanup {
   }
 
   /**
-   * Remove the tags map's route keys whose entries are not `keep`'s. Each key
-   * is decided when the listing page covering its object's name arrives, and
-   * removals are written as the map's flush interval allows. Keys added to the
-   * map after it was read here are never removed.
-   *
-   * The new build is serving meanwhile. When it caches a page after that
-   * page's key was decided, its own add finds the key still in the map (from
-   * the earlier build) and writes nothing, and the removal then drops it. So
-   * once the removals are stored, a second listing finds those pages and adds
-   * their keys back; a page cached after that adds its key itself.
+   * Remove the tags map's route keys whose entries are not `keep`'s: each is
+   * decided as the listing reaches its object's name, the decisions are saved,
+   * then removed together. The new build serves meanwhile, and a page it caches
+   * after its key was decided adds nothing (the key is still there), so the
+   * removal drops it; a second listing adds those keys back. A run that stops
+   * before then leaves the saved removals for the next, as the map no longer
+   * has those keys.
    */
   private async pruneTagsMap(keep: string, check: () => Promise<void>): Promise<void> {
-    const { tagsMap } = this.config;
-    const keysByObject = await tagsMap.routeKeysByObject();
-    // Listings return names in this order (they are ASCII).
-    const names = [...keysByObject.keys()].sort();
-    const removedByObject = new Map<string, string[]>();
-    let next = 0;
-    let removed = 0;
-    const removeUpTo = async (lastListed: string | undefined, kept: Set<string>) => {
-      const stale: string[] = [];
-      while (next < names.length && (lastListed === undefined || names[next] <= lastListed)) {
-        if (!kept.has(names[next])) {
-          const keys = keysByObject.get(names[next])!;
-          stale.push(...keys);
-          removedByObject.set(names[next], keys);
-        }
-        next++;
+    const { tagsMap, jobBucket, removalsKey } = this.config;
+    const saved = (await readJsonObject<PruneRemovals>(jobBucket, removalsKey)).value;
+    let removedByObject: Map<string, string[]>;
+    if (saved?.keep === keep) {
+      removedByObject = new Map(Object.entries(saved.byObject));
+    } else {
+      removedByObject = await this.decideRemovals(keep, check);
+      if (removedByObject.size > 0) {
+        const removals: PruneRemovals = { keep, byObject: Object.fromEntries(removedByObject) };
+        await writeJsonObject(jobBucket, removalsKey, removals);
+        await check();
       }
-      removed += stale.length;
-      await tagsMap.remove(stale);
-    };
-
-    for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
-      const kept = new Set(files.filter((file) => this.config.generationOf(file) === keep).map((file) => file.name));
-      if (files.length > 0) {
-        await removeUpTo(files.at(-1)!.name, kept);
-      }
-      await check();
     }
-    // Names after the last listed one have no object at all.
-    await removeUpTo(undefined, new Set());
-    if (!(await tagsMap.flush())) {
-      throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
-    }
+    const removedKeys = [...removedByObject.values()].flat();
+    const removed = removedKeys.length;
     if (removed === 0) {
       return;
+    }
+    await tagsMap.remove(removedKeys);
+    if (!(await tagsMap.flush())) {
+      throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
     }
 
     const cached = new Map<string, string[]>();
@@ -516,14 +541,14 @@ export class RouteCacheCleanup {
       }
       await check();
     }
-    // Not retried by a later run: its read of the map no longer has these keys.
+    // A later run removes the saved keys again, then adds these back again.
     let restored = 0;
     if (cached.size > 0) {
       restored = await tagsMap.restore(cached);
       if (!(await tagsMap.flush())) {
-        this.config.log.warn(
-          `Adding back ${restored} route keys this build cached during the prune to ${tagsMap.location} is not ` +
-            `stored yet; until it is, tag revalidations do not purge the CDN for those pages`
+        throw new Error(
+          `adding back ${restored} route keys this build cached during the prune to ${tagsMap.location} is not ` +
+            `stored yet`
         );
       }
     }
@@ -531,6 +556,34 @@ export class RouteCacheCleanup {
       `Removed ${removed - restored} route keys of earlier builds from ${tagsMap.location}` +
         (restored > 0 ? ` (and added back ${restored} whose pages this build cached during the prune)` : '')
     );
+  }
+
+  /** The map's route keys whose object is gone or not `keep`'s, by object name. */
+  private async decideRemovals(keep: string, check: () => Promise<void>): Promise<Map<string, string[]>> {
+    const keysByObject = await this.config.tagsMap.routeKeysByObject();
+    // Listings return names in this order (they are ASCII).
+    const names = [...keysByObject.keys()].sort();
+    const removedByObject = new Map<string, string[]>();
+    let next = 0;
+    const decideUpTo = (lastListed: string | undefined, kept: Set<string>) => {
+      while (next < names.length && (lastListed === undefined || names[next] <= lastListed)) {
+        if (!kept.has(names[next])) {
+          removedByObject.set(names[next], keysByObject.get(names[next])!);
+        }
+        next++;
+      }
+    };
+
+    for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
+      const kept = new Set(files.filter((file) => this.config.generationOf(file) === keep).map((file) => file.name));
+      if (files.length > 0) {
+        decideUpTo(files.at(-1)!.name, kept);
+      }
+      await check();
+    }
+    // Names after the last listed one have no object at all.
+    decideUpTo(undefined, new Set());
+    return removedByObject;
   }
 
   /** Take the lock on `keep`'s job, or null when there is none, it is another build's, or it is held. */

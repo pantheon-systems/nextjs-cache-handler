@@ -172,6 +172,11 @@ export class TagsBuffer {
     return this.pending.deletes.has(cacheKey);
   }
 
+  /** Whether an addition for `cacheKey` is queued and not yet written. */
+  isAddPending(cacheKey: string): boolean {
+    return this.pending.adds.has(cacheKey);
+  }
+
   /** Total updates dropped after exceeding maxPendingAgeMs (see onFlushFailure). */
   get droppedUpdates(): number {
     return this.droppedUpdatesTotal;

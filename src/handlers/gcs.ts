@@ -313,6 +313,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private readonly imageCachePrefix: string;
   private readonly buildMetaKey: string;
   private readonly cleanupJobKey: string;
+  private readonly cleanupRemovalsKey: string;
   private readonly cleanup: RouteCacheCleanup;
   private readonly tagsPrefix: string;
   private readonly tagsMapKey: string;
@@ -342,6 +343,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.buildMetaKey = `${envPrefix}build-meta.json`;
     // Outside route-cache/, so the clean-up's own listing never includes it.
     this.cleanupJobKey = `${envPrefix}route-cache-cleanup.json`;
+    this.cleanupRemovalsKey = `${envPrefix}route-cache-cleanup-removals.json`;
     this.tagsPrefix = `${envPrefix}cache/tags/`;
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
 
@@ -378,6 +380,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
         bucket: this.bucket,
         jobBucket: this.tagsBucket,
         jobKey: this.cleanupJobKey,
+        removalsKey: this.cleanupRemovalsKey,
         prefix: this.routeCachePrefix,
         generationOf: routeObjectGeneration,
         concurrency: () => resolveDeleteConcurrency(),
@@ -613,13 +616,13 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private cleanupTagsMap(): CleanupTagsMap {
     const { tagsBuffer } = this;
     // The buffer is shared with every request in the process, so a prune
-    // judges only its own removals, and any updates dropped since it started.
+    // judges only its own removals and add-backs, and any updates dropped
+    // since it queued them.
     let removing = new Set<string>();
+    let restoring = new Set<string>();
     let droppedBefore = 0;
     return {
       routeKeysByObject: async () => {
-        removing = new Set();
-        droppedBefore = tagsBuffer.droppedUpdates;
         const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
         const byObject = new Map<string, string[]>();
         for (const key of new Set(Object.values(mapping).flat())) {
@@ -631,18 +634,20 @@ export class GcsCacheHandler extends BaseCacheHandler {
         return byObject;
       },
       remove: async (keys) => {
-        for (const key of keys) {
-          removing.add(key);
-        }
+        removing = new Set(keys);
+        restoring = new Set();
+        droppedBefore = tagsBuffer.droppedUpdates;
         tagsBuffer.deleteKeys(keys);
         await tagsBuffer.flushIfDue();
       },
       flush: async () => {
         await tagsBuffer.flush();
-        // A failed write leaves the removals queued (the buffer logged why); a
-        // drop may have discarded them.
+        // A failed write leaves them queued (the buffer logged why); a drop
+        // may have discarded them.
         return (
-          tagsBuffer.droppedUpdates === droppedBefore && ![...removing].some((key) => tagsBuffer.isDeletePending(key))
+          tagsBuffer.droppedUpdates === droppedBefore &&
+          ![...removing].some((key) => tagsBuffer.isDeletePending(key)) &&
+          ![...restoring].some((key) => tagsBuffer.isAddPending(key))
         );
       },
       restore: async (keysByObject) => {
@@ -653,7 +658,10 @@ export class GcsCacheHandler extends BaseCacheHandler {
           const strings = Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : [];
           for (const key of keys) {
             tagsBuffer.addTags(key, strings);
-            queued += strings.length > 0 ? 1 : 0;
+            if (strings.length > 0) {
+              restoring.add(key);
+              queued++;
+            }
           }
         });
         const failed = results.filter((result) => result.status === 'rejected');

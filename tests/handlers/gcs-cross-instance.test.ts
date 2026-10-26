@@ -672,6 +672,48 @@ describe('GcsCacheHandler across instances', () => {
       expect(bucket.json(TAGS_MAP)).toEqual({ news: [shared] });
     });
 
+    it('adds such a key back on a later instance when the add-back is not stored before the instance stops', async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        listings++;
+        if (listings === 2) {
+          // Another new-build instance caches `shared` right after the prune listed it; its key is
+          // already in tags.json, so its flush writes nothing.
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        if (listings === 3) {
+          // The removals are stored; the write adding `shared` back fails.
+          bucket.failWrites.set(TAGS_MAP, { code: 503, times: 1 });
+        }
+        return result;
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({});
+      expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+      expect(bucket.objects.has('route-cache-cleanup-removals.json')).toBe(true);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('adding back 1 route keys'))).toBe(true);
+
+      // The instance stops with the add-back still queued; a later one finishes the prune.
+      resetGcsSharedState();
+      resetBuildInvalidationCheck();
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(bucket.objects.has('route-cache-cleanup-removals.json')).toBe(false);
+    });
+
     it("counts the prune as stored when other requests' updates arrive during its write", async () => {
       // Each tags.json write queues another request's update, so the buffer is never empty after a flush.
       const real = bucket.file.bind(bucket);
