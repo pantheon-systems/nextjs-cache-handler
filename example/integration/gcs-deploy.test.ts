@@ -187,7 +187,8 @@ describeWithEmulator('GCS deploy across processes', () => {
       async () => (servers.every((server) => server.lines.some((line) => /Ready in/.test(line.text))) ? true : undefined),
       120_000
     )
-    // Every process's first request at once, so they all find the previous build and race for the clean-up.
+    // Every process's first request at once, so they race for the clean-up. A process that reads
+    // build-meta.json after another recorded the new build finds it current, and still joins the race.
     const started = Date.now()
     const responses = await Promise.all(PORTS.map((port) => fetch(`http://127.0.0.1:${port}/`)))
     firstResponseAt = Date.now()
@@ -217,10 +218,9 @@ describeWithEmulator('GCS deploy across processes', () => {
     expect(firstResponseMs).toBeLessThan(5_000)
   })
 
-  it('has every process find the previous build', () => {
-    for (const server of servers) {
-      expect(server.lines.some((line) => /New build detected \(old-build -> /.test(line.text))).toBe(true)
-    }
+  it('finds the previous build, and no other', () => {
+    expect(logged(/New build detected \(old-build -> /).length).toBeGreaterThan(0)
+    expect(logged(/New build detected/).every((line) => line.text.includes(`(old-build -> ${generation})`))).toBe(true)
   })
 
   it('deletes every entry of earlier builds, and keeps the new build’s', async () => {
