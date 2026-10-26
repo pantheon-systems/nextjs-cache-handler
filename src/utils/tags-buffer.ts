@@ -342,7 +342,7 @@ export class TagsBuffer {
       this.oldestPendingSince = 0;
       this.nextFlushTime = Date.now() + this.nextInterval();
       this.log.error(
-        `Dropping pending tag updates for ${dropped} cache key(s): the oldest was queued ` +
+        `Dropping ${dropped} pending tag update(s): the oldest was queued ` +
           `${Math.round(pendingForMs / 1000)}s ago and the flush failed again (${reason}, ` +
           `${failures} failed attempt(s)). Revalidating tags may not purge the CDN for the affected pages.`,
         error
@@ -355,8 +355,8 @@ export class TagsBuffer {
 
     if (this.consecutiveFailures === 1) {
       this.log.warn(
-        `Tags mapping flush (read or write) failed (${reason}); updates for ${this.pendingCount} cache key(s) ` +
-          `pending, retrying in ${delay}ms. ` +
+        `Tags mapping flush (read or write) failed (${reason}); ${this.pendingCount} update(s) pending, ` +
+          `retrying in ${delay}ms. ` +
           `Repeated 429s mean more instances are writing than the flush interval absorbs ` +
           `(raise CACHE_TAGS_FLUSH_INTERVAL_MS).`,
         error

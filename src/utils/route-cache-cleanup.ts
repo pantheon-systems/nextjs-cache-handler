@@ -328,6 +328,13 @@ export class RouteCacheCleanup {
         } else {
           await renew({ purgeRuns });
         }
+      } else if (job.purgePending) {
+        // Nothing to send it with here; keeping it owed would hold the job open on every run.
+        log.warn(
+          `CDN purge for build ${keep}, which failed when the build was recorded, is dropped: this instance has ` +
+            `no edge cache clearer (OUTBOUND_PROXY_ENDPOINT is not set)`
+        );
+        await renew({ purgePending: false });
       }
 
       if (job.deleteEntries && !job.deleted) {
@@ -409,15 +416,19 @@ export class RouteCacheCleanup {
       }
       const labels = [errorLabel(error instanceof ListPrefixError ? error.reason : error)];
       const when = released ? 'the next run' : 'the next run, once the lock expires,';
-      const next =
-        job.deleted || !job.deleteEntries
+      const next = job.pruned
+        ? `${when} finishes it`
+        : job.deleted || !job.deleteEntries
           ? `${when} prunes the tags map`
           : released
             ? `${when} resumes it after ${cursor ?? 'the start'}`
             : `${when} resumes it from the last recorded object`;
+      // Failed deletes are counted, not thrown, so a stop is never one; only a denied listing has a hint.
+      const hints =
+        error instanceof ListPrefixError && isDenied(labels) ? (this.config.failureHints?.(labels) ?? []) : [];
       const text = [
         `Route cache clean-up for build ${keep} stopped (${reason}); ${next}. Objects left behind are not served.`,
-        ...(this.config.failureHints?.(labels) ?? []),
+        ...hints,
       ].join(' ');
       // A permission problem stops every run the same way, so the bucket only grows until someone fixes it.
       if (isDenied(labels)) {

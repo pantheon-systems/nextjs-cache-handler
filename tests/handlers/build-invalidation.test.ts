@@ -345,7 +345,7 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(logged(warn)).toContain(
         `[GcsCacheHandler] Route cache clean-up for build build-B stopped (listing ${routePrefix} failed after 3 ` +
           `attempts (503: unavailable)); the next run resumes it after ${routePrefix}0000999.json. Objects left ` +
-          `behind are not served. ${throttled}`
+          'behind are not served.'
       );
       expect(JSON.parse(store[jobKey])).toMatchObject({
         keep: 'build-B',
@@ -434,7 +434,7 @@ describe('GcsCacheHandler build invalidation', () => {
 
       expect(logged(warn)).toContain(
         '[GcsCacheHandler] Route cache clean-up for build build-B stopped (503: Service unavailable); the next ' +
-          `run prunes the tags map. Objects left behind are not served. ${throttled}`
+          'run prunes the tags map. Objects left behind are not served.'
       );
       expect(JSON.parse(store[jobKey])).toMatchObject({ keep: 'build-B', deleted: true });
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');

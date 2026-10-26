@@ -591,4 +591,52 @@ describe('RouteCacheCleanup', () => {
     const finished = log.warn.mock.calls.map(([m]) => m).find((m) => m.includes('finished'));
     expect(finished).toContain('deleted 0 objects of earlier builds (2000 listed, 2000 of this build kept');
   });
+
+  it('drops an owed CDN purge on an instance with no edge cache clearer, and finishes', async () => {
+    const t = setup({ total: 10 });
+    await t.create({ purgePending: true });
+    const log = silentLog();
+    await t.cleanup('a', { log, purge: undefined }).resume(NEW);
+
+    expect(t.job()).toBeUndefined();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
+      expect.stringContaining('is dropped: this instance has no edge cache clearer')
+    );
+  });
+
+  it('adds the operator hint only to a denied listing', async () => {
+    const listingFails = (code: number) => {
+      const t = setup({ total: 10 });
+      t.objects.getFiles.mockRejectedValue(Object.assign(new Error(`HTTP ${code}`), { code }));
+      return t;
+    };
+    const hint = () => ['HINT'];
+
+    const throttled = listingFails(503);
+    await throttled.create();
+    const log503 = silentLog();
+    await throttled.cleanup('a', { log: log503, failureHints: hint }).resume(NEW);
+    expect(log503.warn.mock.calls.some(([m]) => m.includes('stopped') && m.includes('HINT'))).toBe(false);
+
+    const denied = listingFails(403);
+    await denied.create();
+    const log403 = silentLog();
+    await denied.cleanup('a', { log: log403, failureHints: hint }).resume(NEW);
+    expect(log403.error.mock.calls.some(([m]) => m.includes('stopped') && m.endsWith('HINT'))).toBe(true);
+  });
+
+  it('says only the finishing step is left when removing the finished job fails', async () => {
+    const t = setup({ total: 10 });
+    await t.create();
+    const real = t.jobBucket.file.bind(t.jobBucket);
+    vi.spyOn(t.jobBucket, 'file').mockImplementation((name, options) => ({
+      ...real(name, options),
+      delete: async () => Promise.reject(Object.assign(new Error('HTTP 503'), { code: 503 })),
+    }));
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(t.job()).toMatchObject({ deleted: true, pruned: true });
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('; the next run finishes it.'));
+  });
 });

@@ -10,6 +10,7 @@
 
 - A new build no longer makes requests wait for the previous builds' route entries to be deleted.
 - Only one instance at a time deletes the earlier builds' route entries.
+- The warning logged when the delete finishes is now `Route cache clean-up for build <id> finished: …`, replacing `Route cache invalidation: deleted …`.
 - Earlier builds' route keys are removed from `cache/tags/tags.json` by the background clean-up, after the delete, and only for keys whose entries are not the running build's. 
 `CACHE_BUILD_INVALIDATION=off` skips the delete but now still prunes the tags map.
 

@@ -494,8 +494,8 @@ lock, taken with a conditional write and renewed every 15 s (checked between bat
 so a slow page doesn't outlast it) with the last object name reached and the counts so far. If
 the holder stops, the lock lapses after 60 s and the next instance to check resumes from that name.
 Instances check when they start and at most once a minute on route-cache reads. A newer deploy
-replaces the job, and an instance still working on the old one stops after its current batch or
-page. On Cloud
+replaces the job, and an instance still working on the old one stops at its next lock renewal
+(within about 15 s) or at the end of its current page. On Cloud
 Run with request-based billing an instance gets almost no CPU between requests, so the delete only
 progresses while requests arrive, and a paused holder loses its lock the same way.
 
@@ -505,7 +505,8 @@ Each key is decided as the listing reaches its entry, and removals are written a
 flush interval, so a key is removed wrongly only when the new build caches that page again within
 about one interval (5 s by default) of the check. Until the page is cached again, revalidating its
 tags doesn't purge it from the CDN. Then the job deletes itself and logs a warning:
-`Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> runs`.
+`Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
+With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
 only up to its last renewal.
 
