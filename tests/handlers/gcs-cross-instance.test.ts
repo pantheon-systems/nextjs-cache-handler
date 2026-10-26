@@ -624,6 +624,54 @@ describe('GcsCacheHandler across instances', () => {
       expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).not.toBeNull();
     });
 
+    it('keeps a tags map key whose page another instance caches after the prune lists it', async () => {
+      // The delete pass lists once; the prune's listing is the second. Right after it, another new-build
+      // instance caches `shared`. Its key is already in tags.json (from the previous build), so that
+      // instance's flush changes nothing and writes nothing.
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.get(objectOf(shared))?.custom).toEqual({ generation: 'test-build' });
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+    });
+
+    it('adds such a key back under the tags the new build gave the page', async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          // The other instance caches `shared` under a new tag, and its flush adds the key there.
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['news']), lastModified: 2, tags: ['news'] },
+            { generation: 'test-build' }
+          );
+          bucket.putJson(TAGS_MAP, { posts: [shared, old], news: [shared] });
+        }
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({ news: [shared] });
+    });
+
     it("counts the prune as stored when other requests' updates arrive during its write", async () => {
       // Each tags.json write queues another request's update, so the buffer is never empty after a flush.
       const real = bucket.file.bind(bucket);

@@ -645,6 +645,28 @@ export class GcsCacheHandler extends BaseCacheHandler {
           tagsBuffer.droppedUpdates === droppedBefore && ![...removing].some((key) => tagsBuffer.isDeletePending(key))
         );
       },
+      restore: async (keysByObject) => {
+        let queued = 0;
+        const results = await mapInBatches([...keysByObject], resolveDeleteConcurrency(), async ([name, keys]) => {
+          const [data] = await this.bucket.file(name).download();
+          const { tags } = JSON.parse(data.toString()) as { tags?: unknown };
+          const strings = Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : [];
+          for (const key of keys) {
+            tagsBuffer.addTags(key, strings);
+            queued += strings.length > 0 ? 1 : 0;
+          }
+        });
+        const failed = results.filter((result) => result.status === 'rejected');
+        if (failed.length > 0) {
+          this.log.warn(
+            `Could not read ${failed.length} route entries to add their keys back to ` +
+              `gs://${this.bucketName}/${this.tagsMapKey} (first: ${errorMessage(
+                (failed[0] as PromiseRejectedResult).reason
+              )}); tag revalidations do not purge the CDN for those pages until they are cached again`
+          );
+        }
+        return queued;
+      },
       location: `gs://${this.bucketName}/${this.tagsMapKey}`,
     };
   }

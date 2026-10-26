@@ -33,6 +33,12 @@ export const LOCK_TTL_MS = 60_000;
 export const RENEW_INTERVAL_MS = 15_000;
 /** Runs that retry a failed CDN purge before the job gives up on it. */
 export const MAX_PURGE_RUNS = 5;
+/**
+ * Wait after a failed background purge before the next, doubling each time.
+ * Every instance checks about once a minute, so without it a fleet spends
+ * every retry within seconds of each other.
+ */
+export const PURGE_RETRY_DELAY_MS = 60_000;
 
 export interface CleanupTotals {
   listed: number;
@@ -57,6 +63,8 @@ export interface CleanupJob {
   /** The CDN purge for the new build failed and is still owed; `purgeRuns` counts the background retries. */
   purgePending?: boolean;
   purgeRuns?: number;
+  /** No run retries the purge before this time. */
+  purgeRetryAt?: number;
   /** Lock holder, and when the lock lapses without renewal. */
   owner?: string;
   expiresAt?: number;
@@ -77,6 +85,11 @@ export interface CleanupTagsMap {
   remove: (keys: string[]) => Promise<void>;
   /** Write what is queued; resolves to whether everything was stored. */
   flush: () => Promise<boolean>;
+  /**
+   * Queue the keys of these objects again, with the tags the objects hold now;
+   * resolves to how many keys were queued.
+   */
+  restore: (keysByObject: Map<string, string[]>) => Promise<number>;
   /** e.g. `gs://bucket/cache/tags/tags.json`, for logs. */
   location: string;
 }
@@ -314,7 +327,9 @@ export class RouteCacheCleanup {
     };
 
     try {
-      if (job.purgePending && this.config.purge) {
+      if (job.purgePending && this.config.purge && (job.purgeRetryAt ?? 0) > this.now()) {
+        // Not due yet: the run still deletes and prunes, and a later one retries it.
+      } else if (job.purgePending && this.config.purge) {
         const purgeRuns = (job.purgeRuns ?? 0) + 1;
         if (await this.config.purge()) {
           log.warn(`CDN purge for build ${keep}, which failed when the build was recorded, has now been sent`);
@@ -326,7 +341,7 @@ export class RouteCacheCleanup {
           );
           await renew({ purgePending: false, purgeRuns });
         } else {
-          await renew({ purgeRuns });
+          await renew({ purgeRuns, purgeRetryAt: this.now() + PURGE_RETRY_DELAY_MS * 2 ** (purgeRuns - 1) });
         }
       } else if (job.purgePending) {
         // Nothing to send it with here; keeping it owed would hold the job open on every run.
@@ -378,9 +393,11 @@ export class RouteCacheCleanup {
         // Everything else is done; a later run retries the purge.
         await release();
         const done = job.deleteEntries ? 'entries deleted' : 'nothing deleted (CACHE_BUILD_INVALIDATION=off)';
+        const retryAt = new Date(job.purgeRetryAt ?? this.now()).toISOString();
         log.warn(
-          `Route cache clean-up for build ${keep}: ${done} and tags map pruned; the CDN purge failed ` +
-            `(${purgeAttempt}) and the next run retries it`
+          `Route cache clean-up for build ${keep}: ${done} and tags map pruned; the CDN purge is still owed ` +
+            `(${job.purgeRuns ?? 0} of ${MAX_PURGE_RUNS} background attempts made) and a run from ${retryAt} ` +
+            `retries it`
         );
         return;
       }
@@ -442,23 +459,30 @@ export class RouteCacheCleanup {
   /**
    * Remove the tags map's route keys whose entries are not `keep`'s. Each key
    * is decided when the listing page covering its object's name arrives, and
-   * removals are written as the map's flush interval allows, so a key whose
-   * entry the new build writes after its page was listed is removed only if
-   * that write lands within about one flush interval. Keys added to the map
-   * after it was read here are never removed.
+   * removals are written as the map's flush interval allows. Keys added to the
+   * map after it was read here are never removed.
+   *
+   * The new build is serving meanwhile. When it caches a page after that
+   * page's key was decided, its own add finds the key still in the map (from
+   * the earlier build) and writes nothing, and the removal then drops it. So
+   * once the removals are stored, a second listing finds those pages and adds
+   * their keys back; a page cached after that adds its key itself.
    */
   private async pruneTagsMap(keep: string, check: () => Promise<void>): Promise<void> {
     const { tagsMap } = this.config;
     const keysByObject = await tagsMap.routeKeysByObject();
     // Listings return names in this order (they are ASCII).
     const names = [...keysByObject.keys()].sort();
+    const removedByObject = new Map<string, string[]>();
     let next = 0;
     let removed = 0;
     const removeUpTo = async (lastListed: string | undefined, kept: Set<string>) => {
       const stale: string[] = [];
       while (next < names.length && (lastListed === undefined || names[next] <= lastListed)) {
         if (!kept.has(names[next])) {
-          stale.push(...keysByObject.get(names[next])!);
+          const keys = keysByObject.get(names[next])!;
+          stale.push(...keys);
+          removedByObject.set(names[next], keys);
         }
         next++;
       }
@@ -478,9 +502,35 @@ export class RouteCacheCleanup {
     if (!(await tagsMap.flush())) {
       throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
     }
-    if (removed > 0) {
-      this.config.log.warn(`Removed ${removed} route keys of earlier builds from ${tagsMap.location}`);
+    if (removed === 0) {
+      return;
     }
+
+    const cached = new Map<string, string[]>();
+    for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
+      for (const file of files) {
+        const keys = removedByObject.get(file.name);
+        if (keys && this.config.generationOf(file) === keep) {
+          cached.set(file.name, keys);
+        }
+      }
+      await check();
+    }
+    // Not retried by a later run: its read of the map no longer has these keys.
+    let restored = 0;
+    if (cached.size > 0) {
+      restored = await tagsMap.restore(cached);
+      if (!(await tagsMap.flush())) {
+        this.config.log.warn(
+          `Adding back ${restored} route keys this build cached during the prune to ${tagsMap.location} is not ` +
+            `stored yet; until it is, tag revalidations do not purge the CDN for those pages`
+        );
+      }
+    }
+    this.config.log.warn(
+      `Removed ${removed - restored} route keys of earlier builds from ${tagsMap.location}` +
+        (restored > 0 ? ` (and added back ${restored} whose pages this build cached during the prune)` : '')
+    );
   }
 
   /** Take the lock on `keep`'s job, or null when there is none, it is another build's, or it is held. */
@@ -500,6 +550,11 @@ export class RouteCacheCleanup {
     }
     if (value.keep !== keep) {
       log.debug(`Route cache clean-up job is for build ${value.keep}, not ${keep}; leaving it`);
+      return null;
+    }
+    if (value.pruned && value.purgePending && (value.purgeRetryAt ?? 0) > this.now()) {
+      // Only the purge is left, and it is not due: taking the lock would only write the job.
+      log.debug(`Route cache clean-up for build ${keep}: the CDN purge retry is not due yet`);
       return null;
     }
     if (value.owner && value.owner !== this.owner && (value.expiresAt ?? 0) > this.now()) {

@@ -228,7 +228,7 @@ flowchart TB
   t3 -- "re-purge, timer" --> dp
   dp --> keysPaths
   t2 -- "background" --> paths1
-  t4 -- "awaited before serving; retried by the background clean-up (up to 5 runs) if it fails" --> nuke["nukeCache()"]
+  t4 -- "awaited before serving; retried by the background clean-up (up to 5 runs, 1, 2, 4, 8 min apart) if it fails" --> nuke["nukeCache()"]
   t5 -- "awaited before serving" --> nuke
   t6 -- "background" --> nuke
   t7 --> keysPaths
@@ -299,10 +299,11 @@ sequenceDiagram
   Note over N: Requests are served from here on. The rest runs in the background, after a new generation and on every start whose generation is current (and again at most once a minute on route-cache reads)
   opt route-cache-cleanup.json exists for this generation, and its lock is free or expired
     N->>G: take the lock (conditional write: owner, expiresAt = now + 60 s), read it back
-    N->>P: full purge again if purgePending; give up with an error after 5 runs that tried
+    N->>P: full purge again if purgePending and purgeRetryAt has passed (1, 2, 4, then 8 min after each failure; a job with only the purge left is not locked until then); give up with an error after 5 runs that tried
     N->>G: delete route-cache/* one listed page (1,000) at a time from the recorded cursor, at most CACHE_INVALIDATION_DELETE_CONCURRENCY (50) in flight, skipping objects stamped with this generation; each delete has ifGenerationMatch on the listed version. Skipped with CACHE_BUILD_INVALIDATION=off
     N->>G: after each page, stop if the job's GCS generation changed or the job is gone (taken over, finished, or replaced by a newer deploy); every 15 s, checked after each batch of deletes too, renew the lock and record the cursor and the totals so far
     N->>G: read tags.json's route keys (starting with /), list route-cache/ again, and as each page arrives queue removal of the keys whose object in that page's name range is not this generation's; removals go through the tags buffer at its flush interval; fetch keys stay
+    N->>G: once the removals are stored, list route-cache/ again and add back, with the tags each entry holds, the removed keys whose object is now this generation's (cached by the new build after its key was decided)
     N->>G: delete route-cache-cleanup.json (ifGenerationMatch) and log the totals, or, if the purge is still owed, release the lock and leave the job for a later run
   end
   Note over N,G: The use cache handler checks use-cache/_build-meta.json when it is constructed and sends its own full purge, so a deploy sends two full purges per starting process. Unlike the route handler it has no fallback-* skip, so a process whose build ID can't be read purges the whole CDN on every start. It deletes no entries (each records its generation, and one from another generation is deleted when read), rewrites _build-meta.json on every start, and retries the check on its next read or write when the file cannot be read.
@@ -338,7 +339,7 @@ is unique, so it would otherwise never hit).
 | `use cache` tag reload is background | A tag revalidated on another instance can be missed by this instance's `use cache` reads for up to about one refresh interval plus the reload's GCS round trip (see below) | README `CACHE_TAGS_REFRESH_INTERVAL_MS` |
 | GCS stall longer than the second-purge delay | An instance still serving without the revalidation can re-cache the old page after the last purge | – |
 | Route-cache delete fails part-way | Deletes that still fail after their retry are counted and logged when the job finishes (counts by status, the fix); the next deploy deletes them. A listing that still fails releases the lock with the cursor, and a later instance resumes. Objects left over are never served, since their generation stamp differs, but take up storage meanwhile; with a permission problem every deploy fails the same way | – |
-| Route keys removed from `tags.json` during the prune | A key whose entry the new build writes after the prune listed that entry's name, and whose tags reach `tags.json` before the prune's removal is written (up to one tags flush interval, 5 s by default), is removed. Until that page is cached again, revalidating its tags does not purge it from the CDN | – |
+| Route keys added back after the prune | An entry that can't be read when its key is added back, or an add-back that is not stored (the buffer keeps retrying it in that process), is logged as a warning; a later run does not retry it. Until that page is cached again, revalidating its tags does not purge it from the CDN | – |
 | Background delete under request-based CPU | Cloud Run throttles CPU between requests, so the delete only moves forward while requests arrive. On a site that scales to zero the job waits for the next request; old objects take up storage meanwhile, but are not served | – |
 | Clean-up totals after a crash | A run that stops without releasing the lock (process killed) loses the counts since its last renewal, about 15 s of work, so the final totals undercount deletes | – |
 | Replaced holder finishes its page | A holder whose job was taken over or replaced notices at its next lock renewal (within about 15 s) or at the end of its current page. A page listed after a newer deploy's instances started writing can still delete their entries (skipped only if stamped with the holder's own generation), which costs cache misses | – |

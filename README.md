@@ -502,16 +502,19 @@ progresses while requests arrive, and a paused holder loses its lock the same wa
 When the delete finishes, the job lists `route-cache/` again and removes from the tags map
 (`cache/tags/tags.json`) the route keys whose entries are not the running build's; fetch keys stay.
 Each key is decided as the listing reaches its entry, and removals are written at the tags map's
-flush interval, so a key is removed wrongly only when the new build caches that page again within
-about one interval (5 s by default) of the check. Until the page is cached again, revalidating its
-tags doesn't purge it from the CDN. Then the job deletes itself and logs a warning:
+flush interval. The new build is serving meanwhile, and a page it caches after its key was decided
+would lose the key, so once the removals are stored the job lists `route-cache/` again and
+adds back, with the tags the entry holds now, the keys of pages this build has cached since. Then
+the job deletes itself and logs a warning:
 `Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
 With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
 only up to its last renewal.
 
 A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
-until the purge succeeds or 5 runs have tried, when it gives up with an error.
+until the purge succeeds or 5 runs have tried, when it gives up with an error. After each failed
+retry the next waits 1, 2, 4, then 8 minutes, so the fifth comes about 15 minutes after the first;
+a retry also waits for an instance to check the job, at most once a minute on a route-cache read.
 
 A listing that fails with throttling, a timeout, a server error or a network error is retried
 twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still
