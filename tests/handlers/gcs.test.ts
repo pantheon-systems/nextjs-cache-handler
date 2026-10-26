@@ -1028,6 +1028,22 @@ describe('GcsCacheHandler tags mapping writes', () => {
     expect(tagsOptions.retryOptions.retryableErrorFn({ code: 412 })).toBe(false);
   });
 
+  it('points both storage clients at CACHE_GCS_API_ENDPOINT when it is set', async () => {
+    storageConstructorOptions.length = 0;
+    process.env.CACHE_GCS_API_ENDPOINT = 'http://localhost:4443';
+    try {
+      const handler = new GcsCacheHandler({} as any);
+      await setWithTags(handler, 'key1', ['posts']);
+    } finally {
+      delete process.env.CACHE_GCS_API_ENDPOINT;
+    }
+
+    expect(storageConstructorOptions).toHaveLength(2);
+    for (const options of storageConstructorOptions) {
+      expect(options).toMatchObject({ apiEndpoint: 'http://localhost:4443' });
+    }
+  });
+
   it('replaces an unparseable mapping instead of failing forever', async () => {
     mockFile.getMetadata.mockResolvedValue([{ generation: '5' }]);
     mockFile.download.mockResolvedValue([Buffer.from('{not json')]);

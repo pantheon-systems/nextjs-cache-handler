@@ -2,6 +2,10 @@
 
 ## 0.14.0
 
+### Added
+
+- `CACHE_GCS_API_ENDPOINT` points the GCS handlers at a GCS emulator, for tests.
+
 ### Changed
 
 - A new build no longer makes requests wait for the previous builds' route entries to be deleted.

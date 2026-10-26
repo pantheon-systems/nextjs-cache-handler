@@ -32,7 +32,7 @@ export function getSharedStorage(bucketName: string, purpose: StoragePurpose): S
   const key = `${purpose}:${bucketName}`;
   let storage = storageClients.get(key);
   if (!storage) {
-    storage = purpose === 'tags' ? createTagsStorage() : new Storage();
+    storage = purpose === 'tags' ? createTagsStorage() : new Storage(endpointOptions());
     storageClients.set(key, storage);
   }
   return storage;
@@ -41,10 +41,21 @@ export function getSharedStorage(bucketName: string, purpose: StoragePurpose): S
 /** Retries transient errors but not 429: the caller's paced backoff handles those, and the flush must not block on library retries. */
 function createTagsStorage(): Storage {
   return new Storage({
+    ...endpointOptions(),
     retryOptions: {
       retryableErrorFn: (err: ApiError) => RETRYABLE_ERR_FN_DEFAULT(err) && getErrorStatusCode(err) !== 429,
     },
   });
+}
+
+/**
+ * CACHE_GCS_API_ENDPOINT points the clients at a GCS emulator, for tests. Not
+ * STORAGE_EMULATOR_HOST: with it the library builds API and upload URLs from
+ * the same value differently, so no value serves both.
+ */
+function endpointOptions(): { apiEndpoint?: string } {
+  const apiEndpoint = process.env.CACHE_GCS_API_ENDPOINT?.trim();
+  return apiEndpoint ? { apiEndpoint } : {};
 }
 
 /** @internal Test hook. */
