@@ -167,6 +167,16 @@ export class TagsBuffer {
     return this.pendingCount > 0;
   }
 
+  /** Unqueue removals of these keys not yet written. */
+  cancelDeletes(cacheKeys: string[]): void {
+    for (const cacheKey of cacheKeys) {
+      this.pending.deletes.delete(cacheKey);
+    }
+    if (!this.hasPending) {
+      this.oldestPendingSince = 0;
+    }
+  }
+
   /** Whether a removal of `cacheKey` is queued and not yet written. */
   isDeletePending(cacheKey: string): boolean {
     return this.pending.deletes.has(cacheKey);

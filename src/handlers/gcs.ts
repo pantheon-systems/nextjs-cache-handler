@@ -644,11 +644,17 @@ export class GcsCacheHandler extends BaseCacheHandler {
         await tagsBuffer.flush();
         // A failed write leaves them queued (the buffer logged why); a drop
         // may have discarded them.
-        return (
+        const stored =
           tagsBuffer.droppedUpdates === droppedBefore &&
           ![...removing].some((key) => tagsBuffer.isDeletePending(key)) &&
-          ![...restoring].some((key) => tagsBuffer.isAddPending(key))
-        );
+          ![...restoring].some((key) => tagsBuffer.isAddPending(key));
+        if (!stored) {
+          // Left queued, a later write could store them after another instance
+          // took the job over and added keys back; the next run removes them
+          // again from the saved removals. Additions stay queued.
+          tagsBuffer.cancelDeletes([...removing]);
+        }
+        return stored;
       },
       restore: async (keysByObject) => {
         let queued = 0;

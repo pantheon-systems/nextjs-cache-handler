@@ -77,7 +77,11 @@ export interface CleanupTagsMap {
   routeKeysByObject: () => Promise<Map<string, string[]>>;
   /** Queue a prune's removals, once per prune; may write when the map's flush interval has passed. */
   remove: (keys: string[]) => Promise<void>;
-  /** Write what is queued; resolves to whether the removals, and any keys added back, were stored. */
+  /**
+   * Write what is queued; resolves to whether the removals, and any keys added
+   * back, were stored. Removals not stored are unqueued, so they can't land
+   * after another instance took the job over and added keys back.
+   */
   flush: () => Promise<boolean>;
   /**
    * Queue the keys of these objects again, with the tags the objects hold now;
@@ -531,6 +535,23 @@ export class RouteCacheCleanup {
       throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
     }
 
+    // Once its removals are stored, a run adds back even after losing the job:
+    // they may have landed after the instance that took over added keys back.
+    // Adding back only adds, so it needs no lock.
+    let lost: LostJobError | undefined;
+    const checkOrNoteLost = async () => {
+      if (lost) {
+        return;
+      }
+      try {
+        await check();
+      } catch (error) {
+        if (!(error instanceof LostJobError)) {
+          throw error;
+        }
+        lost = error;
+      }
+    };
     const cached = new Map<string, string[]>();
     for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
       for (const file of files) {
@@ -539,7 +560,7 @@ export class RouteCacheCleanup {
           cached.set(file.name, keys);
         }
       }
-      await check();
+      await checkOrNoteLost();
     }
     // A later run removes the saved keys again, then adds these back again.
     let restored = 0;
@@ -551,6 +572,9 @@ export class RouteCacheCleanup {
             `stored yet`
         );
       }
+    }
+    if (lost) {
+      throw lost;
     }
     this.config.log.warn(
       `Removed ${removed - restored} route keys of earlier builds from ${tagsMap.location}` +

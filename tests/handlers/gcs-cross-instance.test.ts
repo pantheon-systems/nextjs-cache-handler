@@ -747,6 +747,25 @@ describe('GcsCacheHandler across instances', () => {
       expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
     });
 
+    it("unqueues the prune's removals when their write fails, so a later write can't store them", async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        // The prune's deciding listing is the second; the removals' write then fails.
+        if (++listings === 2) bucket.failWrites.set(TAGS_MAP, { code: 503, times: 1 });
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+      expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+
+      // Writes work again; another instance may have taken the job over by now. Nothing of the prune is stored.
+      await flushGcsTagsMapping();
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared, old] });
+    });
+
     it('does not count the prune as stored when the buffer drops its removals', async () => {
       vi.useFakeTimers({ toFake: ['Date'] });
       try {

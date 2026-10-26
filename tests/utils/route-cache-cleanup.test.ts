@@ -845,6 +845,39 @@ describe('a prune that stops part-way', () => {
     expect(s.map.stored.has(s.late)).toBe(true);
   });
 
+  it('adds back after losing the job, when its removals land after the instance that took over added keys back', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.onListing((n) => {
+      if (n === 1) s.cacheLate();
+    });
+    // "a"'s write of its removals stalls past the lock's lifetime; "b" takes over and finishes the
+    // prune, adding `late` back, then a's write lands.
+    let queued: string[] = [];
+    const tagsMap = {
+      ...s.map.tagsMap,
+      remove: async (keys: string[]) => {
+        queued = keys;
+      },
+      flush: vi.fn(async () => {
+        if (queued.length > 0) {
+          s.t.advance(LOCK_TTL_MS + 1);
+          await s.run('b').resume(NEW, { force: true });
+          expect(s.map.stored.has(s.late)).toBe(true);
+          for (const key of queued) s.map.stored.delete(key);
+          queued = [];
+        }
+        return true;
+      }),
+    };
+    const log = silentLog();
+    await s.t.cleanup('a', { tagsMap, log }).resume(NEW);
+
+    expect(s.t.job()).toBeUndefined();
+    expect(s.map.stored.has(s.late)).toBe(true);
+    expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
+  });
+
   it("ignores removals saved by an earlier build's prune", async () => {
     const s = setupStored();
     await s.t.create({ deleteEntries: false });
