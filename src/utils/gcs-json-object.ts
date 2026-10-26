@@ -124,7 +124,8 @@ export async function readJsonObject<T>(bucket: Bucket, key: string): Promise<Js
       return { value: JSON.parse(data.toString()) as T, generation };
     } catch (error) {
       log.warn(
-        `Object ${key} (generation ${generation}) is not valid JSON; it will be replaced on the next write`,
+        `Object ${key} (generation ${generation}) is not valid JSON; reading it as empty. Its contents are ` +
+          `lost, and the next write replaces it.`,
         error
       );
       return { value: null, generation };

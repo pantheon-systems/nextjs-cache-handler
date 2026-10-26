@@ -45,7 +45,12 @@ import {
 import { isBuildPhase } from '../utils/build-detection.js';
 import { toObjectName } from '../utils/object-names.js';
 import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
-import { RouteCacheCleanup, createCleanupJob, type CleanupTagsMap } from '../utils/route-cache-cleanup.js';
+import {
+  MAX_PURGE_RUNS,
+  RouteCacheCleanup,
+  createCleanupJob,
+  type CleanupTagsMap,
+} from '../utils/route-cache-cleanup.js';
 import {
   DEFAULT_DELETE_CONCURRENCY,
   deletePrefix,
@@ -565,30 +570,31 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // a request that could race a still-cached page from the previous build.
     // Bounded by nukeCache()'s own timeout. A failure is recorded on the job
     // and retried in the background, so it does not hold up requests.
-    let purged = true;
-    if (this.edgeCacheClearer) {
-      const result = await this.edgeCacheClearer.nukeCache();
-      purged = result.success;
-      if (!result.success) {
-        this.log.error(
-          `Edge cache purge on build invalidation failed: ${result.error}. It is retried in the background; ` +
-            `until it succeeds, pages from the previous build stay in the CDN.`
-        );
-      }
-    }
+    const purge = this.edgeCacheClearer ? await this.edgeCacheClearer.nukeCache() : { success: true };
+    const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
+    const stayInCdn =
+      "pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared.";
 
     // Before the build is recorded, so a process that dies after recording it
     // still leaves the job for a later instance.
     try {
       await createCleanupJob(this.tagsBucket, this.cleanupJobKey, getProcessGeneration(), {
         deleteEntries,
-        purgePending: !purged,
+        purgePending: !purge.success,
       });
     } catch (error) {
       this.log.error(
         `Could not record the route cache clean-up in gs://${this.bucketName}/${this.cleanupJobKey} ` +
           `(${errorLabel(error)}: ${errorMessage(error)}). The previous build's entries in ${location} are not ` +
-          `served, but stay in storage, and their keys in the tags map, until the next deploy.`
+          `served, but stay in storage, and their keys in the tags map, until the next deploy.` +
+          (purge.success ? '' : ` ${purgeFailed} It is not retried, so ${stayInCdn}`)
+      );
+      return;
+    }
+    if (!purge.success) {
+      this.log.error(
+        `${purgeFailed} The background clean-up retries it (up to ${MAX_PURGE_RUNS} runs); until then, ` +
+          `pages from the previous build stay in the CDN.`
       );
     }
   }
@@ -1034,14 +1040,14 @@ export async function clearSharedCache(): Promise<number> {
 
   try {
     // Clear fetch cache (data cache - always clearable)
-    clearedCount += await clearGcsFetchCache(bucket, bucketName, fetchCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, fetchCachePrefix, 'fetch');
 
     // Clear route cache (skip static routes)
     const routeResult = await clearGcsRouteCache(bucket, bucketName, routeCachePrefix, staticRoutes);
     clearedCount += routeResult.cleared;
 
     // Clear image cache (content-derived, no build/static-route scoping needed)
-    clearedCount += await clearGcsFetchCache(bucket, bucketName, imageCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, imageCachePrefix, 'image');
 
     // Clear tags mapping
     await clearGcsTagsMapping(bucket, tagsFilePath);
@@ -1063,7 +1069,12 @@ export async function clearSharedCache(): Promise<number> {
   }
 }
 
-async function clearGcsFetchCache(bucket: Bucket, bucketName: string, prefix: string): Promise<number> {
+async function clearGcsFetchCache(
+  bucket: Bucket,
+  bucketName: string,
+  prefix: string,
+  cacheType: 'fetch' | 'image'
+): Promise<number> {
   try {
     const r = await deletePrefix(bucket, prefix, {
       concurrency: resolveDeleteConcurrency(),
@@ -1071,10 +1082,10 @@ async function clearGcsFetchCache(bucket: Bucket, bucketName: string, prefix: st
     });
     logClearFailures(bucketName, prefix, r);
 
-    gcsLog.debug(`Cleared ${r.deleted} fetch cache entries`);
+    gcsLog.debug(`Cleared ${r.deleted} ${cacheType} cache entries`);
     return r.deleted;
   } catch (error) {
-    gcsLog.warn('Error clearing fetch cache:', error);
+    gcsLog.warn(`Error clearing ${cacheType} cache:`, error);
     return 0;
   }
 }

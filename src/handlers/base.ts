@@ -98,12 +98,13 @@ export abstract class BaseCacheHandler {
   private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
   // Tracks the in-flight initialize() call so get()/set() can await it before
-  // touching the store. Without this, a request's get() could race ahead of
-  // checkBuildInvalidation() below and read a stale route-cache entry left
-  // over from the previous build, before this process has had a chance to
-  // wipe it -- initialize() itself can't be awaited from the constructor (JS
-  // constructors can't be async), so this is the only place that gap can
-  // close. Cleared to null once awaited so later get()/set() calls short-circuit.
+  // touching the store. Without this, a request could race ahead of
+  // checkBuildInvalidation() below: served before this process sent a new
+  // build's CDN purge, or, on the file handler, reading a route entry of the
+  // previous build before it is deleted. initialize() itself can't be awaited
+  // from the constructor (JS constructors can't be async), so this is the only
+  // place that gap can close. Cleared to null once awaited so later get()/set()
+  // calls short-circuit.
   private initPromise: Promise<void> | null = null;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
@@ -233,8 +234,8 @@ export abstract class BaseCacheHandler {
     // `buildId` holds the generation ID (build ID + deployment ID).
     const currentBuildId = getProcessGeneration();
     if (isFallbackGeneration(currentBuildId)) {
-      // Unique to this process, so it would wipe the route cache and purge the
-      // CDN on every cold start. Nothing is recorded either.
+      // Unique to this process, so it would purge the CDN and clean up the route
+      // cache on every cold start. Nothing is recorded either.
       this.log.warn(
         `BUILD_ID unreadable (generation ${currentBuildId}); skipping build invalidation. Neither ` +
           `.next/BUILD_ID nor .next/build-manifest.json is readable under ${process.cwd()}, so a new build is ` +
@@ -268,7 +269,9 @@ export abstract class BaseCacheHandler {
 
     if (buildMeta.buildId !== currentBuildId) {
       // warn, not info: once per deploy, and must be visible without CACHE_DEBUG
-      this.log.warn(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
+      this.log.warn(
+        `New build detected (${buildMeta.buildId || '(unreadable)'} -> ${currentBuildId}), invalidating route cache`
+      );
 
       await this.invalidateRouteCache();
       await this.onNewGeneration(buildMeta);
@@ -440,9 +443,9 @@ export abstract class BaseCacheHandler {
     this.log.debug(`GET: ${cacheKey}`);
 
     // Without this, a request racing the very first GET on a cold instance
-    // could read a route-cache entry left over from the previous build,
-    // before checkBuildInvalidation() (in initialize()) has had a chance to
-    // wipe it.
+    // could be served before checkBuildInvalidation() (in initialize()) sent
+    // a new build's CDN purge, or, on the file handler, read a route entry of
+    // the previous build before it is deleted.
     await this.ensureInitialized();
     // Before any tag check: Next's own checks run on what get() returns.
     await this.refreshRevalidations();
@@ -554,9 +557,8 @@ export abstract class BaseCacheHandler {
       revalidate?: Revalidate;
     }
   ): Promise<void> {
-    // Same race as get() above -- a write racing ahead of build invalidation
-    // could persist a fresh entry that the still-pending wipe would then
-    // incorrectly delete.
+    // Same race as get() above: on the file handler, an entry written before
+    // a new build's delete would be deleted with it.
     await this.ensureInitialized();
 
     const cacheType = this.determineCacheTypeFromValue(incrementalCacheValue);
@@ -646,7 +648,7 @@ export abstract class BaseCacheHandler {
     const published = await this.publishRevalidations(revalidations);
     const affectedKeys = await this.findAffectedKeys(tagArray);
 
-    this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
+    this.log.info(`Revalidated tags ${tagArray.join(', ')}; ${new Set(affectedKeys).size} cache keys affected`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
     await this.onRevalidateComplete(tagArray, affectedKeys, published);
@@ -658,7 +660,7 @@ export abstract class BaseCacheHandler {
     try {
       tagsMapping = await this.readTagsMapping();
     } catch (error) {
-      this.log.error('Error reading tags mapping during revalidateTag:', error);
+      this.log.error('Error reading tags mapping; only build prerender keys are known for these tags:', error);
       tagsMapping = {};
     }
 

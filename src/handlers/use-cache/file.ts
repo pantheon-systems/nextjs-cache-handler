@@ -184,10 +184,10 @@ export class UseCacheFileHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
-      // Known Next.js bug: cacheTag() values not propagated to cacheHandlers.set()
-      // See: https://github.com/vercel/next.js/issues/78864
+      // No tags is normal for a function without cacheTag(), and also what
+      // Next.js sends when it drops them (https://github.com/vercel/next.js/issues/78864).
       if ((entry.tags?.length ?? 0) === 0) {
-        log.warn(`SET ${cacheKey}: empty tags array (known Next.js bug)`);
+        log.debug(`SET ${cacheKey}: no tags (none declared, or not passed on by Next.js)`);
       }
 
       const serialized = await serializeUseCacheEntry(entry);

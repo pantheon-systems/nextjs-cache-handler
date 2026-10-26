@@ -368,7 +368,7 @@ export async function clearSharedCache(): Promise<number> {
 
   try {
     // Clear fetch cache (data cache - always clearable)
-    clearedCount += await clearFetchCache(fetchCacheDir);
+    clearedCount += await clearFetchCache(fetchCacheDir, 'fetch');
 
     // Clear route cache (skip static routes)
     const routeResult = await clearRouteCache(routeCacheDir, staticRoutes);
@@ -376,7 +376,7 @@ export async function clearSharedCache(): Promise<number> {
     preservedCount = routeResult.preserved;
 
     // Clear image cache (content-derived, no build/static-route scoping needed)
-    clearedCount += await clearFetchCache(imageCacheDir);
+    clearedCount += await clearFetchCache(imageCacheDir, 'image');
 
     // Clear tags mapping
     await clearTagsMapping(tagsFilePath);
@@ -389,7 +389,7 @@ export async function clearSharedCache(): Promise<number> {
   }
 }
 
-async function clearFetchCache(dir: string): Promise<number> {
+async function clearFetchCache(dir: string, cacheType: 'fetch' | 'image'): Promise<number> {
   try {
     const files = await fs.promises.readdir(dir);
     const jsonFiles = files.filter((file) => file.endsWith('.json'));
@@ -398,7 +398,7 @@ async function clearFetchCache(dir: string): Promise<number> {
       await fs.promises.unlink(safeJoin(dir, file));
     }
 
-    fileLog.debug(`Cleared ${jsonFiles.length} fetch cache entries`);
+    fileLog.debug(`Cleared ${jsonFiles.length} ${cacheType} cache entries`);
     return jsonFiles.length;
   } catch {
     return 0;

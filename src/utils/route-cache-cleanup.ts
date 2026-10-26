@@ -107,7 +107,7 @@ export interface RouteCacheCleanupConfig {
 /** The job object was replaced (another instance took over, or a newer build created its own job) or removed. */
 class LostJobError extends Error {
   constructor() {
-    super('the clean-up job was taken over or replaced');
+    super('the clean-up job was taken over, replaced or removed');
     this.name = 'LostJobError';
   }
 }
@@ -217,7 +217,9 @@ export class RouteCacheCleanup {
     }
     this.lastCheck = this.now();
     this.running = this.run(keep)
-      .catch((error) => this.config.log.error('Route cache clean-up failed; a later instance retries it:', error))
+      .catch((error) =>
+        this.config.log.error('Could not take the route cache clean-up job; the next check retries it:', error)
+      )
       .finally(() => {
         this.running = null;
       });
@@ -240,11 +242,15 @@ export class RouteCacheCleanup {
     let { job, generation } = acquired;
     const started = this.now();
     let lastRenew = started;
-    log.warn(
-      `Route cache clean-up for build ${keep} ${job.totals.runs === 1 ? 'started' : 'resumed'}` +
-        (job.cursor ? ` after ${job.cursor}` : '') +
-        ` (run ${job.totals.runs})`
-    );
+    const purgeAttempt = `attempt ${(job.purgeRuns ?? 0) + 1} of ${MAX_PURGE_RUNS}`;
+    if (job.pruned && job.purgePending) {
+      log.warn(`Route cache clean-up for build ${keep}: retrying the CDN purge (${purgeAttempt})`);
+    } else if (job.totals.runs === 1) {
+      log.warn(`Route cache clean-up for build ${keep} started`);
+    } else {
+      const from = job.deleted || !job.deleteEntries ? 'pruning the tags map' : `after ${job.cursor ?? 'the start'}`;
+      log.warn(`Route cache clean-up for build ${keep} resumed, ${from} (run ${job.totals.runs})`);
+    }
 
     // Totals from earlier runs, fixed for this run; every write records them plus this run's progress.
     const base = job.totals;
@@ -329,7 +335,7 @@ export class RouteCacheCleanup {
           const result = await deletePrefix(this.config.bucket, this.config.prefix, {
             concurrency: this.config.concurrency(),
             pageSize: this.config.pageSize,
-            startOffset: cursor,
+            startAfter: cursor,
             ifUnchanged: true,
             shouldDelete: (file) => this.config.generationOf(file) !== keep,
             // A page can take longer than the lock lasts (throttling, low concurrency).
@@ -364,9 +370,10 @@ export class RouteCacheCleanup {
       if (job.purgePending) {
         // Everything else is done; a later run retries the purge.
         await release();
+        const done = job.deleteEntries ? 'entries deleted' : 'nothing deleted (CACHE_BUILD_INVALIDATION=off)';
         log.warn(
-          `Route cache clean-up for build ${keep}: entries deleted and tags map pruned; the CDN purge is ` +
-            `retried by a later instance`
+          `Route cache clean-up for build ${keep}: ${done} and tags map pruned; the CDN purge failed ` +
+            `(${purgeAttempt}) and the next run retries it`
         );
         return;
       }
@@ -383,26 +390,31 @@ export class RouteCacheCleanup {
             throw error;
           }
         });
-      this.report(keep, final);
+      this.report(keep, job.deleteEntries, final);
     } catch (error) {
       if (error instanceof LostJobError) {
+        // Deletes of a page interrupted mid-way are not in `progress` yet.
         log.warn(
           `Route cache clean-up for build ${keep} stopped: ${error.message} (${location}); ` +
-            `this run deleted ${progress.deleted} objects`
+            `this run deleted at least ${progress.deleted} objects`
         );
         return;
       }
       const reason = error instanceof ListPrefixError ? error.message : `${errorLabel(error)}: ${errorMessage(error)}`;
+      let released = true;
       try {
         await release();
       } catch {
-        // The lock expires on its own.
+        released = false; // the lock expires on its own, and the job keeps its last renewal's cursor
       }
       const labels = [errorLabel(error instanceof ListPrefixError ? error.reason : error)];
+      const when = released ? 'the next run' : 'the next run, once the lock expires,';
       const next =
         job.deleted || !job.deleteEntries
-          ? 'a later instance prunes the tags map'
-          : `a later instance resumes it from ${cursor ?? 'the start'}`;
+          ? `${when} prunes the tags map`
+          : released
+            ? `${when} resumes it after ${cursor ?? 'the start'}`
+            : `${when} resumes it from the last recorded object`;
       const text = [
         `Route cache clean-up for build ${keep} stopped (${reason}); ${next}. Objects left behind are not served.`,
         ...(this.config.failureHints?.(labels) ?? []),
@@ -483,9 +495,7 @@ export class RouteCacheCleanup {
       log.debug(`Route cache clean-up for build ${keep} is running on ${value.owner}`);
       return null;
     }
-    if (value.owner && value.owner !== this.owner) {
-      log.warn(`Route cache clean-up lock held by ${value.owner} expired; taking over`);
-    }
+    const expiredOwner = value.owner && value.owner !== this.owner ? value.owner : undefined;
     const totals = { ...emptyTotals(), ...value.totals };
     totals.runs++;
     const job: CleanupJob = {
@@ -506,14 +516,26 @@ export class RouteCacheCleanup {
     if (reread.value?.owner !== this.owner) {
       return null;
     }
+    if (expiredOwner) {
+      log.warn(`Route cache clean-up lock held by ${expiredOwner} expired; took it over`);
+    }
     return { job: reread.value, generation: reread.generation };
   }
 
-  private report(keep: string, t: CleanupTotals): void {
+  private report(keep: string, deleteEntries: boolean, t: CleanupTotals): void {
+    const runs = `in ${t.durationMs}ms over ${t.runs} run${t.runs === 1 ? '' : 's'}`;
+    if (!deleteEntries) {
+      this.config.log.warn(
+        `Route cache clean-up for build ${keep} finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), ` +
+          `tags map pruned, ${runs}`
+      );
+      return;
+    }
+    // `deleted` includes objects already gone (404).
     const summary =
       `Route cache clean-up for build ${keep} finished: deleted ${t.deleted} objects of earlier builds ` +
       `(${t.listed} listed, ${t.kept} of this build kept, ${t.changed} rewritten during the delete kept), ` +
-      `${t.failed} failed, in ${t.durationMs}ms over ${t.runs} run${t.runs === 1 ? '' : 's'}`;
+      `${t.failed} failed, ${runs}`;
     if (t.failed === 0) {
       this.config.log.warn(summary);
       return;

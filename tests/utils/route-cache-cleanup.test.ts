@@ -225,6 +225,9 @@ describe('RouteCacheCleanup', () => {
       const finished = log.warn.mock.calls.map(([message]) => message).find((m) => m.includes('finished'));
       expect(finished).toMatch(/deleted 3000 objects/);
       expect(finished).toMatch(/over 2 runs$/);
+      expect(log.warn.mock.calls.map(([m]) => m)).toContain(
+        'Route cache clean-up lock held by dead expired; took it over'
+      );
       expect(t.job()).toBeUndefined();
     });
 
@@ -317,7 +320,7 @@ describe('RouteCacheCleanup', () => {
 
     expect(log.warn.mock.calls.map(([m]) => m)).toContain(
       `Route cache clean-up for build ${NEW} stopped (error: removing 100 route keys from ` +
-        `gs://test-bucket/tags.json is not stored yet); a later instance prunes the tags map. Objects left ` +
+        `gs://test-bucket/tags.json is not stored yet); the next run prunes the tags map. Objects left ` +
         `behind are not served.`
     );
     expect(t.objects.live.size).toBe(0);
@@ -334,11 +337,19 @@ describe('RouteCacheCleanup', () => {
   it('under CACHE_BUILD_INVALIDATION=off deletes nothing but still prunes the tags map', async () => {
     const t = setup({ total: 100, current: 3 });
     await t.create({ deleteEntries: false });
-    await t.cleanup('a').resume(NEW);
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
 
     expect(t.objects.live.size).toBe(103);
     expect(t.remainingTagKeys().size).toBe(3);
     expect(t.job()).toBeUndefined();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
+      expect.stringMatching(
+        new RegExp(
+          `^Route cache clean-up for build ${NEW} finished: nothing deleted \\(CACHE_BUILD_INVALIDATION=off\\), tags map pruned, in \\d+ms over 1 run$`
+        )
+      )
+    );
   });
 
   it('keeps the job while the CDN purge still fails, and a later run sends it without deleting or pruning again', async () => {
@@ -357,7 +368,10 @@ describe('RouteCacheCleanup', () => {
     expect(t.objects.getFiles.mock.calls.length).toBe(listings);
     expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
     expect(t.job()).toBeUndefined();
-    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('has now been sent'));
+    const warned = log.warn.mock.calls.map(([m]) => m);
+    expect(warned).toContainEqual(expect.stringContaining('has now been sent'));
+    expect(warned).toContain(`Route cache clean-up for build ${NEW}: retrying the CDN purge (attempt 2 of 5)`);
+    expect(warned.some((m) => m.includes('resumed'))).toBe(false);
   });
 
   it(`gives up on a CDN purge that fails ${MAX_PURGE_RUNS} times, with an error`, async () => {
@@ -443,7 +457,7 @@ describe('RouteCacheCleanup', () => {
       expect(t.job()).toMatchObject({ cursor: `${PREFIX}0000999.json`, totals: { deleted: 1000, listed: 1000 } });
       expect(t.job()!.owner).toBeUndefined();
       expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
-        expect.stringContaining(`a later instance resumes it from ${PREFIX}0000999.json`)
+        expect.stringContaining(`the next run resumes it after ${PREFIX}0000999.json`)
       );
     });
 
@@ -504,7 +518,7 @@ describe('RouteCacheCleanup', () => {
 
     expect(t.job()).toBeUndefined();
     expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
-      expect.stringContaining('stopped: the clean-up job was taken over or replaced')
+      expect.stringContaining('stopped: the clean-up job was taken over, replaced or removed')
     );
   });
 
@@ -549,5 +563,32 @@ describe('RouteCacheCleanup', () => {
 
       expect(t.remainingTagKeys()).toEqual(new Set([late]));
     });
+  });
+
+  it('logs no takeover when another instance takes the expired lock first', async () => {
+    const t = setup({ total: 10 });
+    await t.create();
+    t.jobBucket.putJson(JOB, { ...t.job()!, owner: 'dead', expiresAt: t.clock - 1 });
+    t.jobBucket.failWrites.set(JOB, { code: 412, times: 1 });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(t.objects.live.size).toBe(10);
+    expect(log.warn.mock.calls.some(([m]) => m.includes('took it over'))).toBe(false);
+  });
+
+  it('does not count the object at the cursor again when it resumes', async () => {
+    const t = setup({ total: 0, current: 2000 });
+    await t.create();
+    t.jobBucket.putJson(JOB, {
+      ...t.job()!,
+      cursor: `${PREFIX}0000999.json`,
+      totals: { ...t.job()!.totals, listed: 1000, kept: 1000, runs: 1 },
+    });
+    const log = silentLog();
+    await t.cleanup('b', { log }).resume(NEW);
+
+    const finished = log.warn.mock.calls.map(([m]) => m).find((m) => m.includes('finished'));
+    expect(finished).toContain('deleted 0 objects of earlier builds (2000 listed, 2000 of this build kept');
   });
 });

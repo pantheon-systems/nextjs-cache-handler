@@ -35,9 +35,9 @@ export function resolveDeleteConcurrency(
 }
 
 /**
- * What a new build does to the route cache, from CACHE_BUILD_INVALIDATION:
- * `eager` (default) deletes it before serving; `off` leaves it, for emergencies
- * after it was emptied out-of-band.
+ * What a new build does to the earlier builds' route entries, from
+ * CACHE_BUILD_INVALIDATION: `eager` (default) deletes them in the background;
+ * `off` leaves them, for when the delete itself is the problem.
  */
 export type BuildInvalidationMode = 'eager' | 'off';
 
@@ -151,8 +151,8 @@ export interface DeletePrefixOptions {
   concurrency?: number;
   /** Delete only matching objects (e.g. static-route preservation). */
   shouldDelete?: (file: File) => boolean;
-  /** Start listing at this object name (inclusive), to resume an earlier run. */
-  startOffset?: string;
+  /** Start listing after this object name, to resume an earlier run from the last one it reached. */
+  startAfter?: string;
   /**
    * Delete an object only if it is still the version listed (its GCS
    * generation), so one rewritten after the listing is kept and counted as
@@ -231,7 +231,9 @@ export async function deletePrefix(
   };
 
   try {
-    for await (const files of listPrefixPages(bucket, prefix, opts.pageSize, opts.startOffset)) {
+    for await (const page of listPrefixPages(bucket, prefix, opts.pageSize, opts.startAfter)) {
+      // The listing includes its start name, which the earlier run already handled.
+      const files = opts.startAfter ? page.filter((file) => file.name !== opts.startAfter) : page;
       listed += files.length;
       const targets = opts.shouldDelete ? files.filter(opts.shouldDelete) : files;
       skipped += files.length - targets.length;

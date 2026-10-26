@@ -313,7 +313,7 @@ export class TagsBuffer {
     this.nextFlushTime = now + this.nextInterval();
 
     if (this.consecutiveFailures > 0) {
-      this.log.warn(`Tags mapping write recovered after ${this.consecutiveFailures} failed attempt(s)`);
+      this.log.warn(`Tags mapping flush recovered after ${this.consecutiveFailures} failed attempt(s)`);
       this.consecutiveFailures = 0;
     }
 
@@ -330,14 +330,16 @@ export class TagsBuffer {
     const pendingForMs = Date.now() - this.oldestPendingSince;
     if (pendingForMs > this.maxPendingAgeMs) {
       const dropped = this.pendingCount;
+      const failures = this.consecutiveFailures;
       this.pending = emptyBatch();
       this.droppedUpdatesTotal += dropped;
       this.consecutiveFailures = 0;
       this.oldestPendingSince = 0;
       this.nextFlushTime = Date.now() + this.nextInterval();
       this.log.error(
-        `Dropping ${dropped} pending tag update(s): writes have failed for ${Math.round(pendingForMs / 1000)}s ` +
-          `(last: ${reason}). Revalidating tags may not purge the CDN for the affected pages.`,
+        `Dropping pending tag updates for ${dropped} cache key(s): the oldest was queued ` +
+          `${Math.round(pendingForMs / 1000)}s ago and the flush failed again (${reason}, ` +
+          `${failures} failed attempt(s)). Revalidating tags may not purge the CDN for the affected pages.`,
         error
       );
       return;
@@ -348,14 +350,15 @@ export class TagsBuffer {
 
     if (this.consecutiveFailures === 1) {
       this.log.warn(
-        `Tags mapping write failed (${reason}); ${this.pendingCount} update(s) pending, retrying in ${delay}ms. ` +
+        `Tags mapping flush (read or write) failed (${reason}); updates for ${this.pendingCount} cache key(s) ` +
+          `pending, retrying in ${delay}ms. ` +
           `Repeated 429s mean more instances are writing than the flush interval absorbs ` +
           `(raise CACHE_TAGS_FLUSH_INTERVAL_MS).`,
         error
       );
     } else {
       this.log.debug(
-        `Tags mapping write failed again (${reason}, attempt ${this.consecutiveFailures}), retrying in ${delay}ms`
+        `Tags mapping flush failed again (${reason}, attempt ${this.consecutiveFailures}), retrying in ${delay}ms`
       );
     }
   }

@@ -228,7 +228,7 @@ flowchart TB
   t3 -- "re-purge, timer" --> dp
   dp --> keysPaths
   t2 -- "background" --> paths1
-  t4 -- "awaited before serving; retried in the background if it fails" --> nuke["nukeCache()"]
+  t4 -- "awaited before serving; retried by the background clean-up (up to 5 runs) if it fails" --> nuke["nukeCache()"]
   t5 -- "awaited before serving" --> nuke
   t6 -- "background" --> nuke
   t7 --> keysPaths

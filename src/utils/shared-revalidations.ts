@@ -131,8 +131,10 @@ export class SharedRevalidations {
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
+        // Retry callers pass no entries; name every tag still waiting.
         log.warn(
-          `Could not store revalidation of ${Object.keys(entries).join(', ')}; other instances may serve stale entries until it is stored`
+          `Could not store revalidation of ${[...this.unwritten.keys()].join(', ')}; it is retried on later cache ` +
+            `reads, and until it is stored other instances may serve stale entries`
         );
         return false;
       }
@@ -175,7 +177,8 @@ export class SharedRevalidations {
       this.noteSlowRefresh(pending, maxWaitMs);
       return false;
     }
-    if (this.slowRefreshes > 0) {
+    // A read that failed fast also resolves; recovery is logged once one succeeds.
+    if (this.slowRefreshes > 0 && !this.refreshFailing) {
       log.warn(
         `Reading revalidations from other instances recovered after ${this.slowRefreshes} slow read(s); ` +
           `${this.readsServedWithout} cache read(s) were served without them`
@@ -307,7 +310,11 @@ export class SharedRevalidations {
       }
     } catch (error) {
       if (!this.refreshFailing) {
-        log.warn('Error reading shared revalidations; revalidations from other instances are not applied:', error);
+        log.warn(
+          'Error reading shared revalidations; new revalidations from other instances are not applied until a ' +
+            'read succeeds:',
+          error
+        );
         this.refreshFailing = true;
       }
     }

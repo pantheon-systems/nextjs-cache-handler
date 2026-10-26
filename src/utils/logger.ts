@@ -1,7 +1,6 @@
 /**
- * Debug logger that only logs when CACHE_DEBUG environment variable is set.
- * This allows verbose logging during development/debugging without cluttering
- * production logs.
+ * Logger whose debug and info output appears only with CACHE_DEBUG=true or 1,
+ * so verbose logs stay out of production; warn and error always appear.
  */
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -17,13 +16,13 @@ function formatMessage(handlerName: string, message: string): string {
 
 /**
  * Creates a logger instance for a specific handler.
- * Debug and info logs are only shown when CACHE_DEBUG=true.
+ * Debug and info logs are only shown when CACHE_DEBUG is true or 1.
  * Warn and error logs are always shown.
  */
 export function createLogger(handlerName: string) {
   return {
     /**
-     * Debug level - only shown when CACHE_DEBUG=true
+     * Debug level - only shown when CACHE_DEBUG is true or 1
      * Use for verbose operational logs (GET, SET, HIT, MISS, etc.)
      */
     debug: (message: string, ...args: unknown[]) => {
@@ -33,7 +32,7 @@ export function createLogger(handlerName: string) {
     },
 
     /**
-     * Info level - only shown when CACHE_DEBUG=true
+     * Info level - only shown when CACHE_DEBUG is true or 1
      * Use for important operational events (initialization, cache cleared, etc.)
      */
     info: (message: string, ...args: unknown[]) => {

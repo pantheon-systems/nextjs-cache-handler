@@ -344,7 +344,7 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(mockBucket.getFiles).toHaveBeenCalledTimes(4); // one page, then three attempts at the next
       expect(logged(warn)).toContain(
         `[GcsCacheHandler] Route cache clean-up for build build-B stopped (listing ${routePrefix} failed after 3 ` +
-          `attempts (503: unavailable)); a later instance resumes it from ${routePrefix}0000999.json. Objects left ` +
+          `attempts (503: unavailable)); the next run resumes it after ${routePrefix}0000999.json. Objects left ` +
           `behind are not served. ${throttled}`
       );
       expect(JSON.parse(store[jobKey])).toMatchObject({
@@ -433,8 +433,8 @@ describe('GcsCacheHandler build invalidation', () => {
       await serve();
 
       expect(logged(warn)).toContain(
-        '[GcsCacheHandler] Route cache clean-up for build build-B stopped (503: Service unavailable); a later ' +
-          `instance prunes the tags map. Objects left behind are not served. ${throttled}`
+        '[GcsCacheHandler] Route cache clean-up for build build-B stopped (503: Service unavailable); the next ' +
+          `run prunes the tags map. Objects left behind are not served. ${throttled}`
       );
       expect(JSON.parse(store[jobKey])).toMatchObject({ keep: 'build-B', deleted: true });
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
@@ -454,13 +454,30 @@ describe('GcsCacheHandler build invalidation', () => {
 
       expect(logged(error)).toEqual([
         expect.stringMatching(
-          /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. It is retried in the background; until it succeeds, pages from the previous build stay in the CDN\.$/
+          /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. The background clean-up retries it \(up to 5 runs\); until then, pages from the previous build stay in the CDN\.$/
         ),
       ]);
       expect(fullPurges()).toHaveLength(2);
       expect(logged(warn)).toContain(
         '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
       );
+    });
+
+    it('says a failed CDN purge is not retried when the clean-up job cannot be recorded', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
+      store[jobKey] = JSON.stringify({ keep: 'build-A', deleteEntries: true, createdAt: 1, totals: {} });
+      failingReads.add(jobKey);
+
+      await serve();
+
+      // Then the background run cannot read the job either.
+      expect(logged(error)).toEqual([
+        expect.stringMatching(
+          /^\[GcsCacheHandler\] Could not record the route cache clean-up .+ until the next deploy\. Edge cache purge on build invalidation failed: .+\. It is not retried, so pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared\.$/
+        ),
+        '[GcsCacheHandler] Could not take the route cache clean-up job; the next check retries it:',
+      ]);
+      expect(fullPurges()).toHaveLength(1);
     });
 
     it('clamps CACHE_INVALIDATION_DELETE_CONCURRENCY to 200', async () => {

@@ -428,7 +428,7 @@ describe('TagsBuffer', () => {
       expect(buf.pendingCount).toBe(0);
       expect(buf.droppedUpdates).toBe(1);
       expect(console.error).toHaveBeenCalledTimes(1);
-      expect(vi.mocked(console.error).mock.calls[0][0]).toContain('Dropping 1 pending tag update(s)');
+      expect(vi.mocked(console.error).mock.calls[0][0]).toContain('Dropping pending tag updates for 1 cache key(s)');
 
       // A later flush starts fresh
       mockWrite.mockResolvedValue(undefined);

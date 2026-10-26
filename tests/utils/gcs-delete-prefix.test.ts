@@ -174,11 +174,11 @@ describe('deletePrefix', () => {
     expect(objects.deleted.size).toBe(30);
   });
 
-  it('resumes from startOffset without listing the names before it', async () => {
+  it('resumes after startAfter, without listing the names before it or counting it', async () => {
     const objects = pagedObjects(PREFIX, 2500);
     const r = await deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
       pageSize: 1000,
-      startOffset: `${PREFIX}0002000.json`,
+      startAfter: `${PREFIX}0001999.json`,
     });
 
     expect(r).toMatchObject({ listed: 500, deleted: 500 });

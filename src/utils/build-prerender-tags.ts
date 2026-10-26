@@ -54,7 +54,7 @@ function loadIndex(contextServerDistDir: string | undefined): Promise<BuildPrere
   let promise = cache.get(serverDistDir);
   if (!promise) {
     promise = readBuildPrerenderIndex(serverDistDir).catch((error) => {
-      log.warn('Could not read build prerender tags:', error);
+      log.warn('Could not read build prerender tags or build time:', error);
       return { tags: {}, builtAt: null };
     });
     cache.set(serverDistDir, promise);
@@ -72,8 +72,16 @@ async function readBuildPrerenderIndex(serverDistDir: string): Promise<BuildPrer
   let manifest: PrerenderManifest;
   try {
     manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf-8'));
-  } catch {
-    log.debug(`No prerender manifest at ${manifestPath}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(
+        `Could not read ${manifestPath}; build prerenders are not purged by tag, and revalidations are not ` +
+          `pruned at the next deploy:`,
+        error
+      );
+    } else {
+      log.debug(`No prerender manifest at ${manifestPath}`);
+    }
     return { tags: {}, builtAt: null };
   }
 

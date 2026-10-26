@@ -560,7 +560,7 @@ When debug logging is enabled, you'll see output like:
 [GcsCacheHandler] HIT: /api/posts (route)
 [GcsCacheHandler] SET: /api/users (fetch)
 [EdgeCacheClear] Cleared 3 paths in 45ms
-[GcsCacheHandler] Revalidated 5 entries for tags: posts, blog
+[GcsCacheHandler] Revalidated tags posts, blog; 5 cache keys affected
 ```
 
 ## Publishing
