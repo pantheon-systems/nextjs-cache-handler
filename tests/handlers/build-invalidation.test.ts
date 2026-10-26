@@ -434,7 +434,7 @@ describe('GcsCacheHandler build invalidation', () => {
 
       expect(logged(warn)).toContain(
         '[GcsCacheHandler] Route cache clean-up for build build-B stopped (503: Service unavailable); a later ' +
-          `instance resumes it from the start. Objects left behind are not served. ${throttled}`
+          `instance prunes the tags map. Objects left behind are not served. ${throttled}`
       );
       expect(JSON.parse(store[jobKey])).toMatchObject({ keep: 'build-B', deleted: true });
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');

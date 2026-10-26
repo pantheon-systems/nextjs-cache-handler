@@ -72,7 +72,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A page listing under `prefix` that still failed after its retries. */
 export class ListPrefixError extends Error {
   /** Progress made before the listing failed, set by deletePrefix. */
-  progress?: { listed: number; deleted: number; failed: number; failures: Record<string, number> };
+  progress?: Omit<DeletePrefixProgress, 'lastName'>;
 
   constructor(
     readonly prefix: string,
@@ -126,15 +126,20 @@ export async function* listPrefixPages(
   } while (pageToken);
 }
 
-/** Run `fn` over `items`, at most `concurrency` at once; results keep the order of `items`. */
+/**
+ * Run `fn` over `items`, at most `concurrency` at once; results keep the order
+ * of `items`. `afterBatch` runs after each batch and may throw to stop.
+ */
 export async function mapInBatches<T, R>(
   items: T[],
   concurrency: number,
-  fn: (item: T) => Promise<R>
+  fn: (item: T) => Promise<R>,
+  afterBatch?: () => Promise<void> | void
 ): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = [];
   for (let i = 0; i < items.length; i += concurrency) {
     results.push(...(await Promise.allSettled(items.slice(i, i + concurrency).map(fn))));
+    await afterBatch?.();
   }
   return results;
 }
@@ -154,15 +159,21 @@ export interface DeletePrefixOptions {
    * `changed`.
    */
   ifUnchanged?: boolean;
+  /** Called after each batch of up to `concurrency` deletes; may throw to stop. */
+  onBatch?: () => Promise<void> | void;
   /** Called after each page; may throw to stop. */
   onPage?: (progress: DeletePrefixProgress) => Promise<void> | void;
 }
 
+/** Counts so far, as in DeletePrefixResult. */
 export interface DeletePrefixProgress {
   listed: number;
   deleted: number;
+  skipped: number;
+  changed: number;
   failed: number;
-  /** Name of the last object listed so far; a later run can resume from it with `startOffset`. */
+  failures: Record<string, number>;
+  /** Name of the last object of the last finished page; a later run can resume from it with `startOffset`. */
   lastName?: string;
 }
 
@@ -222,12 +233,11 @@ export async function deletePrefix(
   try {
     for await (const files of listPrefixPages(bucket, prefix, opts.pageSize, opts.startOffset)) {
       listed += files.length;
-      lastName = files.at(-1)?.name ?? lastName;
       const targets = opts.shouldDelete ? files.filter(opts.shouldDelete) : files;
       skipped += files.length - targets.length;
 
       const retry: File[] = [];
-      (await mapInBatches(targets, concurrency, del)).forEach((result, i) => {
+      (await mapInBatches(targets, concurrency, del, opts.onBatch)).forEach((result, i) => {
         if (result.status === 'fulfilled' || isNotFound(result.reason)) {
           deleted++;
         } else if (opts.ifUnchanged && isPreconditionFailure(result.reason)) {
@@ -241,7 +251,7 @@ export async function deletePrefix(
 
       if (retry.length > 0) {
         await sleep(retryBaseDelayMs);
-        for (const result of await mapInBatches(retry, concurrency, del)) {
+        for (const result of await mapInBatches(retry, concurrency, del, opts.onBatch)) {
           if (result.status === 'fulfilled' || isNotFound(result.reason)) {
             deleted++;
           } else if (opts.ifUnchanged && isPreconditionFailure(result.reason)) {
@@ -252,11 +262,12 @@ export async function deletePrefix(
         }
       }
 
-      await opts.onPage?.({ listed, deleted, failed, lastName });
+      lastName = files.at(-1)?.name ?? lastName;
+      await opts.onPage?.({ listed, deleted, skipped, changed, failed, failures: { ...failures }, lastName });
     }
   } catch (error) {
     if (error instanceof ListPrefixError) {
-      error.progress = { listed, deleted, failed, failures };
+      error.progress = { listed, deleted, skipped, changed, failed, failures };
     }
     throw error;
   }

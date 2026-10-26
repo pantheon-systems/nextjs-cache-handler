@@ -45,7 +45,7 @@ import {
 import { isBuildPhase } from '../utils/build-detection.js';
 import { toObjectName } from '../utils/object-names.js';
 import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
-import { RouteCacheCleanup, createCleanupJob } from '../utils/route-cache-cleanup.js';
+import { RouteCacheCleanup, createCleanupJob, type CleanupTagsMap } from '../utils/route-cache-cleanup.js';
 import {
   DEFAULT_DELETE_CONCURRENCY,
   deletePrefix,
@@ -377,7 +377,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
         generationOf: routeObjectGeneration,
         concurrency: () => resolveDeleteConcurrency(),
         purge: edgeCacheClearer ? async () => (await edgeCacheClearer.nukeCache()).success : undefined,
-        pruneTagsMap: (keptNames) => this.pruneTagsMap(keptNames),
+        tagsMap: this.cleanupTagsMap(),
         failureHints: (labels) => deleteFailureHints(this.bucketName, labels),
         log: this.log,
       });
@@ -599,35 +599,36 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * Remove the tags map's route keys whose entries are gone: those whose
-   * object isn't one of `keptNames`, the current build's. Keys written for
-   * the current build are kept, even when instances of it started serving
-   * before the clean-up. A key whose entry is written after the clean-up
-   * listed the route cache, and whose tags reach the map before this flush,
-   * is removed; it comes back the next time that page is cached. Fetch keys
-   * stay: those entries survive deploys. Resolves to whether the update was
-   * stored.
+   * The tags map as the route cache clean-up prunes it: route keys (starting
+   * with `/`) by their object's name. Fetch keys are left out; those entries
+   * survive deploys. Removals go through the shared buffer, whose conditional
+   * writes merge with other instances.
    */
-  private async pruneTagsMap(keptNames: Set<string>): Promise<boolean> {
-    const location = `gs://${this.bucketName}/${this.tagsMapKey}`;
-    const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
-
-    // Route keys start with `/`; fetch keys are hashes.
-    const staleKeys = [...new Set(Object.values(mapping).flat())].filter(
-      (key) => key.startsWith('/') && !keptNames.has(this.getCacheKey(key, 'route'))
-    );
-    if (staleKeys.length === 0) {
-      return true;
-    }
-    this.tagsBuffer.deleteKeys(staleKeys);
-    await this.tagsBuffer.flush();
-    if (this.tagsBuffer.hasPending) {
-      // The buffer logged why; it keeps retrying in this process.
-      this.log.warn(`Removing ${staleKeys.length} route keys of earlier builds from ${location} is not stored yet`);
-      return false;
-    }
-    this.log.warn(`Removed ${staleKeys.length} route keys of earlier builds from ${location}`);
-    return true;
+  private cleanupTagsMap(): CleanupTagsMap {
+    const { tagsBuffer } = this;
+    return {
+      routeKeysByObject: async () => {
+        const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
+        const byObject = new Map<string, string[]>();
+        for (const key of new Set(Object.values(mapping).flat())) {
+          if (typeof key === 'string' && key.startsWith('/')) {
+            const name = this.getCacheKey(key, 'route');
+            byObject.set(name, [...(byObject.get(name) ?? []), key]);
+          }
+        }
+        return byObject;
+      },
+      remove: async (keys) => {
+        tagsBuffer.deleteKeys(keys);
+        await tagsBuffer.flushIfDue();
+      },
+      flush: async () => {
+        await tagsBuffer.flush();
+        // The buffer logged why; it keeps retrying in this process.
+        return !tagsBuffer.hasPending;
+      },
+      location: `gs://${this.bucketName}/${this.tagsMapKey}`,
+    };
   }
 
   // ============================================================================

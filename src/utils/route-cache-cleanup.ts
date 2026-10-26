@@ -7,7 +7,7 @@ import {
   errorLabel,
   errorMessage,
   listPrefixPages,
-  type DeletePrefixResult,
+  type DeletePrefixProgress,
 } from './gcs-delete-prefix.js';
 import { isNotFound, isPreconditionFailure, readJsonObject, writeJsonObject } from './gcs-json-object.js';
 import type { Logger } from './logger.js';
@@ -31,6 +31,8 @@ import type { Logger } from './logger.js';
 export const LOCK_TTL_MS = 60_000;
 /** How often the holder renews the lock and records its progress; the job object takes about one write per second. */
 export const RENEW_INTERVAL_MS = 15_000;
+/** Runs that retry a failed CDN purge before the job gives up on it. */
+export const MAX_PURGE_RUNS = 5;
 
 export interface CleanupTotals {
   listed: number;
@@ -52,16 +54,31 @@ export interface CleanupJob {
   createdAt: number;
   /** False under CACHE_BUILD_INVALIDATION=off: nothing is deleted, only the tags map is pruned. */
   deleteEntries: boolean;
-  /** The CDN purge for the new build failed and is still owed. */
+  /** The CDN purge for the new build failed and is still owed; `purgeRuns` counts the background retries. */
   purgePending?: boolean;
+  purgeRuns?: number;
   /** Lock holder, and when the lock lapses without renewal. */
   owner?: string;
   expiresAt?: number;
   /** Last object name processed; the next run lists from it. */
   cursor?: string;
-  /** All objects are deleted; only the tags map pruning is left. */
+  /** All objects are deleted. */
   deleted?: boolean;
+  /** The tags map is pruned. */
+  pruned?: boolean;
   totals: CleanupTotals;
+}
+
+/** The tags map, as the clean-up prunes it. */
+export interface CleanupTagsMap {
+  /** The map's route keys by the name of the object each is stored under. */
+  routeKeysByObject: () => Promise<Map<string, string[]>>;
+  /** Queue keys for removal; may write when the map's flush interval has passed. */
+  remove: (keys: string[]) => Promise<void>;
+  /** Write what is queued; resolves to whether everything was stored. */
+  flush: () => Promise<boolean>;
+  /** e.g. `gs://bucket/cache/tags/tags.json`, for logs. */
+  location: string;
 }
 
 export interface RouteCacheCleanupConfig {
@@ -77,12 +94,7 @@ export interface RouteCacheCleanupConfig {
   concurrency: () => number;
   /** Purge the whole CDN; resolves to whether it worked. */
   purge?: () => Promise<boolean>;
-  /**
-   * Remove the tags map's route keys whose entries are gone, given the names
-   * of the objects under `prefix` that belong to the kept generation.
-   * Resolves to whether the update was stored.
-   */
-  pruneTagsMap: (keptNames: Set<string>) => Promise<boolean>;
+  tagsMap: CleanupTagsMap;
   /** What an operator can do about failed deletes, from their error labels. */
   failureHints?: (labels: string[]) => string[];
   log: Logger;
@@ -92,7 +104,7 @@ export interface RouteCacheCleanupConfig {
   pageSize?: number;
 }
 
-/** The job object was replaced (another instance took over, or a newer build created its own job). */
+/** The job object was replaced (another instance took over, or a newer build created its own job) or removed. */
 class LostJobError extends Error {
   constructor() {
     super('the clean-up job was taken over or replaced');
@@ -113,17 +125,39 @@ const emptyTotals = (): CleanupTotals => ({
   durationMs: 0,
 });
 
-function addFailures(into: Record<string, number>, from: Record<string, number>): void {
-  for (const [label, count] of Object.entries(from)) {
-    into[label] = (into[label] ?? 0) + count;
+const emptyProgress = (): Omit<DeletePrefixProgress, 'lastName'> => ({
+  listed: 0,
+  deleted: 0,
+  skipped: 0,
+  changed: 0,
+  failed: 0,
+  failures: {},
+});
+
+/** `base` plus one run's progress and duration. */
+function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>, durationMs: number): CleanupTotals {
+  const failures = { ...base.failures };
+  for (const [label, count] of Object.entries(run.failures)) {
+    failures[label] = (failures[label] ?? 0) + count;
   }
+  return {
+    listed: base.listed + run.listed,
+    deleted: base.deleted + run.deleted,
+    kept: base.kept + run.skipped,
+    changed: base.changed + run.changed,
+    failed: base.failed + run.failed,
+    failures,
+    runs: base.runs,
+    durationMs: base.durationMs + durationMs,
+  };
 }
 
 /**
  * Record that `keep`'s clean-up is pending, replacing a job for another build
  * (which also deletes everything not of `keep`, so its progress does not
- * carry over). Leaves a job for `keep` as it is: another instance created it.
- * Throws when the job can't be read or written.
+ * carry over). A job for `keep` already exists when another instance created
+ * it; it is left as it is, except that a failed purge is noted on it. Throws
+ * when the job can't be read or written.
  */
 export async function createCleanupJob(
   jobBucket: Bucket,
@@ -133,19 +167,22 @@ export async function createCleanupJob(
 ): Promise<'created' | 'exists'> {
   for (let attempt = 1; ; attempt++) {
     const { value, generation } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
-    if (value?.keep === keep) {
+    const exists = value?.keep === keep;
+    if (exists && (!opts.purgePending || value.purgePending)) {
       return 'exists';
     }
-    const job: CleanupJob = {
-      keep,
-      createdAt: opts.now ?? Date.now(),
-      deleteEntries: opts.deleteEntries,
-      ...(opts.purgePending ? { purgePending: true } : {}),
-      totals: emptyTotals(),
-    };
+    const job: CleanupJob = exists
+      ? { ...value, purgePending: true }
+      : {
+          keep,
+          createdAt: opts.now ?? Date.now(),
+          deleteEntries: opts.deleteEntries,
+          ...(opts.purgePending ? { purgePending: true } : {}),
+          totals: emptyTotals(),
+        };
     try {
       await writeJsonObject(jobBucket, jobKey, job, generation);
-      return 'created';
+      return exists ? 'exists' : 'created';
     } catch (error) {
       // Another instance wrote it first: read it again.
       if (!isPreconditionFailure(error) || attempt >= 3) {
@@ -209,9 +246,15 @@ export class RouteCacheCleanup {
         ` (run ${job.totals.runs})`
     );
 
+    // Totals from earlier runs, fixed for this run; every write records them plus this run's progress.
+    const base = job.totals;
+    let progress = emptyProgress();
+    let cursor = job.cursor;
+    const totals = () => addRun(base, progress, this.now() - started);
+
     // Write the job at the generation we hold, then learn the new one; a 412 means we lost it.
-    const save = async (update: Partial<CleanupJob>) => {
-      job = { ...job, ...update };
+    const renew = async (update: Partial<CleanupJob> = {}) => {
+      job = { ...job, ...update, cursor, totals: totals(), expiresAt: this.now() + LOCK_TTL_MS };
       try {
         await writeJsonObject(jobBucket, jobKey, job, generation);
       } catch (error) {
@@ -227,96 +270,108 @@ export class RouteCacheCleanup {
       generation = reread.generation;
       lastRenew = this.now();
     };
-    const renew = (update: Partial<CleanupJob> = {}) => save({ ...update, expiresAt: this.now() + LOCK_TTL_MS });
-    // Give up the lock, keeping the progress, so a later instance resumes without waiting for it to expire.
-    const release = (update: Partial<CleanupJob>) =>
-      writeJsonObject(jobBucket, jobKey, { ...job, ...update, owner: undefined, expiresAt: 0 }, generation);
-
-    // Fails fast once someone else changed the job; renews when due.
-    const check = async (update: Partial<CleanupJob> = {}) => {
+    // Mid-page renewals record the previous page's cursor, so the page's end records its own.
+    let renewedInPage = false;
+    const renewIfDue = async () => {
       if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
-        await renew(update);
+        await renew();
+        renewedInPage = true;
+      }
+    };
+    // Give up the lock, keeping the progress, so a later instance resumes without waiting for it to expire.
+    const release = (update: Partial<CleanupJob> = {}) =>
+      writeJsonObject(
+        jobBucket,
+        jobKey,
+        { ...job, ...update, cursor, totals: totals(), owner: undefined, expiresAt: 0 },
+        generation
+      );
+
+    // Fails fast once someone else changed or removed the job; renews when due.
+    const check = async () => {
+      if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
+        await renew();
         return;
       }
-      const [metadata] = await jobBucket.file(jobKey).getMetadata();
+      let metadata;
+      try {
+        [metadata] = await jobBucket.file(jobKey).getMetadata();
+      } catch (error) {
+        if (isNotFound(error)) {
+          throw new LostJobError();
+        }
+        throw error;
+      }
       if (String(metadata.generation) !== String(generation)) {
         throw new LostJobError();
       }
     };
 
-    // Run totals are added to job.totals once, when the run ends.
-    let run: DeletePrefixResult | null = null;
-    let deletedThisRun = 0;
-    // Saved at each renewal, and when the lock is released.
-    let cursor = job.cursor;
-    const withRun = (): CleanupTotals => {
-      const totals = { ...job.totals, failures: { ...job.totals.failures } };
-      totals.durationMs += this.now() - started;
-      if (run) {
-        totals.listed += run.listed;
-        totals.deleted += run.deleted;
-        totals.kept += run.skipped;
-        totals.changed += run.changed;
-        totals.failed += run.failed;
-        addFailures(totals.failures, run.failures);
-      }
-      return totals;
-    };
-
     try {
       if (job.purgePending && this.config.purge) {
+        const purgeRuns = (job.purgeRuns ?? 0) + 1;
         if (await this.config.purge()) {
           log.warn(`CDN purge for build ${keep}, which failed when the build was recorded, has now been sent`);
-          await renew({ purgePending: false });
+          await renew({ purgePending: false, purgeRuns });
+        } else if (purgeRuns >= MAX_PURGE_RUNS) {
+          log.error(
+            `CDN purge for build ${keep} failed again (${purgeRuns} background attempts); giving up. Pages from ` +
+              `the previous build stay in the CDN until they expire or the site's edge cache is cleared.`
+          );
+          await renew({ purgePending: false, purgeRuns });
+        } else {
+          await renew({ purgeRuns });
         }
       }
 
       if (job.deleteEntries && !job.deleted) {
         try {
-          run = await deletePrefix(this.config.bucket, this.config.prefix, {
+          const result = await deletePrefix(this.config.bucket, this.config.prefix, {
             concurrency: this.config.concurrency(),
             pageSize: this.config.pageSize,
-            startOffset: job.cursor,
+            startOffset: cursor,
             ifUnchanged: true,
             shouldDelete: (file) => this.config.generationOf(file) !== keep,
-            onPage: async (p) => {
-              deletedThisRun = p.deleted;
-              cursor = p.lastName;
-              await check({ cursor });
+            // A page can take longer than the lock lasts (throttling, low concurrency).
+            onBatch: renewIfDue,
+            onPage: async ({ lastName, ...counts }) => {
+              progress = counts;
+              cursor = lastName;
+              if (renewedInPage) {
+                renewedInPage = false;
+                await renew();
+              } else {
+                await check();
+              }
             },
           });
+          progress = result;
         } catch (error) {
           if (error instanceof ListPrefixError && error.progress) {
-            run = { ...error.progress, skipped: 0, changed: 0, durationMs: 0 };
+            progress = error.progress;
           }
           throw error;
         }
-        const totals = withRun();
-        run = null;
-        await renew({ deleted: true, cursor: undefined, totals });
+        cursor = undefined;
+        await renew({ deleted: true });
       }
 
-      // After the delete, so what is left under the prefix is the kept build's.
-      await check();
-      const keptNames = new Set<string>();
-      for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
-        for (const file of files) {
-          if (this.config.generationOf(file) === keep) {
-            keptNames.add(file.name);
-          }
-        }
-        await check();
+      if (!job.pruned) {
+        await this.pruneTagsMap(keep, check);
+        await renew({ pruned: true });
       }
-      await renew();
-      const pruned = await this.config.pruneTagsMap(keptNames);
-      if (!pruned) {
-        // A later run prunes again, without deleting again.
-        await release({ totals: withRun() });
-        log.warn(`Route cache clean-up for build ${keep}: pruning the tags map failed; a later instance retries it`);
+
+      if (job.purgePending) {
+        // Everything else is done; a later run retries the purge.
+        await release();
+        log.warn(
+          `Route cache clean-up for build ${keep}: entries deleted and tags map pruned; the CDN purge is ` +
+            `retried by a later instance`
+        );
         return;
       }
 
-      const totals = withRun();
+      const final = totals();
       await jobBucket
         .file(jobKey)
         .delete({ ifGenerationMatch: generation } as DeleteFileOptions)
@@ -328,25 +383,28 @@ export class RouteCacheCleanup {
             throw error;
           }
         });
-      this.report(keep, totals);
+      this.report(keep, final);
     } catch (error) {
       if (error instanceof LostJobError) {
         log.warn(
           `Route cache clean-up for build ${keep} stopped: ${error.message} (${location}); ` +
-            `this run deleted ${run?.deleted ?? deletedThisRun} objects`
+            `this run deleted ${progress.deleted} objects`
         );
         return;
       }
       const reason = error instanceof ListPrefixError ? error.message : `${errorLabel(error)}: ${errorMessage(error)}`;
       try {
-        await release({ cursor, totals: withRun() });
+        await release();
       } catch {
         // The lock expires on its own.
       }
       const labels = [errorLabel(error instanceof ListPrefixError ? error.reason : error)];
+      const next =
+        job.deleted || !job.deleteEntries
+          ? 'a later instance prunes the tags map'
+          : `a later instance resumes it from ${cursor ?? 'the start'}`;
       const text = [
-        `Route cache clean-up for build ${keep} stopped (${reason}); a later instance resumes it from ` +
-          `${cursor ?? 'the start'}. Objects left behind are not served.`,
+        `Route cache clean-up for build ${keep} stopped (${reason}); ${next}. Objects left behind are not served.`,
         ...(this.config.failureHints?.(labels) ?? []),
       ].join(' ');
       // A permission problem stops every run the same way, so the bucket only grows until someone fixes it.
@@ -358,11 +416,63 @@ export class RouteCacheCleanup {
     }
   }
 
+  /**
+   * Remove the tags map's route keys whose entries are not `keep`'s. Each key
+   * is decided when the listing page covering its object's name arrives, and
+   * removals are written as the map's flush interval allows, so a key whose
+   * entry the new build writes after its page was listed is removed only if
+   * that write lands within about one flush interval. Keys added to the map
+   * after it was read here are never removed.
+   */
+  private async pruneTagsMap(keep: string, check: () => Promise<void>): Promise<void> {
+    const { tagsMap } = this.config;
+    const keysByObject = await tagsMap.routeKeysByObject();
+    // Listings return names in this order (they are ASCII).
+    const names = [...keysByObject.keys()].sort();
+    let next = 0;
+    let removed = 0;
+    const removeUpTo = async (lastListed: string | undefined, kept: Set<string>) => {
+      const stale: string[] = [];
+      while (next < names.length && (lastListed === undefined || names[next] <= lastListed)) {
+        if (!kept.has(names[next])) {
+          stale.push(...keysByObject.get(names[next])!);
+        }
+        next++;
+      }
+      removed += stale.length;
+      await tagsMap.remove(stale);
+    };
+
+    for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
+      const kept = new Set(files.filter((file) => this.config.generationOf(file) === keep).map((file) => file.name));
+      if (files.length > 0) {
+        await removeUpTo(files.at(-1)!.name, kept);
+      }
+      await check();
+    }
+    // Names after the last listed one have no object at all.
+    await removeUpTo(undefined, new Set());
+    if (!(await tagsMap.flush())) {
+      throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
+    }
+    if (removed > 0) {
+      this.config.log.warn(`Removed ${removed} route keys of earlier builds from ${tagsMap.location}`);
+    }
+  }
+
   /** Take the lock on `keep`'s job, or null when there is none, it is another build's, or it is held. */
   private async acquire(keep: string): Promise<{ job: CleanupJob; generation: string | number } | null> {
     const { jobBucket, jobKey, log } = this.config;
     const { value, generation } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
     if (!value) {
+      if (String(generation) !== '0') {
+        // Not valid JSON: nothing can resume it, so remove it; the next deploy deletes what it left.
+        log.warn(`Route cache clean-up job ${jobKey} is not valid JSON; removing it`);
+        await jobBucket
+          .file(jobKey)
+          .delete({ ifGenerationMatch: generation } as DeleteFileOptions)
+          .catch(() => {});
+      }
       return null;
     }
     if (value.keep !== keep) {

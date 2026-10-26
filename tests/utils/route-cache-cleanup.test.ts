@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import type { Bucket, File } from '@google-cloud/storage';
 import {
   LOCK_TTL_MS,
+  MAX_PURGE_RUNS,
   RENEW_INTERVAL_MS,
   RouteCacheCleanup,
   createCleanupJob,
@@ -31,11 +32,17 @@ function setup(opts: { total?: number; current?: number; pageSize?: number } = {
   });
   const jobBucket = new FakeBucket();
   let clock = 1_000_000;
-  const pruned: Array<Set<string>> = [];
-  const pruneTagsMap = vi.fn(async (keptNames: Set<string>) => {
-    pruned.push(keptNames);
-    return true;
-  });
+  // The tags map holds one key per object, named after it.
+  const tagKeys = new Set(objects.live);
+  const removed = new Set<string>();
+  const tagsMap = {
+    routeKeysByObject: vi.fn(async () => new Map([...tagKeys].map((name): [string, string[]] => [name, [name]]))),
+    remove: vi.fn(async (keys: string[]) => {
+      for (const key of keys) removed.add(key);
+    }),
+    flush: vi.fn(async () => true),
+    location: 'gs://test-bucket/tags.json',
+  };
   const purge = vi.fn(async () => true);
   const bucket = { name: 'test-bucket', getFiles: objects.getFiles } as unknown as Bucket;
 
@@ -48,7 +55,7 @@ function setup(opts: { total?: number; current?: number; pageSize?: number } = {
       generationOf: (file: File) => (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation,
       concurrency: () => 50,
       purge,
-      pruneTagsMap,
+      tagsMap,
       log: silentLog(),
       now: () => clock,
       owner,
@@ -60,8 +67,10 @@ function setup(opts: { total?: number; current?: number; pageSize?: number } = {
     objects,
     jobBucket,
     cleanup,
-    pruned,
-    pruneTagsMap,
+    tagKeys,
+    tagsMap,
+    /** Tag keys left after pruning. */
+    remainingTagKeys: () => new Set([...tagKeys].filter((key) => !removed.has(key))),
     purge,
     job: () => jobBucket.json(JOB) as CleanupJob | undefined,
     advance: (ms: number) => {
@@ -84,9 +93,16 @@ describe('createCleanupJob', () => {
     const t = setup();
     expect(await t.create()).toBe('created');
     const generation = t.jobBucket.objects.get(JOB)!.generation;
-    expect(await t.create({ purgePending: true })).toBe('exists');
+    expect(await t.create()).toBe('exists');
     expect(t.jobBucket.objects.get(JOB)!.generation).toBe(generation);
     expect(t.job()).toMatchObject({ keep: NEW, deleteEntries: true, totals: { runs: 0 } });
+  });
+
+  it("notes another instance's failed purge on the existing job", async () => {
+    const t = setup();
+    await t.create();
+    expect(await t.create({ purgePending: true })).toBe('exists');
+    expect(t.job()).toMatchObject({ keep: NEW, purgePending: true });
   });
 
   it("replaces another build's job, dropping its progress", async () => {
@@ -113,8 +129,7 @@ describe('RouteCacheCleanup', () => {
 
     expect(t.objects.live.size).toBe(300);
     expect([...t.objects.live].every((name) => name >= `${PREFIX}0002500.json`)).toBe(true);
-    expect(t.pruned).toHaveLength(1);
-    expect(t.pruned[0]).toEqual(t.objects.live);
+    expect(t.remainingTagKeys()).toEqual(t.objects.live);
     expect(t.job()).toBeUndefined();
   });
 
@@ -137,7 +152,7 @@ describe('RouteCacheCleanup', () => {
     t.jobBucket.putJson(JOB, { keep: 'build-C', deleteEntries: true, createdAt: 0, totals: {} });
     await t.cleanup('b').resume(NEW);
     expect(t.objects.live.size).toBe(10);
-    expect(t.pruneTagsMap).not.toHaveBeenCalled();
+    expect(t.tagsMap.routeKeysByObject).not.toHaveBeenCalled();
   });
 
   describe('lock', () => {
@@ -149,7 +164,7 @@ describe('RouteCacheCleanup', () => {
       expect(t.objects.live.size).toBe(0);
       // Each object was deleted by one instance, once.
       expect(Math.max(...t.objects.deleteAttempts.values())).toBe(1);
-      expect(t.pruneTagsMap).toHaveBeenCalledTimes(1);
+      expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
     });
 
     it('skips a job whose lock is held and not expired', async () => {
@@ -230,7 +245,7 @@ describe('RouteCacheCleanup', () => {
 
       expect(t.objects.live.size).toBe(3000); // pages 1 and 2 only
       expect(t.job()!.owner).toBe('b');
-      expect(t.pruneTagsMap).not.toHaveBeenCalled();
+      expect(t.tagsMap.routeKeysByObject).not.toHaveBeenCalled();
       expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
     });
 
@@ -269,7 +284,7 @@ describe('RouteCacheCleanup', () => {
     await t.cleanup('a').resume(NEW);
 
     expect([...t.objects.live]).toEqual([rewritten]);
-    expect(t.pruned[0]).toEqual(new Set([rewritten]));
+    expect(t.remainingTagKeys()).toEqual(new Set([rewritten]));
   });
 
   it('releases the lock with its progress when a listing keeps failing, and a later run resumes', async () => {
@@ -296,12 +311,14 @@ describe('RouteCacheCleanup', () => {
   it('keeps the job when pruning the tags map fails, and a later run prunes without deleting again', async () => {
     const t = setup({ total: 100 });
     await t.create();
-    t.pruneTagsMap.mockResolvedValueOnce(false);
+    t.tagsMap.flush.mockResolvedValueOnce(false);
     const log = silentLog();
     await t.cleanup('a', { log }).resume(NEW);
 
     expect(log.warn.mock.calls.map(([m]) => m)).toContain(
-      `Route cache clean-up for build ${NEW}: pruning the tags map failed; a later instance retries it`
+      `Route cache clean-up for build ${NEW} stopped (error: removing 100 route keys from ` +
+        `gs://test-bucket/tags.json is not stored yet); a later instance prunes the tags map. Objects left ` +
+        `behind are not served.`
     );
     expect(t.objects.live.size).toBe(0);
     expect(t.job()).toMatchObject({ deleted: true, totals: { deleted: 100 } });
@@ -309,7 +326,7 @@ describe('RouteCacheCleanup', () => {
 
     const calls = t.objects.getFiles.mock.calls.length;
     await t.cleanup('b').resume(NEW);
-    expect(t.pruneTagsMap).toHaveBeenCalledTimes(2);
+    expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(2);
     expect(t.objects.getFiles.mock.calls.length).toBe(calls + 1); // the pruning listing only
     expect(t.job()).toBeUndefined();
   });
@@ -320,21 +337,44 @@ describe('RouteCacheCleanup', () => {
     await t.cleanup('a').resume(NEW);
 
     expect(t.objects.live.size).toBe(103);
-    expect(t.pruned[0].size).toBe(3);
+    expect(t.remainingTagKeys().size).toBe(3);
     expect(t.job()).toBeUndefined();
   });
 
-  it('retries a CDN purge that failed when the build was recorded', async () => {
+  it('keeps the job while the CDN purge still fails, and a later run sends it without deleting or pruning again', async () => {
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
     t.purge.mockResolvedValueOnce(false);
-    t.pruneTagsMap.mockResolvedValueOnce(false); // keep the job for a second run
     await t.cleanup('a').resume(NEW);
-    expect(t.job()!.purgePending).toBe(true);
+    expect(t.objects.live.size).toBe(0);
+    expect(t.job()).toMatchObject({ purgePending: true, deleted: true, pruned: true, purgeRuns: 1 });
+    expect(t.job()!.owner).toBeUndefined();
 
-    await t.cleanup('b').resume(NEW);
+    const listings = t.objects.getFiles.mock.calls.length;
+    const log = silentLog();
+    await t.cleanup('b', { log }).resume(NEW);
     expect(t.purge).toHaveBeenCalledTimes(2);
+    expect(t.objects.getFiles.mock.calls.length).toBe(listings);
+    expect(t.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
     expect(t.job()).toBeUndefined();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('has now been sent'));
+  });
+
+  it(`gives up on a CDN purge that fails ${MAX_PURGE_RUNS} times, with an error`, async () => {
+    const t = setup({ total: 10 });
+    await t.create({ purgePending: true });
+    t.purge.mockResolvedValue(false);
+    const log = silentLog();
+    for (let run = 1; run <= MAX_PURGE_RUNS; run++) {
+      await t.cleanup(`run-${run}`, { log }).resume(NEW);
+    }
+
+    expect(t.purge).toHaveBeenCalledTimes(MAX_PURGE_RUNS);
+    expect(t.job()).toBeUndefined();
+    expect(log.error.mock.calls.map(([m]) => m)).toEqual([
+      `CDN purge for build ${NEW} failed again (${MAX_PURGE_RUNS} background attempts); giving up. Pages from ` +
+        `the previous build stay in the CDN until they expire or the site's edge cache is cleared.`,
+    ]);
   });
 
   it('checks again only once the lock lifetime has passed, unless forced', async () => {
@@ -358,8 +398,156 @@ describe('RouteCacheCleanup', () => {
     const t = setup({ total: 10 });
     await t.create();
     const log = silentLog();
-    t.pruneTagsMap.mockRejectedValueOnce(new Error('boom'));
+    t.tagsMap.routeKeysByObject.mockRejectedValueOnce(new Error('boom'));
     await expect(t.cleanup('a', { log }).resume(NEW)).resolves.toBeUndefined();
     expect(log.warn.mock.calls.some(([m]) => /stopped \(error: boom\)/.test(m))).toBe(true);
+  });
+
+  describe('totals', () => {
+    it('records them at each renewal, so a run that is killed keeps its counts', async () => {
+      const t = setup({ total: 5000 });
+      await t.create();
+      const getFiles = t.objects.getFiles.getMockImplementation()!;
+      let listings = 0;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        t.advance(RENEW_INTERVAL_MS);
+        // The fourth listing never returns: the process is killed.
+        return ++listings === 4 ? new Promise(() => {}) : getFiles(query);
+      });
+      void t.cleanup('dead').resume(NEW);
+      await vi.waitFor(() => expect(t.job()!.totals.deleted).toBe(3000));
+
+      t.objects.getFiles.mockImplementation(getFiles);
+      t.advance(LOCK_TTL_MS);
+      const log = silentLog();
+      await t.cleanup('b', { log }).resume(NEW);
+      const finished = log.warn.mock.calls.map(([m]) => m).find((m) => m.includes('finished'));
+      expect(finished).toMatch(/deleted 5000 objects of earlier builds \(5000 listed/);
+      expect(finished).toMatch(/over 2 runs$/);
+    });
+
+    it('keeps the counts of a run that stops on a failed renewal', async () => {
+      const t = setup({ total: 3000 });
+      await t.create();
+      const getFiles = t.objects.getFiles.getMockImplementation()!;
+      let listings = 0;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        t.advance(RENEW_INTERVAL_MS);
+        // The renewal during the second page fails once.
+        if (++listings === 2) t.jobBucket.failWrites.set(JOB, { code: 503, times: 1 });
+        return getFiles(query);
+      });
+      const log = silentLog();
+      await t.cleanup('a', { log }).resume(NEW);
+
+      expect(t.job()).toMatchObject({ cursor: `${PREFIX}0000999.json`, totals: { deleted: 1000, listed: 1000 } });
+      expect(t.job()!.owner).toBeUndefined();
+      expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
+        expect.stringContaining(`a later instance resumes it from ${PREFIX}0000999.json`)
+      );
+    });
+
+    it('counts the time once', async () => {
+      const t = setup({ total: 2500 });
+      await t.create();
+      const getFiles = t.objects.getFiles.getMockImplementation()!;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        t.advance(1000);
+        return getFiles(query);
+      });
+      const log = silentLog();
+      await t.cleanup('a', { log }).resume(NEW);
+
+      const listings = t.objects.getFiles.mock.calls.length; // 3 to delete, 1 to prune
+      const finished = log.warn.mock.calls.map(([m]) => m).find((m) => m.includes('finished'));
+      expect(finished).toContain(`in ${listings * 1000}ms over 1 run`);
+    });
+  });
+
+  it('keeps the lock through a page that takes longer than the lock lasts', async () => {
+    const t = setup({ total: 1000 });
+    await t.create();
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    const lapsed: number[] = [];
+    t.objects.getFiles.mockImplementation(async (query) => {
+      const [files, ...rest] = await getFiles(query);
+      // Each delete takes a second (throttling), so the page takes 100 s at concurrency 10.
+      const slow = files.map((file: any) => ({
+        ...file,
+        delete: async (options?: unknown) => {
+          t.advance(1000);
+          const job = t.job();
+          if (job && job.expiresAt! <= t.clock) lapsed.push(t.clock);
+          return file.delete(options);
+        },
+      }));
+      return [slow, ...rest];
+    });
+    await t.cleanup('a', { concurrency: () => 10 }).resume(NEW);
+
+    expect(t.objects.live.size).toBe(0);
+    expect(lapsed).toEqual([]);
+    expect(t.job()).toBeUndefined();
+  });
+
+  it('stops quietly when another instance finished the job and removed it', async () => {
+    const t = setup({ total: 3000 });
+    await t.create();
+    const getFiles = t.objects.getFiles.getMockImplementation()!;
+    let listings = 0;
+    t.objects.getFiles.mockImplementation(async (query) => {
+      if (++listings === 2) t.jobBucket.objects.delete(JOB);
+      return getFiles(query);
+    });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(t.job()).toBeUndefined();
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
+      expect.stringContaining('stopped: the clean-up job was taken over or replaced')
+    );
+  });
+
+  it('removes a job object that is not valid JSON', async () => {
+    const t = setup({ total: 10 });
+    t.jobBucket.objects.set(JOB, { data: 'not json', generation: 99 });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(t.jobBucket.objects.has(JOB)).toBe(false);
+    expect(t.objects.live.size).toBe(10);
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('is not valid JSON'));
+  });
+
+  describe('tags map pruning', () => {
+    it('removes keys page by page, as the listing covers their objects', async () => {
+      const t = setup({ total: 0, current: 2500 });
+      await t.create({ deleteEntries: false });
+      // Keys for objects that are gone, between and after the listed ones.
+      t.tagKeys.add(`${PREFIX}0000500x.json`);
+      t.tagKeys.add(`${PREFIX}0002000x.json`);
+      t.tagKeys.add(`${PREFIX}zzz.json`);
+      await t.cleanup('a').resume(NEW);
+
+      const calls = t.tagsMap.remove.mock.calls.map(([keys]) => keys);
+      expect(calls).toEqual([[`${PREFIX}0000500x.json`], [], [`${PREFIX}0002000x.json`], [`${PREFIX}zzz.json`]]);
+      expect(t.tagsMap.flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a key whose object the new build writes before its page is listed', async () => {
+      const t = setup({ total: 2500 });
+      await t.create();
+      const late = `${PREFIX}0002100.json`; // on the third page
+      const getFiles = t.objects.getFiles.getMockImplementation()!;
+      let listings = 0;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        // The deletes take three listings; the pruning listing's first page is the fourth.
+        if (++listings === 4) t.objects.rewrite(late, { generation: NEW });
+        return getFiles(query);
+      });
+      await t.cleanup('a').resume(NEW);
+
+      expect(t.remainingTagKeys()).toEqual(new Set([late]));
+    });
   });
 });

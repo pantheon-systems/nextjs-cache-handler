@@ -151,11 +151,27 @@ describe('deletePrefix', () => {
       onPage: (p) => progress.push(p),
     });
 
+    const counts = { skipped: 0, changed: 0, failed: 0, failures: {} };
     expect(progress).toEqual([
-      { listed: 1000, deleted: 1000, failed: 0, lastName: `${PREFIX}0000999.json` },
-      { listed: 2000, deleted: 2000, failed: 0, lastName: `${PREFIX}0001999.json` },
-      { listed: 2500, deleted: 2500, failed: 0, lastName: `${PREFIX}0002499.json` },
+      { listed: 1000, deleted: 1000, ...counts, lastName: `${PREFIX}0000999.json` },
+      { listed: 2000, deleted: 2000, ...counts, lastName: `${PREFIX}0001999.json` },
+      { listed: 2500, deleted: 2500, ...counts, lastName: `${PREFIX}0002499.json` },
     ]);
+  });
+
+  it('calls onBatch after each batch of deletes, and stops when it throws', async () => {
+    const objects = pagedObjects(PREFIX, 100);
+    let batches = 0;
+    const stop = new Error('stop');
+    await expect(
+      deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
+        concurrency: 10,
+        onBatch: () => {
+          if (++batches === 3) throw stop;
+        },
+      })
+    ).rejects.toBe(stop);
+    expect(objects.deleted.size).toBe(30);
   });
 
   it('resumes from startOffset without listing the names before it', async () => {
