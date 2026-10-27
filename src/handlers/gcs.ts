@@ -557,7 +557,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
    * entries are misses already (see readCacheEntry), so requests don't wait
    * for it. Never throws.
    */
-  protected async invalidateRouteCache(): Promise<void> {
+  protected async invalidateRouteCache(previous: BuildMeta): Promise<void> {
     const location = `gs://${this.bucketName}/${this.routeCachePrefix}`;
     const deleteEntries = resolveBuildInvalidationMode() !== 'off';
     if (!deleteEntries) {
@@ -582,6 +582,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       await createCleanupJob(this.tagsBucket, this.cleanupJobKey, getProcessGeneration(), {
         deleteEntries,
         purgePending: !purge.success,
+        replacedBuildAt: previous.timestamp,
       });
     } catch (error) {
       this.log.error(

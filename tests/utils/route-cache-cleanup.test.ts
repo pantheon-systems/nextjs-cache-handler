@@ -118,6 +118,36 @@ describe('createCleanupJob', () => {
     expect(t.job()!.cursor).toBeUndefined();
   });
 
+  it('replaces a job for the same build created before the build it replaces was recorded', async () => {
+    // Build NEW deployed, rolled back to a build that ignores the job (0.13), then NEW deployed again.
+    const t = setup();
+    t.jobBucket.putJson(JOB, {
+      keep: NEW,
+      createdAt: 100,
+      deleteEntries: true,
+      cursor: `${PREFIX}0001999.json`,
+      deleted: true,
+      pruned: true,
+      totals: { runs: 2 },
+    });
+    const create = (replacedBuildAt: number) =>
+      createCleanupJob(t.jobBucket as unknown as Bucket, JOB, NEW, {
+        deleteEntries: true,
+        purgePending: false,
+        replacedBuildAt,
+        now: t.clock,
+      });
+
+    expect(await create(200)).toBe('created');
+    expect(t.job()).toMatchObject({ keep: NEW, createdAt: t.clock, totals: { runs: 0 } });
+    expect(t.job()).not.toHaveProperty('cursor');
+    expect(t.job()).not.toHaveProperty('deleted');
+    expect(t.job()).not.toHaveProperty('pruned');
+
+    // Another instance of the same deploy: the job was created after the replaced build was recorded.
+    expect(await create(200)).toBe('exists');
+  });
+
   it('two instances creating at once end with one job', async () => {
     const t = setup();
     const results = await Promise.all([t.create(), t.create()]);

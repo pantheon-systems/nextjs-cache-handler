@@ -198,20 +198,22 @@ function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>
  * it; it is left as it is, except that a failed purge is noted on it, with
  * a fresh set of retries. The first retry waits PURGE_RETRY_DELAY_MS: the
  * purge just failed, most likely because the CDN API is down, and a retry
- * sent at once would fail for the same reason. Throws when the job can't be
- * read or written.
+ * sent at once would fail for the same reason. A job for `keep` created
+ * before the replaced build was recorded (`replacedBuildAt`) is from an
+ * earlier deploy of `keep`, left by a rollback to a version that ignores the
+ * job, so it is replaced. Throws when the job can't be read or written.
  */
 export async function createCleanupJob(
   jobBucket: Bucket,
   jobKey: string,
   keep: string,
-  opts: { deleteEntries: boolean; purgePending: boolean; now?: number }
+  opts: { deleteEntries: boolean; purgePending: boolean; replacedBuildAt?: number; now?: number }
 ): Promise<'created' | 'exists'> {
   const now = opts.now ?? Date.now();
   const purgeRetryAt = now + PURGE_RETRY_DELAY_MS;
   for (let attempt = 1; ; attempt++) {
     const { value, generation } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
-    const exists = value?.keep === keep;
+    const exists = value?.keep === keep && value.createdAt >= (opts.replacedBuildAt ?? 0);
     if (exists && (!opts.purgePending || value.purgePending)) {
       return 'exists';
     }

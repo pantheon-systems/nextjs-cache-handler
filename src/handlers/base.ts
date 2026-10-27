@@ -171,9 +171,10 @@ export abstract class BaseCacheHandler {
   /**
    * Make a new build's route cache safe to serve from, before the build is
    * recorded. Entries from other builds are already misses; work that only
-   * frees storage can wait for onBuildCurrent().
+   * frees storage can wait for onBuildCurrent(). `previous` is the build being
+   * replaced, as stored.
    */
-  protected abstract invalidateRouteCache(): Promise<void>;
+  protected abstract invalidateRouteCache(previous: BuildMeta): Promise<void>;
 
   // ============================================================================
   // Shared tag mapping methods
@@ -269,7 +270,7 @@ export abstract class BaseCacheHandler {
         `New build detected (${buildMeta.buildId || '(unreadable)'} -> ${currentBuildId}), invalidating route cache`
       );
 
-      await this.invalidateRouteCache();
+      await this.invalidateRouteCache(buildMeta);
       await this.onNewGeneration(buildMeta);
 
       // Last, so a process that dies part-way leaves the new build undetected

@@ -448,6 +448,28 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(store[jobKey]).toBeUndefined();
     });
 
+    it('deletes again when the build is deployed again after a rollback left its finished job', async () => {
+      // build-B ran here before, then a rollback to build-A on a version that ignores the job (it was
+      // recorded at 2), which left build-B's job with the delete and prune marked done.
+      store[metaKey] = JSON.stringify({ buildId: 'build-A', timestamp: 2 });
+      store[jobKey] = JSON.stringify({
+        keep: 'build-B',
+        createdAt: 1,
+        deleteEntries: true,
+        deleted: true,
+        pruned: true,
+        totals: { runs: 1 },
+      });
+      const objects = pagedObjects(routePrefix, 1500);
+      mockBucket.getFiles.mockImplementation(objects.getFiles);
+
+      await serve();
+
+      expect(objects.live.size).toBe(0);
+      expect(logged(warn)).toContain(finished(1500, 1500));
+      expect(store[jobKey]).toBeUndefined();
+    });
+
     it('retries a failed CDN purge in the background, once the retry delay has passed', async () => {
       vi.useFakeTimers({ toFake: ['Date'] });
       try {
