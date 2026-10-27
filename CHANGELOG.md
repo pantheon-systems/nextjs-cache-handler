@@ -4,7 +4,7 @@
 
 ### Added
 
-- `CACHE_GCS_API_ENDPOINT` points the GCS handlers at a GCS emulator, for tests.
+- `CACHE_GCS_API_ENDPOINT` points the GCS handlers at a GCS emulator, for tests. It is ignored on Cloud Run.
 
 ### Changed
 

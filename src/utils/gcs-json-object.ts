@@ -48,19 +48,42 @@ function createTagsStorage(): Storage {
   });
 }
 
+let endpointLogged = false;
+
 /**
  * CACHE_GCS_API_ENDPOINT points the clients at a GCS emulator, for tests. Not
  * STORAGE_EMULATOR_HOST: with it the library builds API and upload URLs from
- * the same value differently, so no value serves both.
+ * the same value differently, so no value serves both. The library sends
+ * requests to a custom endpoint without credentials, so it is ignored on
+ * Cloud Run (K_SERVICE is set), and is logged once per process.
  */
 function endpointOptions(): { apiEndpoint?: string } {
   const apiEndpoint = process.env.CACHE_GCS_API_ENDPOINT?.trim();
-  return apiEndpoint ? { apiEndpoint } : {};
+  if (!apiEndpoint) {
+    return {};
+  }
+  const onCloudRun = Boolean(process.env.K_SERVICE);
+  if (!endpointLogged) {
+    endpointLogged = true;
+    if (onCloudRun) {
+      log.error(
+        'CACHE_GCS_API_ENDPOINT is ignored on Cloud Run (K_SERVICE is set): it is for tests against a GCS ' +
+          'emulator, and requests to it would carry no credentials. Using GCS. Unset it.'
+      );
+    } else {
+      log.warn(
+        `CACHE_GCS_API_ENDPOINT is set: GCS requests go to ${apiEndpoint} without credentials. Set it only ` +
+          `to test against a GCS emulator.`
+      );
+    }
+  }
+  return onCloudRun ? {} : { apiEndpoint };
 }
 
 /** @internal Test hook. */
 export function resetSharedStorageForTests(): void {
   storageClients.clear();
+  endpointLogged = false;
 }
 
 export function getErrorStatusCode(error: unknown): number | undefined {

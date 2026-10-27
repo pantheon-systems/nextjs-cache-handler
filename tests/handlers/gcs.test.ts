@@ -1042,6 +1042,35 @@ describe('GcsCacheHandler tags mapping writes', () => {
     for (const options of storageConstructorOptions) {
       expect(options).toMatchObject({ apiEndpoint: 'http://localhost:4443' });
     }
+    // Requests to it carry no credentials: warned once, not once per client.
+    const warned = vi.mocked(console.warn).mock.calls.map(([m]) => String(m));
+    expect(warned.filter((m) => m.includes('CACHE_GCS_API_ENDPOINT'))).toEqual([
+      '[GcsJsonObject] CACHE_GCS_API_ENDPOINT is set: GCS requests go to http://localhost:4443 without ' +
+        'credentials. Set it only to test against a GCS emulator.',
+    ]);
+  });
+
+  it('ignores CACHE_GCS_API_ENDPOINT on Cloud Run, with an error', async () => {
+    storageConstructorOptions.length = 0;
+    process.env.CACHE_GCS_API_ENDPOINT = 'http://localhost:4443';
+    process.env.K_SERVICE = 'site-env';
+    try {
+      const handler = new GcsCacheHandler({} as any);
+      await setWithTags(handler, 'key1', ['posts']);
+    } finally {
+      delete process.env.CACHE_GCS_API_ENDPOINT;
+      delete process.env.K_SERVICE;
+    }
+
+    expect(storageConstructorOptions).toHaveLength(2);
+    for (const options of storageConstructorOptions) {
+      expect(options).not.toHaveProperty('apiEndpoint');
+    }
+    const errors = vi.mocked(console.error).mock.calls.map(([m]) => String(m));
+    expect(errors.filter((m) => m.includes('CACHE_GCS_API_ENDPOINT'))).toEqual([
+      '[GcsJsonObject] CACHE_GCS_API_ENDPOINT is ignored on Cloud Run (K_SERVICE is set): it is for tests ' +
+        'against a GCS emulator, and requests to it would carry no credentials. Using GCS. Unset it.',
+    ]);
   });
 
   it('replaces an unparseable mapping instead of failing forever', async () => {
