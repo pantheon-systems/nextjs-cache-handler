@@ -57,6 +57,7 @@ import {
   describeFailures,
   errorLabel,
   errorMessage,
+  isDenied,
   listPrefixPages,
   mapInBatches,
   resolveBuildInvalidationMode,
@@ -139,12 +140,12 @@ function routeObjectGeneration(file: File): unknown {
  */
 function deleteFailureHints(bucketName: string, labels: string[]): string[] {
   const hints: string[] = [];
-  if (labels.some((label) => label === '401' || label === '403')) {
+  if (isDenied(labels)) {
     hints.push(
       `Permission denied: the service account needs storage.objects.delete and storage.objects.list on gs://${bucketName}.`
     );
   }
-  if (labels.some((label) => label !== '401' && label !== '403' && !/^4\d\d$/.test(label))) {
+  if (labels.some((label) => !/^4\d\d$/.test(label))) {
     hints.push(
       `GCS throttled or was unavailable after retries; a lower CACHE_INVALIDATION_DELETE_CONCURRENCY ` +
         `(now ${resolveDeleteConcurrency()}) reduces throttling.`
@@ -997,7 +998,7 @@ export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
 
   const byGeneration: Record<string, number> = {};
   const routeObjects = await countObjects(bucket, `${envPrefix}route-cache/`, (file) => {
-    const generation = (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation;
+    const generation = routeObjectGeneration(file);
     const key = typeof generation === 'string' ? generation : 'unstamped';
     byGeneration[key] = (byGeneration[key] ?? 0) + 1;
   });

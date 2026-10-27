@@ -6,6 +6,7 @@ import {
   describeFailures,
   errorLabel,
   errorMessage,
+  isDenied,
   listPrefixPages,
   type DeletePrefixProgress,
 } from './gcs-delete-prefix.js';
@@ -152,8 +153,6 @@ const objectGeneration = (file: File) => String(file.metadata?.generation ?? 0);
 /** Whether `removals` were saved by a run of `job`, not of another job, also one for the same build. */
 const isJobsRemovals = (removals: PruneRemovals | null, job: CleanupJob): removals is PruneRemovals =>
   removals?.keep === job.keep && removals.createdAt === job.createdAt;
-
-const isDenied = (labels: string[]) => labels.some((label) => label === '401' || label === '403');
 
 const emptyTotals = (): CleanupTotals => ({
   listed: 0,

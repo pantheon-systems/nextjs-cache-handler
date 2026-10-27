@@ -63,6 +63,11 @@ export function errorLabel(error: unknown): string {
   return typeof code === 'string' && code !== '' ? code : 'error';
 }
 
+/** Whether any of these errorLabel() labels is a permission failure (401 or 403). */
+export function isDenied(labels: string[]): boolean {
+  return labels.some((label) => label === '401' || label === '403');
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
