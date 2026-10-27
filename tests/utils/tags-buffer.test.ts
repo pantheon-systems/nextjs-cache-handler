@@ -153,6 +153,21 @@ describe('TagsBuffer', () => {
     });
   });
 
+  describe('failedFlushes', () => {
+    it('counts failed flushes only, not updates queued again during a write', async () => {
+      const buf = createBuffer();
+      buf.addTags('key1', ['tag1']);
+      mockWrite.mockImplementationOnce(async () => buf.addTags('key1', ['tag1'])); // queued during the write
+      await buf.flush();
+      expect(buf.failedFlushes).toBe(0);
+      expect(buf.isAddPending('key1')).toBe(true);
+
+      mockWrite.mockRejectedValueOnce(httpError(503));
+      await buf.flush();
+      expect(buf.failedFlushes).toBe(1);
+    });
+  });
+
   describe('flush', () => {
     it('should read, apply updates, and write with the read generation', async () => {
       mockRead.mockImplementation(async () => snapshot({ existingTag: ['existingKey'] }, '42'));

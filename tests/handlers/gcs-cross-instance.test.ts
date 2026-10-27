@@ -747,6 +747,50 @@ describe('GcsCacheHandler across instances', () => {
       expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
     });
 
+    it('counts the add-back as stored when a request caches the same page during its write', async () => {
+      // Right after the prune lists `shared`, another new-build instance caches it (its key is already
+      // in tags.json, so it writes nothing). The add-back's listing is the third; during the write that
+      // adds the key back, a request on this instance caches `shared` again, queueing the same key.
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        return result;
+      });
+      const real = bucket.file.bind(bucket);
+      let recached = false;
+      vi.spyOn(bucket, 'file').mockImplementation((name, options) => {
+        const file = real(name, options);
+        if (name !== TAGS_MAP) return file;
+        return {
+          ...file,
+          save: async (data: string, saveOptions?: any) => {
+            await file.save(data, saveOptions);
+            if (listings >= 3 && !recached) {
+              recached = true;
+              await newHandler().set(shared, page(['posts']) as any, { tags: ['posts'] } as any);
+            }
+          },
+        };
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(recached).toBe(true);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+    });
+
     it("unqueues the prune's removals when their write fails, so a later write can't store them", async () => {
       const getFiles = bucket.getFiles.bind(bucket);
       let listings = 0;

@@ -613,11 +613,10 @@ export class GcsCacheHandler extends BaseCacheHandler {
    */
   private cleanupTagsMap(): CleanupTagsMap {
     const { tagsBuffer } = this;
-    // The buffer is shared with every request in the process, so a prune
-    // judges only its own removals and add-backs, and any updates dropped
-    // since it queued them.
+    // The buffer is shared with every request in the process, which may queue
+    // the same keys again, so a prune judges its updates by whether the
+    // flushes failed or dropped updates, not by what is queued afterwards.
     let removing = new Set<string>();
-    let restoring = new Set<string>();
     let droppedBefore = 0;
     return {
       routeKeysByObject: async () => {
@@ -633,19 +632,16 @@ export class GcsCacheHandler extends BaseCacheHandler {
       },
       remove: async (keys) => {
         removing = new Set(keys);
-        restoring = new Set();
         droppedBefore = tagsBuffer.droppedUpdates;
         tagsBuffer.deleteKeys(keys);
         await tagsBuffer.flushIfDue();
       },
       flush: async () => {
+        const failedBefore = tagsBuffer.failedFlushes;
         await tagsBuffer.flush();
         // A failed write leaves them queued (the buffer logged why); a drop
-        // may have discarded them.
-        const stored =
-          tagsBuffer.droppedUpdates === droppedBefore &&
-          ![...removing].some((key) => tagsBuffer.isDeletePending(key)) &&
-          ![...restoring].some((key) => tagsBuffer.isAddPending(key));
+        // since they were queued may have discarded them.
+        const stored = tagsBuffer.failedFlushes === failedBefore && tagsBuffer.droppedUpdates === droppedBefore;
         if (!stored) {
           // Left queued, a later write could store them after another instance
           // took the job over and added keys back; the next run removes them
@@ -663,7 +659,6 @@ export class GcsCacheHandler extends BaseCacheHandler {
           for (const key of keys) {
             tagsBuffer.addTags(key, strings);
             if (strings.length > 0) {
-              restoring.add(key);
               queued++;
             }
           }

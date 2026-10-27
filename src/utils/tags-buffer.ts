@@ -98,6 +98,7 @@ export class TagsBuffer {
   /** When the oldest currently-pending update was queued. */
   private oldestPendingSince = 0;
   private droppedUpdatesTotal = 0;
+  private failedFlushesTotal = 0;
 
   constructor(config: TagsBufferConfig) {
     this.flushIntervalMs = config.flushIntervalMs ?? DEFAULT_TAGS_FLUSH_INTERVAL_MS;
@@ -190,6 +191,14 @@ export class TagsBuffer {
   /** Total updates dropped after exceeding maxPendingAgeMs (see onFlushFailure). */
   get droppedUpdates(): number {
     return this.droppedUpdatesTotal;
+  }
+
+  /**
+   * Total flushes whose read or write failed. A flush() during which this
+   * doesn't change wrote everything queued when it was called.
+   */
+  get failedFlushes(): number {
+    return this.failedFlushesTotal;
   }
 
   private markPending(): void {
@@ -343,6 +352,7 @@ export class TagsBuffer {
   }
 
   private onFlushFailure(error: unknown): void {
+    this.failedFlushesTotal++;
     this.consecutiveFailures++;
     const code = getErrorStatusCode(error);
     const reason = code === 429 ? 'rate limited (429)' : code ? `HTTP ${code}` : 'error';
