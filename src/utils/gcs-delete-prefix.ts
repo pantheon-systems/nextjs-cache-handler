@@ -94,10 +94,9 @@ export class ListPrefixError extends Error {
 }
 
 /**
- * Pages of objects under `prefix`, `pageSize` at a time; only one page is held
- * at once. With `startOffset`, the listing starts at that name (inclusive), in
- * name order. A transient listing failure is retried with backoff; one that
- * keeps failing, or a permanent one (403), throws ListPrefixError.
+ * Pages of objects under `prefix` in name order, `pageSize` at a time, holding one page at once; with
+ * `startOffset` the listing starts at that name (inclusive). A transient listing failure is retried with
+ * backoff; one that keeps failing, or a permanent one (403), throws ListPrefixError.
  */
 export async function* listPrefixPages(
   bucket: Bucket,

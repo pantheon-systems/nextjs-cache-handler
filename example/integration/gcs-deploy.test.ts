@@ -1,11 +1,8 @@
 /**
- * A deploy against GCS, in real `next start` processes: the build check, the
- * background route cache clean-up and its lock across processes, the CDN
- * purge and the tags map pruning.
- *
- * Runs only with CACHE_GCS_API_ENDPOINT set, against a GCS emulator
- * (fake-gcs-server in CI). The emulator ignores delete preconditions, so an
- * entry rewritten during the delete is covered by the unit tests instead.
+ * A deploy against a GCS emulator (fake-gcs-server in CI; runs only with CACHE_GCS_API_ENDPOINT set), in
+ * real `next start` processes: the build check, the background clean-up in one process at a time, the CDN
+ * purge and the tags map prune. The emulator ignores delete preconditions, so the unit tests cover an entry
+ * rewritten during the delete.
  */
 
 import { spawn, type ChildProcess } from 'child_process'

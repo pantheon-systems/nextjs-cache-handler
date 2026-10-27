@@ -554,10 +554,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * Purge the CDN and record that the previous builds' route entries are to be
-   * deleted. The delete itself runs in the background (onBuildCurrent): the
-   * entries are misses already (see readCacheEntry), so requests don't wait
-   * for it. Never throws.
+   * Purge the CDN and record that the previous builds' route entries are to be deleted. Requests do
+   * not wait for the delete, which runs in the background (onBuildCurrent): those entries are already
+   * misses (see readCacheEntry). Never throws.
    */
   protected async invalidateRouteCache(previous: BuildMeta): Promise<void> {
     const location = `gs://${this.bucketName}/${this.routeCachePrefix}`;
@@ -609,10 +608,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   /**
-   * The tags map as the route cache clean-up prunes it: route keys (starting
-   * with `/`) by their object's name. Fetch keys are left out; those entries
-   * survive deploys. Removals go through the shared buffer, whose conditional
-   * writes merge with other instances.
+   * The tags map as the route cache clean-up prunes it: route keys (starting with `/`) by their object's
+   * name. Fetch keys are left out, as fetch entries survive deploys. Removals go through the shared
+   * buffer, whose conditional writes merge with other instances' writes.
    */
   private cleanupTagsMap(): CleanupTagsMap {
     const { tagsBuffer } = this;

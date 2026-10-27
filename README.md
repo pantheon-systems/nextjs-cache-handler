@@ -339,7 +339,7 @@ turns on the shared object.
 Call it from process-level code such as a custom `server.js`, which shares the
 module instance Next.js loaded the cache handler into. Code that Next.js bundles
 (route handlers, `instrumentation.ts`) may get its own copy of the package with
-an empty buffer registry, so a call from there flushes nothing. The function
+an empty buffer registry, so a call from there does not flush anything. The function
 returns the number of buffers it flushed. A `0` from a shutdown hook that should
 have had pending updates means it ran in the wrong module instance.
 
@@ -369,9 +369,9 @@ between steps 2 and 3. So each process, when it reads a revalidation that
 another process made, purges the CDN for the pages it served from its cache
 after that revalidation. The purge starts inside the request that read it
 (which has CPU) without holding up its cache reads. A process that served none
-of those pages purges nothing, and never purges the whole site. (Revalidations
-it finds on its first read are skipped, because it had served nothing before
-then.) The second purge in step 3 is a backstop, for a process that served the
+of those pages does not send a purge, and never purges the whole site. (Revalidations
+it finds on its first read are skipped, because it had not served any pages
+before then.) The second purge in step 3 is a backstop, for a process that served the
 old page and then received no further requests.
 
 A server action that revalidates responds after step 2; step 3 runs on a timer.
@@ -397,7 +397,7 @@ not served), so it first deletes the fetch entries the tags
 mapping lists under those tags. The object therefore holds roughly the
 revalidations made since the previous deploy. Each build records when its
 prerenders were written (`builtAt` in `build-meta.json`, less a minute's
-margin), so the first deploy after upgrading prunes nothing; pruning starts at
+margin), so the first deploy after upgrading does not prune anything; pruning starts at
 the one after. A fetch entry missing from the tags mapping (one whose mapping
 update was lost) is not deleted and is served again once its revalidation is
 pruned.

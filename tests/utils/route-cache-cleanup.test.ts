@@ -858,7 +858,7 @@ function storedTagsMap(names: Iterable<string>) {
   const stored = new Set(names);
   return {
     stored,
-    /** The new build caches a page: its add writes nothing when the key is already there. */
+    /** The new build caches a page: its add does not write anything when the key is already there. */
     cache: (key: string) => stored.add(key),
     tagsMap: {
       routeKeysByObject: vi.fn(async () => new Map([...stored].map((name): [string, string[]] => [name, [name]]))),
@@ -911,7 +911,7 @@ describe('a prune that stops part-way', () => {
     await s.run('a').resume(NEW);
     expect(s.t.job()!.pruned).toBeFalsy();
 
-    // Run 1 removed nothing, so run 2 decides afresh and sees `late` as the new build's.
+    // Run 1 did not remove any keys, so run 2 decides afresh and sees `late` as the new build's.
     await s.run('b').resume(NEW);
     expect(s.t.job()).toBeUndefined();
     expect(s.map.stored.has(s.late)).toBe(true);
@@ -965,7 +965,7 @@ describe('a prune that stops part-way', () => {
       if (n === 1) s.cacheLate();
     });
     // "a"'s write of its removals stalls past the lock's lifetime; "b" takes over and finishes the
-    // prune, adding `late` back, then a's write lands.
+    // prune, adding `late` back, then a's removals are written to the tags map.
     let queued: string[] = [];
     const tagsMap = {
       ...s.map.tagsMap,
@@ -995,7 +995,8 @@ describe('a prune that stops part-way', () => {
     const s = setupStored();
     await s.t.create({ deleteEntries: false });
     // After "a" decided to remove `late` (the old build's), a newer build replaces the job and caches
-    // `late`; its add writes nothing, as the key is still there. Then a's removal lands.
+    // `late`; its add does not write anything, as the key is still there. Then a's removal is written
+    // to the tags map.
     const tagsMap = {
       ...s.map.tagsMap,
       remove: async (keys: string[]) => {

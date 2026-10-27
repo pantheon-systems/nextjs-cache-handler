@@ -627,7 +627,7 @@ describe('GcsCacheHandler across instances', () => {
     it('keeps a tags map key whose page another instance caches after the prune lists it', async () => {
       // The delete pass lists once; the prune's listing is the second. Right after it, another new-build
       // instance caches `shared`. Its key is already in tags.json (from the previous build), so that
-      // instance's flush changes nothing and writes nothing.
+      // instance's flush does not change tags.json and does not write it.
       const getFiles = bucket.getFiles.bind(bucket);
       let listings = 0;
       vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
@@ -680,7 +680,7 @@ describe('GcsCacheHandler across instances', () => {
         listings++;
         if (listings === 2) {
           // Another new-build instance caches `shared` right after the prune listed it; its key is
-          // already in tags.json, so its flush writes nothing.
+          // already in tags.json, so its flush does not write tags.json.
           bucket.putJson(
             objectOf(shared),
             { value: page(['posts']), lastModified: 2, tags: ['posts'] },
@@ -749,8 +749,9 @@ describe('GcsCacheHandler across instances', () => {
 
     it('counts the add-back as stored when a request caches the same page during its write', async () => {
       // Right after the prune lists `shared`, another new-build instance caches it (its key is already
-      // in tags.json, so it writes nothing). The add-back's listing is the third; during the write that
-      // adds the key back, a request on this instance caches `shared` again, queueing the same key.
+      // in tags.json, so its flush does not write tags.json). The add-back's listing is the third;
+      // during the write that adds the key back, a request on this instance caches `shared` again,
+      // queueing the same key.
       const getFiles = bucket.getFiles.bind(bucket);
       let listings = 0;
       vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
@@ -805,7 +806,7 @@ describe('GcsCacheHandler across instances', () => {
       await waitForRouteCacheCleanupsForTests();
       expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
 
-      // Writes work again; another instance may have taken the job over by now. Nothing of the prune is stored.
+      // Writes work again; another instance may have taken the job over by now. The prune's updates are not stored.
       await flushGcsTagsMapping();
       expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared, old] });
     });

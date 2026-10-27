@@ -79,7 +79,7 @@ function statefulCleanupJob() {
       data = null;
     }),
   };
-  // No tags map, so the clean-up's pruning reads nothing.
+  // No tags map, so the clean-up's prune does not find any keys to remove.
   const noTagsMap = { ...mockFile, getMetadata: vi.fn(async () => Promise.reject(notFound())) };
   mockBucket.file.mockImplementation(((key: string) =>
     key.endsWith('route-cache-cleanup.json') ? file : key.endsWith('tags/tags.json') ? noTagsMap : mockFile) as any);

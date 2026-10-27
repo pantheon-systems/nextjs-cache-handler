@@ -97,10 +97,9 @@ export abstract class BaseCacheHandler {
   // the not-yet-assigned instance field as null (a false miss).
   private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
-  // The in-flight initialize(), awaited by get()/set() so no request races
-  // ahead of checkBuildInvalidation(): served before a new build's CDN purge
-  // was sent, or (file handler) reading a previous build's route entry before
-  // it is deleted. The constructor can't await it. Cleared once awaited.
+  // The in-flight initialize(), which get() and set() await, so a request is not served before a new
+  // build's CDN purge is sent and (file handler) does not read a previous build's route entry before
+  // the entry is deleted. The constructor can't await it. Cleared once awaited.
   private initPromise: Promise<void> | null = null;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
@@ -169,10 +168,9 @@ export abstract class BaseCacheHandler {
   protected abstract readBuildMeta(): Promise<BuildMeta | null>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
   /**
-   * Make a new build's route cache safe to serve from, before the build is
-   * recorded. Entries from other builds are already misses; work that only
-   * frees storage can wait for onBuildCurrent(). `previous` is the build being
-   * replaced, as stored.
+   * Make a new build's route cache safe to serve from, before the build is recorded; `previous` is the
+   * stored build being replaced. Entries from other builds are already misses, so work that only frees
+   * storage can wait for onBuildCurrent().
    */
   protected abstract invalidateRouteCache(previous: BuildMeta): Promise<void>;
 
@@ -232,7 +230,7 @@ export abstract class BaseCacheHandler {
     const currentBuildId = getProcessGeneration();
     if (isFallbackGeneration(currentBuildId)) {
       // Unique to this process, so it would purge the CDN and clean up the route
-      // cache on every cold start. Nothing is recorded either.
+      // cache on every cold start. build-meta.json is not written either.
       this.log.warn(
         `BUILD_ID unreadable (generation ${currentBuildId}); skipping build invalidation. Neither ` +
           `.next/BUILD_ID nor .next/build-manifest.json is readable under ${process.cwd()}, so a new build is ` +
@@ -291,8 +289,8 @@ export abstract class BaseCacheHandler {
   }
 
   /**
-   * Called once the stored build is this process's, with nothing awaiting it:
-   * work that must not hold up requests starts here. Not called on a first run.
+   * Called once the stored build is this process's, and not awaited: work that
+   * must not hold up requests starts here. Not called on a first run.
    * Default: nothing.
    */
   protected onBuildCurrent(): void {

@@ -23,16 +23,18 @@ import type { Logger } from './logger.js';
  * instance of its build noting a failed purge.
  */
 
-/** How long a lock lasts without renewal. Long enough to ride out a throttled-CPU stall between requests. */
+/**
+ * How long a lock lasts without renewal: long enough for a holder whose CPU is throttled between
+ * requests to renew it.
+ */
 export const LOCK_TTL_MS = 60_000;
 /** How often the holder renews the lock and records its progress; the job object takes about one write per second. */
 export const RENEW_INTERVAL_MS = 15_000;
 /** Runs that retry a failed CDN purge before the job gives up on it. */
 export const MAX_PURGE_RUNS = 5;
 /**
- * Wait after a failed background purge before the next, doubling each time.
- * Every instance checks about once a minute, so without it a fleet spends
- * every retry within seconds of each other.
+ * Wait after a failed background purge before the next, doubling each time. Every instance checks
+ * about once a minute, so without the wait the instances would use up every retry within seconds.
  */
 export const PURGE_RETRY_DELAY_MS = 60_000;
 /** How often a run logs its progress; a large delete under throttled CPU can run for most of an hour. */
@@ -82,9 +84,9 @@ export interface CleanupTagsMap {
   /** Queue a prune's removals, once per prune; may write when the map's flush interval has passed. */
   remove: (keys: string[]) => Promise<void>;
   /**
-   * Write what is queued; resolves to whether the removals, and any keys added
-   * back, were stored. Removals not stored are unqueued, so they can't land
-   * after another instance took the job over and added keys back.
+   * Write what is queued; resolves to whether the removals, and any keys added back, were stored.
+   * Removals that were not stored are unqueued, so a later write does not store them after another
+   * instance took the job over and added keys back.
    */
   flush: () => Promise<boolean>;
   /**
@@ -134,7 +136,7 @@ class LostJobError extends Error {
 
 /** A prune's decided removals: the map's route keys by object name. */
 interface PruneRemovals {
-  /** The job's, which with `keep` tells it from another job's, also one for the same build. */
+  /** The job's `keep` and `createdAt`: together they tell its removals from another job's, also for the same build. */
   keep: string;
   createdAt: number;
   byObject: Record<string, string[]>;
@@ -150,7 +152,7 @@ interface Decided {
 
 const objectGeneration = (file: File) => String(file.metadata?.generation ?? 0);
 
-/** Whether `removals` were saved by a run of `job`, not of another job, also one for the same build. */
+/** Whether `removals` were saved by a run of `job`, not by a run of another job, also one for the same build. */
 const isJobsRemovals = (removals: PruneRemovals | null, job: CleanupJob): removals is PruneRemovals =>
   removals?.keep === job.keep && removals.createdAt === job.createdAt;
 
@@ -193,16 +195,11 @@ function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>
 }
 
 /**
- * Record that `keep`'s clean-up is pending, replacing a job for another build
- * (which also deletes everything not of `keep`, so its progress does not
- * carry over). A job for `keep` already exists when another instance created
- * it; it is left as it is, except that a failed purge is noted on it, with
- * a fresh set of retries. The first retry waits PURGE_RETRY_DELAY_MS: the
- * purge just failed, most likely because the CDN API is down, and a retry
- * sent at once would fail for the same reason. A job for `keep` created
- * before the replaced build was recorded (`replacedBuildAt`) is from an
- * earlier deploy of `keep`, left by a rollback to a version that ignores the
- * job, so it is replaced. Throws when the job can't be read or written.
+ * Record that `keep`'s clean-up is pending, replacing another build's job, whose progress does not
+ * carry over. A job for `keep` that another instance created is kept, but a failed purge is noted on
+ * it with fresh retries, the first after PURGE_RETRY_DELAY_MS (a retry at once would most likely
+ * fail too). A job for `keep` created before `replacedBuildAt` was left by an earlier deploy
+ * of `keep` (a rollback to a version that ignores the job) and is replaced. Throws on a failed read or write.
  */
 export async function createCleanupJob(
   jobBucket: Bucket,
@@ -327,7 +324,7 @@ export class RouteCacheCleanup {
       generation = current;
     };
 
-    // Write the job at the generation we hold, then learn the new one.
+    // Write the job at the generation this run holds, then read the job's new generation.
     const renew = async (update: Partial<CleanupJob> = {}) => {
       for (let attempt = 1; ; attempt++) {
         job = { ...job, ...update, cursor, totals: totals(), expiresAt: this.now() + LOCK_TTL_MS };
@@ -379,7 +376,7 @@ export class RouteCacheCleanup {
         generation
       );
 
-    // Fails fast once someone else took, replaced or removed the job.
+    // Throws LostJobError once another instance took, replaced or removed the job.
     const verify = async () => {
       let metadata;
       try {
@@ -394,7 +391,7 @@ export class RouteCacheCleanup {
         await adopt();
       }
     };
-    // As verify, but renews instead when due.
+    // As verify, but renews the lock instead when a renewal is due.
     const check = async () => {
       if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
         await renew();
@@ -405,7 +402,7 @@ export class RouteCacheCleanup {
 
     try {
       if (job.purgePending && this.config.purge && (job.purgeRetryAt ?? 0) > this.now()) {
-        // Not due yet: the run still deletes and prunes, and a later one retries it.
+        // Not due yet: this run still deletes and prunes, and a later run retries the purge.
       } else if (job.purgePending && this.config.purge) {
         const purgeRuns = (job.purgeRuns ?? 0) + 1;
         if (await this.config.purge()) {
@@ -421,7 +418,7 @@ export class RouteCacheCleanup {
           await renew({ purgeRuns, purgeRetryAt: this.now() + PURGE_RETRY_DELAY_MS * 2 ** (purgeRuns - 1) });
         }
       } else if (job.purgePending) {
-        // Nothing to send it with here; keeping it owed would hold the job open on every run.
+        // This instance has no edge cache clearer; keeping the purge owed would hold the job open on every run.
         log.warn(
           `CDN purge for build ${keep}, which failed when the build was recorded, is dropped: this instance has ` +
             `no edge cache clearer (OUTBOUND_PROXY_ENDPOINT is not set)`
@@ -437,10 +434,9 @@ export class RouteCacheCleanup {
             startAfter: cursor,
             ifUnchanged: true,
             shouldDelete: (file) => this.config.generationOf(file) !== keep,
-            // A newer build replaces the job before any of its instances
-            // serves, so a page holding its entries was listed after that:
-            // checking here keeps them from being deleted as not `keep`'s. Not
-            // a renewal, which records the cursor and counts at a page's end.
+            // A newer build replaces the job before its instances serve, so a page holding their entries
+            // is listed after the replacement, and this check stops the run before the page's deletes.
+            // Not a renewal: renewals record the cursor and counts at a page's end.
             onListed: verify,
             // A page can take longer than the lock lasts (throttling, low concurrency).
             onBatch: renewIfDue,
@@ -515,7 +511,8 @@ export class RouteCacheCleanup {
           }
         );
       if (!removed) {
-        // Changed since the last write: lost, unless a failed purge was noted on it.
+        // The job changed since this run's last write: the run lost it, unless another instance only
+        // noted a failed purge on it.
         await adopt();
         if (!job.purgePending) {
           throw new LostJobError();
@@ -549,7 +546,7 @@ export class RouteCacheCleanup {
           : released
             ? `${when} resumes it after ${cursor ?? 'the start'}`
             : `${when} resumes it from the last recorded object`;
-      // Failed deletes are counted, not thrown, so a stop is never one; only a denied listing has a hint.
+      // Failed deletes are counted, not thrown, so a run never stops on one; only a denied listing gets a hint.
       const hints =
         error instanceof ListPrefixError && isDenied(labels) ? (this.config.failureHints?.(labels) ?? []) : [];
       const text = [
@@ -566,16 +563,11 @@ export class RouteCacheCleanup {
   }
 
   /**
-   * Remove the tags map's route keys whose entries are not `keep`'s: each is
-   * decided as the listing reaches its object's name, the decisions are saved,
-   * then removed together. The new build serves meanwhile, and a page it caches
-   * after its key was decided adds nothing (the key is still there), so the
-   * removal drops it; a second listing adds those keys back. So does a newer
-   * build that replaced the job meanwhile, so it adds back every key whose
-   * object changed since the decision. A run that stops before then leaves the
-   * saved removals for the next, as the map no longer has those keys. Once a
-   * run of the job saved its decision, every later run uses that one: its
-   * removals may already be stored.
+   * Remove the tags map's route keys whose entries are not `keep`'s. Each key is decided as the
+   * listing reaches its object's name; the decisions are saved, then removed in one write. A page
+   * cached after its key was decided, by this build or a newer one that replaced the job, does not
+   * change the map (the key is still there), so a second listing adds back every decided key whose
+   * object changed since. Later runs use the saved decisions, as the map may no longer have their keys.
    */
   private async pruneTagsMap(job: CleanupJob, check: () => Promise<void>): Promise<void> {
     const { tagsMap, jobBucket, removalsKey } = this.config;
@@ -625,9 +617,9 @@ export class RouteCacheCleanup {
       throw new Error(`removing ${removed} route keys from ${tagsMap.location} is not stored yet`);
     }
 
-    // Once its removals are stored, a run adds back even after losing the job:
-    // they may have landed after the instance that took over added keys back.
-    // Adding back only adds, so it needs no lock.
+    // Once its removals are stored, a run adds back even after losing the job: its removals may have
+    // been written to tags.json after the instance that took over added keys back. Adding back only
+    // adds keys, so it needs no lock.
     let lost: LostJobError | undefined;
     const checkOrNoteLost = async () => {
       if (lost) {

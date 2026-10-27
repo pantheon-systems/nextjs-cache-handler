@@ -194,8 +194,8 @@ export class TagsBuffer {
   }
 
   /**
-   * Total flushes whose read or write failed. A flush() during which this
-   * doesn't change wrote everything queued when it was called.
+   * Total flushes whose read or write failed. A flush() call during which this
+   * count does not change wrote everything queued when the call started.
    */
   get failedFlushes(): number {
     return this.failedFlushesTotal;

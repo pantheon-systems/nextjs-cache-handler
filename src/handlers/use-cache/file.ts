@@ -184,8 +184,8 @@ export class UseCacheFileHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
-      // No tags is normal for a function without cacheTag(), and also what
-      // Next.js sends when it drops them (https://github.com/vercel/next.js/issues/78864).
+      // An empty tags list is normal for a function without cacheTag(), and is also what
+      // Next.js sends when it drops the tags (https://github.com/vercel/next.js/issues/78864).
       if ((entry.tags?.length ?? 0) === 0) {
         log.debug(`SET ${cacheKey}: no tags (none declared, or not passed on by Next.js)`);
       }
