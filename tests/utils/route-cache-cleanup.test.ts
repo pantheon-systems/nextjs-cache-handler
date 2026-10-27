@@ -907,6 +907,65 @@ describe('a prune that stops part-way', () => {
     expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
   });
 
+  it('uses the removals another run of the job saved while it was deciding, instead of overwriting them', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    const first = `${PREFIX}0000001.json`;
+    // While "a" decides, another run of the job (which may already have stored its removals) saves
+    // a decision of one key.
+    const tagsMap = {
+      ...s.map.tagsMap,
+      routeKeysByObject: async () => {
+        const byObject = await s.map.tagsMap.routeKeysByObject();
+        s.t.jobBucket.putJson(REMOVALS, {
+          keep: NEW,
+          createdAt: s.t.job()!.createdAt,
+          byObject: { [first]: [first] },
+          generations: { [first]: '2' },
+        });
+        return byObject;
+      },
+    };
+    await s.t.cleanup('a', { tagsMap }).resume(NEW);
+
+    expect(s.t.job()).toBeUndefined();
+    expect(s.map.stored.has(first)).toBe(false);
+    expect(s.map.stored.size).toBe(2499); // only the saved decision's key was removed
+    expect(s.t.jobBucket.objects.has(REMOVALS)).toBe(false);
+  });
+
+  it('ignores removals saved by an earlier job for the same build', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    s.t.jobBucket.putJson(REMOVALS, { keep: NEW, createdAt: 1, byObject: { [`${PREFIX}zzz.json`]: ['/stale'] } });
+    s.map.stored.add('/stale');
+    await s.run('a').resume(NEW);
+
+    expect(s.map.tagsMap.routeKeysByObject).toHaveBeenCalledTimes(1);
+    expect(s.map.stored.has('/stale')).toBe(false); // decided afresh: no object of that name
+    expect(s.map.stored.size).toBe(0);
+  });
+
+  it("leaves removals another job saved after this run's prune", async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    const newer = { keep: 'build-C', createdAt: s.t.clock + 1, byObject: {}, generations: {} };
+    // The newer build's job saves its decision between a's last renewal and a's removal of the file.
+    const flush = s.map.tagsMap.flush;
+    const tagsMap = {
+      ...s.map.tagsMap,
+      flush: vi.fn(async () => {
+        const stored = await flush();
+        s.t.jobBucket.putJson(REMOVALS, newer);
+        return stored;
+      }),
+    };
+    await s.t.cleanup('a', { tagsMap }).resume(NEW);
+
+    expect(s.t.job()).toBeUndefined();
+    expect(s.t.jobBucket.json(REMOVALS)).toEqual(newer);
+  });
+
   it("ignores removals saved by an earlier build's prune", async () => {
     const s = setupStored();
     await s.t.create({ deleteEntries: false });

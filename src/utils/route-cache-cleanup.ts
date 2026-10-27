@@ -131,7 +131,9 @@ class LostJobError extends Error {
 
 /** A prune's decided removals: the map's route keys by object name. */
 interface PruneRemovals {
+  /** The job's, which with `keep` tells it from another job's, also one for the same build. */
   keep: string;
+  createdAt: number;
   byObject: Record<string, string[]>;
   /** Each object's GCS generation when its removal was decided; `0` when there was none. */
   generations: Record<string, string>;
@@ -144,6 +146,10 @@ interface Decided {
 }
 
 const objectGeneration = (file: File) => String(file.metadata?.generation ?? 0);
+
+/** Whether `removals` were saved by a run of `job`, not of another job, also one for the same build. */
+const isJobsRemovals = (removals: PruneRemovals | null, job: CleanupJob): removals is PruneRemovals =>
+  removals?.keep === job.keep && removals.createdAt === job.createdAt;
 
 const isDenied = (labels: string[]) => labels.some((label) => label === '401' || label === '403');
 
@@ -430,13 +436,19 @@ export class RouteCacheCleanup {
       }
 
       if (!job.pruned) {
-        await this.pruneTagsMap(keep, check);
+        await this.pruneTagsMap(job, check);
         await renew({ pruned: true });
-        // Left behind, it is only read for this build, whose prune is done.
-        await jobBucket
-          .file(this.config.removalsKey)
-          .delete()
-          .catch(() => {});
+        // Only this job's: by now a newer build may have replaced the job and saved its own.
+        const { value: removals, generation: removalsGeneration } = await readJsonObject<PruneRemovals>(
+          jobBucket,
+          this.config.removalsKey
+        );
+        if (isJobsRemovals(removals, job)) {
+          await jobBucket
+            .file(this.config.removalsKey)
+            .delete({ ifGenerationMatch: removalsGeneration } as DeleteFileOptions)
+            .catch(() => {}); // left behind, no later run of this job reads it
+        }
       }
 
       // Everything else is done; a later run retries the purge.
@@ -530,26 +542,44 @@ export class RouteCacheCleanup {
    * removal drops it; a second listing adds those keys back. So does a newer
    * build that replaced the job meanwhile, so it adds back every key whose
    * object changed since the decision. A run that stops before then leaves the
-   * saved removals for the next, as the map no longer has those keys.
+   * saved removals for the next, as the map no longer has those keys. Once a
+   * run of the job saved its decision, every later run uses that one: its
+   * removals may already be stored.
    */
-  private async pruneTagsMap(keep: string, check: () => Promise<void>): Promise<void> {
+  private async pruneTagsMap(job: CleanupJob, check: () => Promise<void>): Promise<void> {
     const { tagsMap, jobBucket, removalsKey } = this.config;
-    const saved = (await readJsonObject<PruneRemovals>(jobBucket, removalsKey)).value;
+    const { keep } = job;
+    const fromSaved = (saved: PruneRemovals): Decided => ({
+      byObject: new Map(Object.entries(saved.byObject)),
+      generations: new Map(Object.entries(saved.generations ?? {})),
+    });
+    const { value: saved, generation: savedGeneration } = await readJsonObject<PruneRemovals>(jobBucket, removalsKey);
     let decided: Decided;
-    if (saved?.keep === keep) {
-      decided = {
-        byObject: new Map(Object.entries(saved.byObject)),
-        generations: new Map(Object.entries(saved.generations ?? {})),
-      };
+    if (isJobsRemovals(saved, job)) {
+      decided = fromSaved(saved);
     } else {
       decided = await this.decideRemovals(keep, check);
       if (decided.byObject.size > 0) {
         const removals: PruneRemovals = {
           keep,
+          createdAt: job.createdAt,
           byObject: Object.fromEntries(decided.byObject),
           generations: Object.fromEntries(decided.generations),
         };
-        await writeJsonObject(jobBucket, removalsKey, removals);
+        try {
+          // Replaces only what was read: another run's decision saved meanwhile stays.
+          await writeJsonObject(jobBucket, removalsKey, removals, savedGeneration);
+        } catch (error) {
+          if (!isPreconditionFailure(error)) {
+            throw error;
+          }
+          const { value: theirs } = await readJsonObject<PruneRemovals>(jobBucket, removalsKey);
+          if (!isJobsRemovals(theirs, job)) {
+            await check(); // another job's: this one was most likely replaced
+            throw error;
+          }
+          decided = fromSaved(theirs);
+        }
         await check();
       }
     }
