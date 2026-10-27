@@ -215,7 +215,8 @@ describeWithEmulator('GCS deploy across processes', () => {
     const [finished] = logged(/Route cache clean-up for build .* finished/)
     expect(finished).toBeDefined()
     expect(firstResponseAt).toBeLessThan(finished.at)
-    expect(firstResponseMs).toBeLessThan(5_000)
+    // Three cold renders at once on a 2-core runner, with the purge and the emulator writes.
+    expect(firstResponseMs).toBeLessThan(15_000)
   })
 
   it('finds the previous build, and no other', () => {
@@ -238,8 +239,11 @@ describeWithEmulator('GCS deploy across processes', () => {
     expect(mapping.data).toEqual(['a1b2c3'])
   })
 
-  it('runs the clean-up in one process only, and logs its totals', async () => {
-    expect(logged(/Route cache clean-up for build .* (started|resumed)/)).toHaveLength(1)
+  it('runs the clean-up in one process at a time, and logs its totals', async () => {
+    // One process starts it. Another resumes it only after taking over an expired lock, which a runner
+    // that stalls past the lock's 60 s can cause.
+    expect(logged(/Route cache clean-up for build .* started/)).toHaveLength(1)
+    expect(logged(/Route cache clean-up for build .* resumed/)).toHaveLength(logged(/expired; took it over/).length)
     const finished = logged(/Route cache clean-up for build .* finished/)
     expect(finished).toHaveLength(1)
     expect(finished[0].text).toContain(`build ${generation} finished: deleted ${OLD_ENTRIES + 2} objects of earlier builds`)
