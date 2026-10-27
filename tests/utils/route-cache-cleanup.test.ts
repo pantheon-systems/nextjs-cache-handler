@@ -650,7 +650,7 @@ describe('RouteCacheCleanup', () => {
       expect(t.tagsMap.flush).toHaveBeenCalledTimes(2);
       expect(log.warn.mock.calls.map(([m]) => m)).toContain(
         `Removed 2499 route keys of earlier builds from gs://test-bucket/tags.json (and added back 1 whose ` +
-          `pages this build cached during the prune)`
+          `pages were cached during the prune)`
       );
     });
 
@@ -841,7 +841,7 @@ describe('a prune that stops part-way', () => {
     await s.t.cleanup('a', { tagsMap: s.map.tagsMap, log }).resume(NEW);
     expect(s.t.job()!.pruned).toBeFalsy();
     expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(
-      expect.stringContaining('adding back 1 route keys this build cached during the prune')
+      expect.stringContaining('adding back 1 route keys of pages cached during the prune')
     );
 
     await s.run('b').resume(NEW);
@@ -879,6 +879,31 @@ describe('a prune that stops part-way', () => {
 
     expect(s.t.job()).toBeUndefined();
     expect(s.map.stored.has(s.late)).toBe(true);
+    expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
+  });
+
+  it('adds back the key of a page a newer build cached after the removal was decided', async () => {
+    const s = setupStored();
+    await s.t.create({ deleteEntries: false });
+    // After "a" decided to remove `late` (the old build's), a newer build replaces the job and caches
+    // `late`; its add writes nothing, as the key is still there. Then a's removal lands.
+    const tagsMap = {
+      ...s.map.tagsMap,
+      remove: async (keys: string[]) => {
+        await createCleanupJob(s.t.jobBucket as unknown as Bucket, JOB, 'build-C', {
+          deleteEntries: false,
+          purgePending: false,
+        });
+        s.t.objects.rewrite(s.late, { generation: 'build-C' });
+        s.map.cache(s.late);
+        await s.map.tagsMap.remove(keys);
+      },
+    };
+    const log = silentLog();
+    await s.t.cleanup('a', { tagsMap, log }).resume(NEW);
+
+    expect(s.map.stored.has(s.late)).toBe(true);
+    expect(s.t.job()).toMatchObject({ keep: 'build-C' });
     expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
   });
 

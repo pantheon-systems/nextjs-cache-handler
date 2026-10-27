@@ -133,7 +133,17 @@ class LostJobError extends Error {
 interface PruneRemovals {
   keep: string;
   byObject: Record<string, string[]>;
+  /** Each object's GCS generation when its removal was decided; `0` when there was none. */
+  generations: Record<string, string>;
 }
+
+/** What a prune decided: the keys to remove, and the objects' GCS generations then, by object name. */
+interface Decided {
+  byObject: Map<string, string[]>;
+  generations: Map<string, string>;
+}
+
+const objectGeneration = (file: File) => String(file.metadata?.generation ?? 0);
 
 const isDenied = (labels: string[]) => labels.some((label) => label === '401' || label === '403');
 
@@ -517,24 +527,33 @@ export class RouteCacheCleanup {
    * decided as the listing reaches its object's name, the decisions are saved,
    * then removed together. The new build serves meanwhile, and a page it caches
    * after its key was decided adds nothing (the key is still there), so the
-   * removal drops it; a second listing adds those keys back. A run that stops
-   * before then leaves the saved removals for the next, as the map no longer
-   * has those keys.
+   * removal drops it; a second listing adds those keys back. So does a newer
+   * build that replaced the job meanwhile, so it adds back every key whose
+   * object changed since the decision. A run that stops before then leaves the
+   * saved removals for the next, as the map no longer has those keys.
    */
   private async pruneTagsMap(keep: string, check: () => Promise<void>): Promise<void> {
     const { tagsMap, jobBucket, removalsKey } = this.config;
     const saved = (await readJsonObject<PruneRemovals>(jobBucket, removalsKey)).value;
-    let removedByObject: Map<string, string[]>;
+    let decided: Decided;
     if (saved?.keep === keep) {
-      removedByObject = new Map(Object.entries(saved.byObject));
+      decided = {
+        byObject: new Map(Object.entries(saved.byObject)),
+        generations: new Map(Object.entries(saved.generations ?? {})),
+      };
     } else {
-      removedByObject = await this.decideRemovals(keep, check);
-      if (removedByObject.size > 0) {
-        const removals: PruneRemovals = { keep, byObject: Object.fromEntries(removedByObject) };
+      decided = await this.decideRemovals(keep, check);
+      if (decided.byObject.size > 0) {
+        const removals: PruneRemovals = {
+          keep,
+          byObject: Object.fromEntries(decided.byObject),
+          generations: Object.fromEntries(decided.generations),
+        };
         await writeJsonObject(jobBucket, removalsKey, removals);
         await check();
       }
     }
+    const removedByObject = decided.byObject;
     const removedKeys = [...removedByObject.values()].flat();
     const removed = removedKeys.length;
     if (removed === 0) {
@@ -566,7 +585,10 @@ export class RouteCacheCleanup {
     for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
       for (const file of files) {
         const keys = removedByObject.get(file.name);
-        if (keys && this.config.generationOf(file) === keep) {
+        if (
+          keys &&
+          (this.config.generationOf(file) === keep || objectGeneration(file) !== decided.generations.get(file.name))
+        ) {
           cached.set(file.name, keys);
         }
       }
@@ -578,7 +600,7 @@ export class RouteCacheCleanup {
       restored = await tagsMap.restore(cached);
       if (!(await tagsMap.flush())) {
         throw new Error(
-          `adding back ${restored} route keys this build cached during the prune to ${tagsMap.location} is not ` +
+          `adding back ${restored} route keys of pages cached during the prune to ${tagsMap.location} is not ` +
             `stored yet`
         );
       }
@@ -588,36 +610,48 @@ export class RouteCacheCleanup {
     }
     this.config.log.warn(
       `Removed ${removed - restored} route keys of earlier builds from ${tagsMap.location}` +
-        (restored > 0 ? ` (and added back ${restored} whose pages this build cached during the prune)` : '')
+        (restored > 0 ? ` (and added back ${restored} whose pages were cached during the prune)` : '')
     );
   }
 
   /** The map's route keys whose object is gone or not `keep`'s, by object name. */
-  private async decideRemovals(keep: string, check: () => Promise<void>): Promise<Map<string, string[]>> {
+  private async decideRemovals(keep: string, check: () => Promise<void>): Promise<Decided> {
     const keysByObject = await this.config.tagsMap.routeKeysByObject();
     // Listings return names in this order (they are ASCII).
     const names = [...keysByObject.keys()].sort();
-    const removedByObject = new Map<string, string[]>();
+    const decided: Decided = { byObject: new Map(), generations: new Map() };
     let next = 0;
-    const decideUpTo = (lastListed: string | undefined, kept: Set<string>) => {
+    // `listed` holds the page's objects that are not `keep`'s, by name.
+    const decideUpTo = (lastListed: string | undefined, kept: Set<string>, listed: Map<string, File>) => {
       while (next < names.length && (lastListed === undefined || names[next] <= lastListed)) {
-        if (!kept.has(names[next])) {
-          removedByObject.set(names[next], keysByObject.get(names[next])!);
+        const name = names[next];
+        if (!kept.has(name)) {
+          decided.byObject.set(name, keysByObject.get(name)!);
+          const file = listed.get(name);
+          decided.generations.set(name, file ? objectGeneration(file) : '0');
         }
         next++;
       }
     };
 
     for await (const files of listPrefixPages(this.config.bucket, this.config.prefix, this.config.pageSize)) {
-      const kept = new Set(files.filter((file) => this.config.generationOf(file) === keep).map((file) => file.name));
+      const kept = new Set<string>();
+      const listed = new Map<string, File>();
+      for (const file of files) {
+        if (this.config.generationOf(file) === keep) {
+          kept.add(file.name);
+        } else {
+          listed.set(file.name, file);
+        }
+      }
       if (files.length > 0) {
-        decideUpTo(files.at(-1)!.name, kept);
+        decideUpTo(files.at(-1)!.name, kept, listed);
       }
       await check();
     }
     // Names after the last listed one have no object at all.
-    decideUpTo(undefined, new Set());
-    return removedByObject;
+    decideUpTo(undefined, new Set(), new Map());
+    return decided;
   }
 
   /** Take the lock on `keep`'s job, or null when there is none, it is another build's, or it is held. */
