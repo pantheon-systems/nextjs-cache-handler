@@ -722,6 +722,29 @@ describe('RouteCacheCleanup', () => {
     });
   });
 
+  it('logs a failure to take the job as a warning, or as an error when permission is denied', async () => {
+    const t = setup({ total: 10 });
+    await t.create();
+    const take = async (code: number) => {
+      t.jobBucket.failWrites.set(JOB, { code, times: 1 });
+      const log = silentLog();
+      await t.cleanup('a', { log }).resume(NEW);
+      return log;
+    };
+
+    const unavailable = await take(503);
+    expect(unavailable.error).not.toHaveBeenCalled();
+    expect(unavailable.warn.mock.calls.map(([m]) => m)).toContain(
+      'Could not take the route cache clean-up job; the next check retries it:'
+    );
+
+    const denied = await take(403);
+    expect(denied.error.mock.calls.map(([m]) => m)).toEqual([
+      'Could not take the route cache clean-up job; the next check retries it:',
+    ]);
+    expect(t.objects.live.size).toBe(10);
+  });
+
   it('logs no takeover when another instance takes the expired lock first', async () => {
     const t = setup({ total: 10 });
     await t.create();

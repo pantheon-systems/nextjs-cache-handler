@@ -263,9 +263,16 @@ export class RouteCacheCleanup {
     }
     this.lastCheck = this.now();
     this.running = this.run(keep)
-      .catch((error) =>
-        this.config.log.error('Could not take the route cache clean-up job; the next check retries it:', error)
-      )
+      .catch((error) => {
+        // Each instance checks about once a minute, so during a GCS outage every instance would log an
+        // error every minute. A permission problem does not go away on its own, so it is an error.
+        const message = 'Could not take the route cache clean-up job; the next check retries it:';
+        if (isDenied([errorLabel(error)])) {
+          this.config.log.error(message, error);
+        } else {
+          this.config.log.warn(message, error);
+        }
+      })
       .finally(() => {
         this.running = null;
       });

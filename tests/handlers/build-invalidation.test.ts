@@ -505,13 +505,15 @@ describe('GcsCacheHandler build invalidation', () => {
 
       await serve();
 
-      // Then the background run cannot read the job either.
       expect(logged(error)).toEqual([
         expect.stringMatching(
           /^\[GcsCacheHandler\] Could not record the route cache clean-up .+ until the next deploy\. Edge cache purge on build invalidation failed: .+\. It is not retried, so pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared\.$/
         ),
-        '[GcsCacheHandler] Could not take the route cache clean-up job; the next check retries it:',
       ]);
+      // Then the background run cannot read the job either; the read failure is not a permission problem.
+      expect(logged(warn)).toContain(
+        '[GcsCacheHandler] Could not take the route cache clean-up job; the next check retries it:'
+      );
       expect(fullPurges()).toHaveLength(1);
     });
 
