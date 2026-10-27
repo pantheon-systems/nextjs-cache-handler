@@ -159,6 +159,8 @@ export interface DeletePrefixOptions {
    * `changed`.
    */
   ifUnchanged?: boolean;
+  /** Called after each page is listed, before its deletes; may throw to stop. */
+  onListed?: () => Promise<void> | void;
   /** Called after each batch of up to `concurrency` deletes; may throw to stop. */
   onBatch?: () => Promise<void> | void;
   /** Called after each page; may throw to stop. */
@@ -236,6 +238,7 @@ export async function deletePrefix(
       // The listing includes its start name, which the earlier run already handled.
       const files = opts.startAfter ? page.filter((file) => file.name !== opts.startAfter) : page;
       listed += files.length;
+      await opts.onListed?.();
       const targets = opts.shouldDelete ? files.filter(opts.shouldDelete) : files;
       skipped += files.length - targets.length;
 

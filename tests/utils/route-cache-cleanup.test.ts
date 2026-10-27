@@ -251,16 +251,18 @@ describe('RouteCacheCleanup', () => {
       const log = silentLog();
       await t.cleanup('a', { log }).resume(NEW);
 
-      expect(t.objects.live.size).toBe(3000); // pages 1 and 2 only
+      expect(t.objects.live.size).toBe(4000); // page 1 only
       expect(t.job()!.owner).toBe('b');
       expect(t.tagsMap.routeKeysByObject).not.toHaveBeenCalled();
       expect(log.warn.mock.calls.some(([m]) => /stopped: the clean-up job was taken over/.test(m))).toBe(true);
     });
 
-    it('stops when a newer build replaces the job', async () => {
+    it("stops when a newer build replaces the job, before deleting the newer build's objects", async () => {
       const t = setup({ total: 5000 });
       await t.create();
       const getFiles = t.objects.getFiles.getMockImplementation()!;
+      // The newer build replaces the job, then caches pages, all on the next page, before it is listed.
+      const newer = Array.from({ length: 1000 }, (_, i) => `${PREFIX}${String(1000 + i).padStart(7, '0')}.json`);
       let listings = 0;
       t.objects.getFiles.mockImplementation(async (query) => {
         if (++listings === 2) {
@@ -268,12 +270,14 @@ describe('RouteCacheCleanup', () => {
             deleteEntries: true,
             purgePending: false,
           });
+          for (const name of newer) t.objects.rewrite(name, { generation: 'build-C' });
         }
         return getFiles(query);
       });
       await t.cleanup('a').resume(NEW);
 
-      expect(t.objects.live.size).toBe(3000);
+      expect(t.objects.live.size).toBe(4000); // page 1 only
+      expect(newer.every((name) => t.objects.live.has(name))).toBe(true);
       expect(t.job()).toMatchObject({ keep: 'build-C' });
     });
   });

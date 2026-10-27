@@ -332,12 +332,8 @@ export class RouteCacheCleanup {
         generation
       );
 
-    // Fails fast once someone else took, replaced or removed the job; renews when due.
-    const check = async () => {
-      if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
-        await renew();
-        return;
-      }
+    // Fails fast once someone else took, replaced or removed the job.
+    const verify = async () => {
       let metadata;
       try {
         [metadata] = await jobBucket.file(jobKey).getMetadata();
@@ -350,6 +346,14 @@ export class RouteCacheCleanup {
       if (String(metadata.generation) !== String(generation)) {
         await adopt();
       }
+    };
+    // As verify, but renews instead when due.
+    const check = async () => {
+      if (this.now() - lastRenew >= RENEW_INTERVAL_MS) {
+        await renew();
+        return;
+      }
+      await verify();
     };
 
     try {
@@ -386,6 +390,11 @@ export class RouteCacheCleanup {
             startAfter: cursor,
             ifUnchanged: true,
             shouldDelete: (file) => this.config.generationOf(file) !== keep,
+            // A newer build replaces the job before any of its instances
+            // serves, so a page holding its entries was listed after that:
+            // checking here keeps them from being deleted as not `keep`'s. Not
+            // a renewal, which records the cursor and counts at a page's end.
+            onListed: verify,
             // A page can take longer than the lock lasts (throttling, low concurrency).
             onBatch: renewIfDue,
             onPage: async ({ lastName, ...counts }) => {
