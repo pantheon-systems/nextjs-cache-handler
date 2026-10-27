@@ -1002,6 +1002,30 @@ describe('purge notes, resumed cursors and purge retries', () => {
     expect(t.job()!.owner).toBeUndefined();
   });
 
+  it('a failed purge noted while the background purge runs writes nothing, so the purge clears the job', async () => {
+    // After a sent purge, renew({ purgePending: false }) would clear a note it merged on a 412. A note
+    // is not written to the job between the purge and that renewal: the job already owes the purge,
+    // and createCleanupJob does not write to a job that does.
+    const t = setup({ total: 10 });
+    await t.create({ purgePending: true });
+    let note = '';
+    let noteWrites = -1;
+    t.purge.mockImplementation(async () => {
+      const before = t.jobBucket.writes.get(JOB) ?? 0;
+      note = await t.create({ purgePending: true });
+      noteWrites = (t.jobBucket.writes.get(JOB) ?? 0) - before;
+      return true;
+    });
+    const log = silentLog();
+    await t.cleanup('a', { log }).resume(NEW);
+
+    expect(note).toBe('exists');
+    expect(noteWrites).toBe(0);
+    expect(log.warn.mock.calls.map(([m]) => m)).toContainEqual(expect.stringContaining('has now been sent'));
+    expect(log.warn.mock.calls.some(([m]) => /stopped/.test(m))).toBe(false);
+    expect(t.job()).toBeUndefined();
+  });
+
   it('keeps the lock, and the note, when a failed purge is noted just before a renewal', async () => {
     const t = setup({ total: 5000 });
     await t.create();
