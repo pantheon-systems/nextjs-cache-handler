@@ -507,9 +507,8 @@ Each key is decided as the listing reaches its entry, the decided keys are saved
 serving meanwhile, and a page it caches after its key was decided would lose the key, so once the
 removals are stored the job lists `route-cache/` again and adds back, with the tags the entry holds
 now, the keys of pages cached since, by this build or by a newer one that replaced the job. A run
-that stops before the add-back is stored
-leaves the saved removals, and the next run stores them again and adds back again. Then the job
-deletes the saved removals and itself, and logs a warning:
+that stops before the add-back is stored leaves the saved removals, and the next run stores them
+again and adds back again. Then the job deletes the saved removals and itself, and logs a warning:
 `Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
 With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
