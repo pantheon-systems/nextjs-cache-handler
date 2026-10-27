@@ -517,9 +517,7 @@ only up to its last renewal.
 
 While it runs, the job logs its progress as a warning at most once every 5 minutes:
 `Route cache clean-up for build <id>: deleted <n> objects of earlier builds so far (<listed> listed, <kept> of this build kept), up to <object>, in run <run>`,
-then `… pruning the tags map, in run <run>` once the delete is done. Between those lines,
-`gcloud storage cat gs://<bucket>/<prefix>route-cache-cleanup.json` prints the job: its lock
-holder, the last object reached and the counts so far.
+then `… pruning the tags map, in run <run>` once the delete is done.
 
 A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
 until the purge succeeds or 5 runs have tried, when it gives up with an error. The first retry
