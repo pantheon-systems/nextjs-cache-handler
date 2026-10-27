@@ -1004,8 +1004,8 @@ describe('purge notes, resumed cursors and purge retries', () => {
 
   it('a failed purge noted while the background purge runs writes nothing, so the purge clears the job', async () => {
     // After a sent purge, renew({ purgePending: false }) would clear a note it merged on a 412. A note
-    // is not written to the job between the purge and that renewal: the job already owes the purge,
-    // and createCleanupJob does not write to a job that does.
+    // is not written to the job between the purge and that renewal: the job already has
+    // purgePending: true, and createCleanupJob does not write to a job with purgePending: true.
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
     let note = '';
