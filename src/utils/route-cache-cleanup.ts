@@ -34,6 +34,8 @@ export const MAX_PURGE_RUNS = 5;
  * every retry within seconds of each other.
  */
 export const PURGE_RETRY_DELAY_MS = 60_000;
+/** How often a run logs its progress; a large delete under throttled CPU can run for most of an hour. */
+export const PROGRESS_LOG_INTERVAL_MS = 5 * 60_000;
 
 export interface CleanupTotals {
   listed: number;
@@ -295,6 +297,7 @@ export class RouteCacheCleanup {
     let { job, generation } = acquired;
     const started = this.now();
     let lastRenew = started;
+    let lastProgressLog = started;
     const purgeAttempt = `attempt ${(job.purgeRuns ?? 0) + 1} of ${MAX_PURGE_RUNS}`;
     if (job.pruned && job.purgePending) {
       log.warn(`Route cache clean-up for build ${keep}: retrying the CDN purge (${purgeAttempt})`);
@@ -344,6 +347,21 @@ export class RouteCacheCleanup {
       }
       await adopt();
       lastRenew = this.now();
+      if (lastRenew - lastProgressLog >= PROGRESS_LOG_INTERVAL_MS && !job.pruned) {
+        lastProgressLog = lastRenew;
+        logProgress();
+      }
+    };
+    const logProgress = () => {
+      const t = job.totals;
+      const status =
+        job.deleteEntries && !job.deleted
+          ? `deleted ${t.deleted} objects of earlier builds so far (${t.listed} listed, ${t.kept} of this ` +
+            `build kept), up to ${cursor ?? 'the start'}`
+          : job.deleteEntries
+            ? `deleted ${t.deleted} objects of earlier builds, pruning the tags map`
+            : 'nothing deleted (CACHE_BUILD_INVALIDATION=off), pruning the tags map';
+      log.warn(`Route cache clean-up for build ${keep}: ${status}, in run ${t.runs}`);
     };
     // Mid-page renewals record the previous page's cursor, so the page's end records its own.
     let renewedInPage = false;

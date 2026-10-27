@@ -4,6 +4,7 @@ import {
   LOCK_TTL_MS,
   MAX_PURGE_RUNS,
   PURGE_RETRY_DELAY_MS,
+  PROGRESS_LOG_INTERVAL_MS,
   RENEW_INTERVAL_MS,
   RouteCacheCleanup,
   createCleanupJob,
@@ -538,6 +539,33 @@ describe('RouteCacheCleanup', () => {
   });
 
   describe('totals', () => {
+    it(`logs its progress at most once every ${PROGRESS_LOG_INTERVAL_MS / 60_000} minutes while it runs`, async () => {
+      // 8 pages to delete from (3 of them the running build's), then 3 pages each for the prune's two listings.
+      const t = setup({ total: 5000, current: 3000 });
+      await t.create();
+      const getFiles = t.objects.getFiles.getMockImplementation()!;
+      t.objects.getFiles.mockImplementation(async (query) => {
+        t.advance(2 * 60_000); // each page takes 2 minutes
+        return getFiles(query);
+      });
+      const log = silentLog();
+      await t.cleanup('a', { log }).resume(NEW);
+
+      const prefix = `Route cache clean-up for build ${NEW}:`;
+      const progress = log.warn.mock.calls.map(([m]) => m).filter((m) => m.startsWith(prefix));
+      expect(progress).toEqual([
+        // 6 min: the renewal during page 3's deletes records page 2's end.
+        `${prefix} deleted 2000 objects of earlier builds so far (2000 listed, 0 of this build kept), ` +
+          `up to ${PREFIX}0001999.json, in run 1`,
+        // 12 min: page 6 holds only the running build's objects, so its end renews.
+        `${prefix} deleted 5000 objects of earlier builds so far (6000 listed, 1000 of this build kept), ` +
+          `up to ${PREFIX}0005999.json, in run 1`,
+        // 18 min and 24 min: the first page of the deciding listing, then of the add-back listing.
+        `${prefix} deleted 5000 objects of earlier builds, pruning the tags map, in run 1`,
+        `${prefix} deleted 5000 objects of earlier builds, pruning the tags map, in run 1`,
+      ]);
+    });
+
     it('records them at each renewal, so a run that is killed keeps its counts', async () => {
       const t = setup({ total: 5000 });
       await t.create();

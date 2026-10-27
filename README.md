@@ -494,7 +494,8 @@ and renewed every 15 s (also between batches of deletes, so a slow page doesn't 
 the last object name reached and the counts so far. If the holder stops, the lock lapses after
 60 s and the next instance to check resumes from that name. Instances check when they start and
 at most once a minute on route-cache reads. A newer deploy replaces the job, and an instance still
-working on the old one stops at its next renewal (within about 15 s) or the end of its page.
+working on the old one stops at its next renewal (within about 15 s), or before it deletes from the
+next page it lists.
 Another instance of the same build noting a failed CDN purge on the job does not stop the holder.
 On Cloud Run with request-based billing an instance gets almost no CPU between requests, so the
 delete only progresses while requests arrive, and a paused holder loses its lock the same way.
@@ -513,6 +514,12 @@ deletes the saved removals and itself, and logs a warning:
 With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
 The counts cover every run that worked on the job; a run killed without releasing the lock counts
 only up to its last renewal.
+
+While it runs, the job logs its progress as a warning at most once every 5 minutes:
+`Route cache clean-up for build <id>: deleted <n> objects of earlier builds so far (<listed> listed, <kept> of this build kept), up to <object>, in run <run>`,
+then `… pruning the tags map, in run <run>` once the delete is done. Between those lines,
+`gcloud storage cat gs://<bucket>/<prefix>route-cache-cleanup.json` prints the job: its lock
+holder, the last object reached and the counts so far.
 
 A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
 until the purge succeeds or 5 runs have tried, when it gives up with an error. The first retry
