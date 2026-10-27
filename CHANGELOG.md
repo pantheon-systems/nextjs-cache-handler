@@ -21,6 +21,7 @@
   - Note: Until then, which with a large route cache can take minutes, revalidating their tags purges the tags but not those pages' paths. 
   - The removals are saved in `route-cache-cleanup-removals.json` until the keys are added back, so a clean-up that stops part-way, or loses its lock to another instance, no longer loses those keys.
 - A full CDN purge that fails when a new build is recorded is retried in the background up to 5 times, about 1, 2, 4, 8 and 16 minutes after the failure.
+- Deletes that still fail with 429 (throttling) after a retry now log the suggestion to lower `CACHE_INVALIDATION_DELETE_CONCURRENCY`; before, only server and network errors did.
 
 ## 0.13.4
 

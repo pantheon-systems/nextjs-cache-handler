@@ -285,6 +285,16 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(JSON.parse(store[metaKey]).buildId).toBe('build-B');
     });
 
+    it('suggests a lower delete concurrency when deletes are still throttled (429) after a retry', async () => {
+      const objects = pagedObjects(routePrefix, 10, { deleteStatus: (i) => (i < 3 ? 429 : undefined) });
+      mockBucket.getFiles.mockImplementation(objects.getFiles);
+
+      await serve();
+
+      expect(logged(warn)).toContain(`${finished(7, 10, 0, 3)} (429 x3). ${leftovers} ${throttled}`);
+      expect(error).not.toHaveBeenCalled();
+    });
+
     it('says the service account lacks permission when deletes are denied', async () => {
       const objects = pagedObjects(routePrefix, 10, { deleteStatus: () => 403 });
       mockBucket.getFiles.mockImplementation(objects.getFiles);

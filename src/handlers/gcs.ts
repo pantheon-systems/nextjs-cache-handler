@@ -145,7 +145,8 @@ function deleteFailureHints(bucketName: string, labels: string[]): string[] {
       `Permission denied: the service account needs storage.objects.delete and storage.objects.list on gs://${bucketName}.`
     );
   }
-  if (labels.some((label) => !/^4\d\d$/.test(label))) {
+  // 429 is throttling; other 4xx are not, and a lower concurrency does not help them.
+  if (labels.some((label) => label === '429' || !/^4\d\d$/.test(label))) {
     hints.push(
       `GCS throttled or was unavailable after retries; a lower CACHE_INVALIDATION_DELETE_CONCURRENCY ` +
         `(now ${resolveDeleteConcurrency()}) reduces throttling.`
