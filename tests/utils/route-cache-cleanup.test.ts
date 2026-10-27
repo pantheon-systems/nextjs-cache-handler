@@ -370,6 +370,7 @@ describe('RouteCacheCleanup', () => {
   it('keeps the job while the CDN purge still fails, and a later run sends it without deleting or pruning again', async () => {
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     t.purge.mockResolvedValueOnce(false);
     await t.cleanup('a').resume(NEW);
     expect(t.objects.live.size).toBe(0);
@@ -393,6 +394,7 @@ describe('RouteCacheCleanup', () => {
   it(`gives up on a CDN purge that fails ${MAX_PURGE_RUNS} times, with an error`, async () => {
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     t.purge.mockResolvedValue(false);
     const log = silentLog();
     for (let run = 1; run <= MAX_PURGE_RUNS; run++) {
@@ -412,6 +414,7 @@ describe('RouteCacheCleanup', () => {
     // 20 instances, each checking once a minute, all pick up the released job within seconds.
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     t.purge.mockResolvedValue(false);
     for (let instance = 1; instance <= MAX_PURGE_RUNS; instance++) {
       await t.cleanup(`instance-${instance}`).resume(NEW);
@@ -424,9 +427,34 @@ describe('RouteCacheCleanup', () => {
     expect(t.job()!.owner).toBeUndefined();
   });
 
+  it('waits a retry delay after the failed purge at startup before the first background attempt', async () => {
+    const t = setup({ total: 10 });
+    await t.create({ purgePending: true });
+    expect(t.job()!.purgeRetryAt).toBe(t.clock + PURGE_RETRY_DELAY_MS);
+
+    // The run started right after the failed purge deletes and prunes, but does not send the purge yet.
+    await t.cleanup('a').resume(NEW);
+    expect(t.purge).not.toHaveBeenCalled();
+    expect(t.objects.live.size).toBe(0);
+    expect(t.job()).toMatchObject({ purgePending: true, deleted: true, pruned: true });
+
+    t.advance(PURGE_RETRY_DELAY_MS);
+    await t.cleanup('b').resume(NEW);
+    expect(t.purge).toHaveBeenCalledTimes(1);
+    expect(t.job()).toBeUndefined();
+  });
+
+  it('waits a retry delay after a failed purge noted on an existing job', async () => {
+    const t = setup({ total: 10 });
+    await t.create();
+    await t.create({ purgePending: true });
+    expect(t.job()!.purgeRetryAt).toBe(t.clock + PURGE_RETRY_DELAY_MS);
+  });
+
   it('waits twice as long after each failed CDN purge', async () => {
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     t.purge.mockResolvedValue(false);
     await t.cleanup('a').resume(NEW);
     expect(t.job()!.purgeRetryAt).toBe(t.clock + PURGE_RETRY_DELAY_MS);
@@ -1008,6 +1036,7 @@ describe('purge notes, resumed cursors and purge retries', () => {
     // purgePending: true, and createCleanupJob does not write to a job with purgePending: true.
     const t = setup({ total: 10 });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     let note = '';
     let noteWrites = -1;
     t.purge.mockImplementation(async () => {
@@ -1092,6 +1121,7 @@ describe('purge notes, resumed cursors and purge retries', () => {
     // An earlier purge used up its retries.
     t.jobBucket.putJson(JOB, { ...t.job()!, purgePending: false, purgeRuns: MAX_PURGE_RUNS, pruned: true });
     await t.create({ purgePending: true });
+    t.advance(PURGE_RETRY_DELAY_MS); // the first background attempt is due
     t.purge.mockResolvedValue(false);
     await t.cleanup('a').resume(NEW);
 

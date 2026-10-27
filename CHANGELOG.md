@@ -20,7 +20,7 @@
 - Removing earlier builds' keys from `cache/tags/tags.json` no longer drops for good the keys of pages the new build cached during the prune; they are added back once a second listing finds those pages, so revalidating their tags purges them from the CDN again. 
   - Note: Until then, which with a large route cache can take minutes, revalidating their tags purges the tags but not those pages' paths. 
   - The removals are saved in `route-cache-cleanup-removals.json` until the keys are added back, so a clean-up that stops part-way, or loses its lock to another instance, no longer loses those keys.
-- A full CDN purge that fails when a new build is recorded, on any instance, is retried in the background by later runs of the clean-up (up to 5, waiting 1, 2, 4 and 8 minutes between them) instead of only being logged; giving up is logged as an error. A purge that fails on another instance after an earlier one gave up gets its own 5 retries.
+- A full CDN purge that fails when a new build is recorded is retried in the background up to 5 times, about 1, 2, 4, 8 and 16 minutes after the failure.
 
 ## 0.13.4
 

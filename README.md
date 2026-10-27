@@ -515,9 +515,10 @@ The counts cover every run that worked on the job; a run killed without releasin
 only up to its last renewal.
 
 A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
-until the purge succeeds or 5 runs have tried, when it gives up with an error. After each failed
-retry the next waits 1, 2, 4, then 8 minutes, so the fifth comes about 15 minutes after the first;
-a retry also waits for an instance to check the job, at most once a minute on a route-cache read.
+until the purge succeeds or 5 runs have tried, when it gives up with an error. The first retry
+waits 1 minute after the failed purge, and after each failed retry the next waits 1, 2, 4, then 8
+minutes, so the fifth comes about 16 minutes after the failed purge; a retry also waits for an
+instance to check the job, at most once a minute on a route-cache read.
 
 A listing that fails with throttling, a timeout, a server error or a network error is retried
 twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still

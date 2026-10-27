@@ -5,6 +5,7 @@ import * as path from 'path';
 import { pagedObjects, pagedObjectsNamed } from '../helpers/paged-objects.js';
 import { toObjectName } from '../../src/utils/object-names.js';
 import { setRetryBaseDelayForTests } from '../../src/utils/gcs-delete-prefix.js';
+import { PURGE_RETRY_DELAY_MS } from '../../src/utils/route-cache-cleanup.js';
 
 // Route/ISR invalidation keyed on the generation ID (build ID + optional deployment ID).
 let mockGenerationId = 'build-A';
@@ -447,20 +448,32 @@ describe('GcsCacheHandler build invalidation', () => {
       expect(store[jobKey]).toBeUndefined();
     });
 
-    it('retries a failed CDN purge in the background', async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
+    it('retries a failed CDN purge in the background, once the retry delay has passed', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
 
-      await serve();
+        await serve();
 
-      expect(logged(error)).toEqual([
-        expect.stringMatching(
-          /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. The background clean-up retries it \(up to 5 runs\); until then, pages from the previous build stay in the CDN\.$/
-        ),
-      ]);
-      expect(fullPurges()).toHaveLength(2);
-      expect(logged(warn)).toContain(
-        '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
-      );
+        expect(logged(error)).toEqual([
+          expect.stringMatching(
+            /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. The background clean-up retries it \(up to 5 runs\); until then, pages from the previous build stay in the CDN\.$/
+          ),
+        ]);
+        expect(fullPurges()).toHaveLength(1);
+        expect(JSON.parse(store[jobKey])).toMatchObject({ purgePending: true, pruned: true });
+
+        vi.setSystemTime(Date.now() + PURGE_RETRY_DELAY_MS);
+        await serve();
+
+        expect(fullPurges()).toHaveLength(2);
+        expect(logged(warn)).toContain(
+          '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
+        );
+        expect(store[jobKey]).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('says a failed CDN purge is not retried when the clean-up job cannot be recorded', async () => {

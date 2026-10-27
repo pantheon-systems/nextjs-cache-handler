@@ -196,7 +196,10 @@ function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>
  * (which also deletes everything not of `keep`, so its progress does not
  * carry over). A job for `keep` already exists when another instance created
  * it; it is left as it is, except that a failed purge is noted on it, with
- * a fresh set of retries. Throws when the job can't be read or written.
+ * a fresh set of retries. The first retry waits PURGE_RETRY_DELAY_MS: the
+ * purge just failed, most likely because the CDN API is down, and a retry
+ * sent at once would fail for the same reason. Throws when the job can't be
+ * read or written.
  */
 export async function createCleanupJob(
   jobBucket: Bucket,
@@ -204,6 +207,8 @@ export async function createCleanupJob(
   keep: string,
   opts: { deleteEntries: boolean; purgePending: boolean; now?: number }
 ): Promise<'created' | 'exists'> {
+  const now = opts.now ?? Date.now();
+  const purgeRetryAt = now + PURGE_RETRY_DELAY_MS;
   for (let attempt = 1; ; attempt++) {
     const { value, generation } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
     const exists = value?.keep === keep;
@@ -211,12 +216,12 @@ export async function createCleanupJob(
       return 'exists';
     }
     const job: CleanupJob = exists
-      ? { ...value, purgePending: true, purgeRuns: 0, purgeRetryAt: undefined }
+      ? { ...value, purgePending: true, purgeRuns: 0, purgeRetryAt }
       : {
           keep,
-          createdAt: opts.now ?? Date.now(),
+          createdAt: now,
           deleteEntries: opts.deleteEntries,
-          ...(opts.purgePending ? { purgePending: true } : {}),
+          ...(opts.purgePending ? { purgePending: true, purgeRetryAt } : {}),
           totals: emptyTotals(),
         };
     try {
