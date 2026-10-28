@@ -52,8 +52,13 @@ function readSiteUrlConfig(distDir: string): SiteUrlConfig {
         defaultLocales.add(locale);
       }
     }
-  } catch {
-    log.debug(`No required-server-files.json in ${distDir}; assuming no basePath or trailingSlash`);
+  } catch (error) {
+    const assumed = 'assuming no basePath, trailingSlash or i18n default locales for CDN purge paths';
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      log.debug(`No required-server-files.json in ${distDir}; ${assumed}`);
+    } else {
+      log.warn(`Could not read required-server-files.json in ${distDir}; ${assumed}:`, error);
+    }
   }
 
   let buildId: string | null = null;

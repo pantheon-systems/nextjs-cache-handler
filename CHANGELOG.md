@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.14.0
+
+### Added
+
+- `CACHE_GCS_API_ENDPOINT` points the GCS handlers at a GCS emulator, for tests. It is ignored on Cloud Run.
+
+### Changed
+
+- With the GCS handler, a new build no longer makes requests wait for the earlier builds' route entries to be deleted: a background clean-up deletes them. The file handler still deletes `route-cache/` before it serves.
+- Only one instance at a time deletes the earlier builds' route entries.
+- Earlier builds' route keys are removed from `cache/tags/tags.json` by the background clean-up, after the delete, and only for keys whose entries are not the running build's. With `CACHE_BUILD_INVALIDATION=off` the clean-up does not delete anything and still prunes the tags map, as 0.13.4 did.
+
+#### Logs
+
+*Renamed:*
+
+- `Route cache invalidation: deleted …` is now `Route cache clean-up for build <id> finished: …`.
+- `Route cache invalidation stopped: …` and `Route cache invalidation failed. …` are now `Route cache clean-up for build <id> stopped …`.
+- `Removed <n> route keys of the previous build from …` is now `Removed <n> route keys of earlier builds from …`.
+- `Tags mapping write recovered after …` is now `Tags mapping flush recovered after …`.
+- `Error reading tags mapping during revalidateTag:` is now `Error reading tags mapping; only build prerender keys are known for these tags:`.
+- `Could not read build prerender tags:` is now `Could not read build prerender tags or build time:`.
+- In the `use cache` handlers, `SET <key>: empty tags array (known Next.js bug)` is now `SET <key>: no tags (none declared, or not passed on by Next.js)`, logged at debug instead of warn.
+
+
+*New warnings:*
+- `Route cache clean-up for build <id> started`, `… resumed, …`
+- the progress line `… deleted <n> objects of earlier builds so far …` (at most every 5 minutes)
+- `Route cache clean-up lock held by <owner> expired; took it over`
+- `CDN purge for build <id>, which failed when the build was recorded, has now been sent`.
+
+*Errors worth alerting on:*
+
+- `Could not record the route cache clean-up in …`: the clean-up does not run for this deploy; the earlier builds' entries stay in storage until the next deploy.
+- `CDN purge for build <id> failed again (5 background attempts); giving up.`: pages from the previous build stay in the CDN until they expire or the edge cache is cleared.
+- `Route cache clean-up for build <id> stopped …`, `Route cache clean-up for build <id> finished: …` and `Could not take the route cache clean-up job …`, which are errors only for 401 and 403: the service account lacks permission on the bucket, so every run stops the same way.
+- `CACHE_GCS_API_ENDPOINT is ignored on Cloud Run …`: the setting is for tests and should be removed from the service.
+
+#### Dependencies
+
+- `@google-cloud/storage` ^7.21.0 → ^8.4.0: It brings `google-auth-library` 11, `gaxios` 7, `teeny-request` 11 and `node-fetch` 3. `@google-cloud/storage`, `google-auth-library` and `teeny-request` require Node.js ≥ 22.
+  - Under many concurrent downloads, storage 8 can log a `MaxListenersExceededWarning` from `teeny-request`. See [googleapis/google-cloud-node#9185](https://github.com/googleapis/google-cloud-node/issues/9185) for more info.
+
+### Fixed
+
+- The delete on a new build no longer removes pages that instances of the new build cached during the deploy. It skips objects stamped with the running build, and each delete is conditional on the object not having changed since it was listed.
+- Removing earlier builds' keys from `cache/tags/tags.json` no longer drops for good the keys of pages the new build cached during the prune; they are added back once a second listing finds those pages, so revalidating their tags purges them from the CDN again. 
+  - Note: Until then, which with a large route cache can take minutes, revalidating their tags purges the tags but not those pages' paths. 
+  - The removals are saved in `route-cache-cleanup-removals.json` until the keys are added back, so a clean-up that stops part-way, or loses its lock to another instance, no longer loses those keys.
+- A full CDN purge that fails when a new build is recorded is retried in the background up to 5 times, about 1, 2, 4, 8 and 16 minutes after the failure.
+- Deletes that still fail with 429 (throttling) after a retry now log the suggestion to lower `CACHE_INVALIDATION_DELETE_CONCURRENCY`; before, only server and network errors did.
+
 ## 0.13.4
 
 ### Added

@@ -190,7 +190,9 @@ export class EdgeCacheClear {
         if (result.success) {
           edgeLog.debug(`Background path clear for ${context}: ${result.paths?.length} paths cleared`);
         } else {
-          edgeLog.warn(`Background path clear failed for ${context}: ${result.error}`);
+          edgeLog.warn(
+            `Background path clear failed for ${context}: ${result.error ?? 'no path cleared (see the warnings above)'}`
+          );
         }
       })
       .catch((error) => {
@@ -285,7 +287,9 @@ export class EdgeCacheClear {
         if (result.success) {
           edgeLog.debug(`Background key clear for ${context}: ${result.paths?.length} keys cleared`);
         } else {
-          edgeLog.warn(`Background key clear failed for ${context}: ${result.error}`);
+          edgeLog.warn(
+            `Background key clear failed for ${context}: ${result.error ?? 'no key cleared (see the warnings above)'}`
+          );
         }
       })
       .catch((error) => {

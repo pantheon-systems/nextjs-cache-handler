@@ -97,13 +97,9 @@ export abstract class BaseCacheHandler {
   // the not-yet-assigned instance field as null (a false miss).
   private buildPrerenderFallbackPromise: Promise<FileSystemCacheLike | null> | null = null;
 
-  // Tracks the in-flight initialize() call so get()/set() can await it before
-  // touching the store. Without this, a request's get() could race ahead of
-  // checkBuildInvalidation() below and read a stale route-cache entry left
-  // over from the previous build, before this process has had a chance to
-  // wipe it -- initialize() itself can't be awaited from the constructor (JS
-  // constructors can't be async), so this is the only place that gap can
-  // close. Cleared to null once awaited so later get()/set() calls short-circuit.
+  // The in-flight initialize(), which get() and set() await, so a request is not served before a new
+  // build's CDN purge is sent and (file handler) does not read a previous build's route entry before
+  // the entry is deleted. The constructor can't await it. Cleared once awaited.
   private initPromise: Promise<void> | null = null;
 
   constructor(context: FileSystemCacheContext, handlerName: string) {
@@ -171,7 +167,12 @@ export abstract class BaseCacheHandler {
   /** The stored build metadata, or null when none is stored. Throws when it can't be read. */
   protected abstract readBuildMeta(): Promise<BuildMeta | null>;
   protected abstract writeBuildMeta(meta: BuildMeta): Promise<void>;
-  protected abstract invalidateRouteCache(): Promise<void>;
+  /**
+   * Make a new build's route cache safe to serve from, before the build is recorded; `previous` is the
+   * stored build being replaced. Entries from other builds are already misses, so work that only frees
+   * storage can wait for onBuildCurrent().
+   */
+  protected abstract invalidateRouteCache(previous: BuildMeta): Promise<void>;
 
   // ============================================================================
   // Shared tag mapping methods
@@ -228,8 +229,8 @@ export abstract class BaseCacheHandler {
     // `buildId` holds the generation ID (build ID + deployment ID).
     const currentBuildId = getProcessGeneration();
     if (isFallbackGeneration(currentBuildId)) {
-      // Unique to this process, so it would wipe the route cache and purge the
-      // CDN on every cold start. Nothing is recorded either.
+      // Unique to this process, so it would purge the CDN and clean up the route
+      // cache on every cold start. build-meta.json is not written either.
       this.log.warn(
         `BUILD_ID unreadable (generation ${currentBuildId}); skipping build invalidation. Neither ` +
           `.next/BUILD_ID nor .next/build-manifest.json is readable under ${process.cwd()}, so a new build is ` +
@@ -263,15 +264,18 @@ export abstract class BaseCacheHandler {
 
     if (buildMeta.buildId !== currentBuildId) {
       // warn, not info: once per deploy, and must be visible without CACHE_DEBUG
-      this.log.warn(`New build detected (${buildMeta.buildId} -> ${currentBuildId}), invalidating route cache`);
+      this.log.warn(
+        `New build detected (${buildMeta.buildId || '(unreadable)'} -> ${currentBuildId}), invalidating route cache`
+      );
 
-      await this.invalidateRouteCache();
+      await this.invalidateRouteCache(buildMeta);
       await this.onNewGeneration(buildMeta);
 
       // Last, so a process that dies part-way leaves the new build undetected
       // and the next start resumes the invalidation.
       await this.writeBuildMeta(currentMeta);
     }
+    this.onBuildCurrent();
   }
 
   /** Stored build metadata that isn't valid JSON counts as an unknown previous generation. */
@@ -282,6 +286,15 @@ export abstract class BaseCacheHandler {
       this.log.warn('Stored build metadata is not valid JSON; treating it as a different build');
       return { buildId: '', timestamp: 0 };
     }
+  }
+
+  /**
+   * Called once the stored build is this process's, and not awaited: work that
+   * must not hold up requests starts here. Not called on a first run.
+   * Default: nothing.
+   */
+  protected onBuildCurrent(): void {
+    // Default implementation does nothing
   }
 
   /**
@@ -424,10 +437,7 @@ export abstract class BaseCacheHandler {
   ): Promise<CacheHandlerValue | null> {
     this.log.debug(`GET: ${cacheKey}`);
 
-    // Without this, a request racing the very first GET on a cold instance
-    // could read a route-cache entry left over from the previous build,
-    // before checkBuildInvalidation() (in initialize()) has had a chance to
-    // wipe it.
+    // Waits for the build check (see initPromise).
     await this.ensureInitialized();
     // Before any tag check: Next's own checks run on what get() returns.
     await this.refreshRevalidations();
@@ -539,9 +549,7 @@ export abstract class BaseCacheHandler {
       revalidate?: Revalidate;
     }
   ): Promise<void> {
-    // Same race as get() above -- a write racing ahead of build invalidation
-    // could persist a fresh entry that the still-pending wipe would then
-    // incorrectly delete.
+    // Waits for the build check, so a write isn't deleted by a new build's delete.
     await this.ensureInitialized();
 
     const cacheType = this.determineCacheTypeFromValue(incrementalCacheValue);
@@ -631,7 +639,7 @@ export abstract class BaseCacheHandler {
     const published = await this.publishRevalidations(revalidations);
     const affectedKeys = await this.findAffectedKeys(tagArray);
 
-    this.log.info(`Revalidated ${affectedKeys.length} entries for tags: ${tagArray.join(', ')}`);
+    this.log.info(`Revalidated tags ${tagArray.join(', ')}; ${new Set(affectedKeys).size} cache keys affected`);
 
     // Hook for subclasses to perform additional cleanup (e.g., edge cache clearing)
     await this.onRevalidateComplete(tagArray, affectedKeys, published);
@@ -643,7 +651,7 @@ export abstract class BaseCacheHandler {
     try {
       tagsMapping = await this.readTagsMapping();
     } catch (error) {
-      this.log.error('Error reading tags mapping during revalidateTag:', error);
+      this.log.error('Error reading tags mapping; only build prerender keys are known for these tags:', error);
       tagsMapping = {};
     }
 

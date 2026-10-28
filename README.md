@@ -17,7 +17,7 @@ Each badge shows whether the tests on `main` pass against the newest Next.js 15 
 - **Edge Cache Clearing**: Automatic CDN cache invalidation on Pantheon infrastructure
 - **Build-Aware Caching**: Automatically invalidates route cache on new builds
 - **Static Route Preservation**: Preserves SSG routes during cache clearing
-- **Edge-Runtime Safe**: Ships an edge-safe entry (resolved via the `edge-light`/`worker` export conditions) so a globally-configured cache handler doesn't break edge routes or edge middleware
+- **Edge-Runtime Safe**: Ships an edge-safe entry so a globally-configured cache handler doesn't break edge routes or edge middleware (see [Edge runtime safety](#edge-runtime-safety))
 
 ## Installation
 
@@ -101,8 +101,6 @@ interface CacheHandlerConfig {
 }
 ```
 
-> **Note:** Debug logging is controlled via the `CACHE_DEBUG` environment variable. See the [Debugging](#debugging) section for details.
-
 ## Environment Variables
 
 | Variable | Description | Required |
@@ -111,9 +109,10 @@ interface CacheHandlerConfig {
 | `OUTBOUND_PROXY_ENDPOINT` | Edge cache proxy endpoint (Pantheon infrastructure) | Optional (enables edge cache clearing) |
 | `CACHE_DEBUG` | Enable debug logging (`true` or `1`) | Optional |
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
-| `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries (the `memoryMb` option of `createUseCacheHandler` takes precedence) it has read or written, least recently used first out (default `32`, `0` disables). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
-| `CACHE_INVALIDATION_DELETE_CONCURRENCY` | Deletes in flight at once when a new build deletes `route-cache/`, and when `clearSharedCache()` runs (default `50`, clamped to `1`–`200`). Raising it shortens the delete a new build waits for before serving. See [Build Invalidation](#build-invalidation). | Optional |
-| `CACHE_BUILD_INVALIDATION` | `off` stops a new build from deleting `route-cache/` (it still records the build and purges the CDN), for when the delete itself is the problem. Entries from earlier builds are still never served; they only take up storage until a deploy runs without `off`. Any other value, or unset, deletes as usual. | Optional |
+| `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries it has read or written, evicting the least recently used (default `32`, `0` disables; the `memoryMb` option of `createUseCacheHandler` takes precedence). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
+| `CACHE_INVALIDATION_DELETE_CONCURRENCY` | Deletes in flight at once when a new build deletes the earlier builds' entries in `route-cache/` (in the background), and when `clearSharedCache()` runs (default `50`, clamped to `1`–`200`). Raising it shortens the background delete; lowering it eases GCS throttling. See [Build Invalidation](#build-invalidation). | Optional |
+| `CACHE_BUILD_INVALIDATION` | `off` stops a new build from deleting `route-cache/` (it still records the build, purges the CDN and removes earlier builds' keys from the tags map), for when the delete itself is the problem. Entries from earlier builds are still never served; they only take up storage until a deploy runs without `off`. Any other value, or unset, deletes as usual. | Optional |
+| `CACHE_GCS_API_ENDPOINT` | Base URL of a GCS emulator for the GCS handlers to use instead of GCS, such as `http://localhost:4443` for [fake-gcs-server](https://github.com/fsouza/fake-gcs-server); the integration tests use it. `STORAGE_EMULATOR_HOST` does not work for this: the storage library builds API and upload URLs from it differently, so no value serves both. Requests to it are sent without credentials, so it is ignored, with an error, on Cloud Run (when `K_SERVICE` is set). | Optional (testing only) |
 | `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for one interval plus up to 1 s (the interval again, capped at 1 s) after the first, 2 s by default. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
 
 ## API Reference
@@ -220,8 +219,7 @@ const UseCacheHandler = createUseCacheHandler({
   memoryMb: 32, // Per-process in-memory entries for the GCS handler (default 32, 0 disables)
 });
 
-// Note the `new` — Next.js calls methods directly on this exported value
-// and will not instantiate the class for you.
+// `new`: Next.js calls methods on this value and won't instantiate it.
 export default new UseCacheHandler();
 ```
 
@@ -341,7 +339,7 @@ turns on the shared object.
 Call it from process-level code such as a custom `server.js`, which shares the
 module instance Next.js loaded the cache handler into. Code that Next.js bundles
 (route handlers, `instrumentation.ts`) may get its own copy of the package with
-an empty buffer registry, so a call from there flushes nothing. The function
+an empty buffer registry, so a call from there does not flush anything. The function
 returns the number of buffers it flushed. A `0` from a shutdown hook that should
 have had pending updates means it ran in the wrong module instance.
 
@@ -371,9 +369,9 @@ between steps 2 and 3. So each process, when it reads a revalidation that
 another process made, purges the CDN for the pages it served from its cache
 after that revalidation. The purge starts inside the request that read it
 (which has CPU) without holding up its cache reads. A process that served none
-of those pages purges nothing, and never purges the whole site. (Revalidations
-it finds on its first read are skipped, because it had served nothing before
-then.) The second purge in step 3 is a backstop, for a process that served the
+of those pages does not send a purge, and never purges the whole site. (Revalidations
+it finds on its first read are skipped, because it had not served any pages
+before then.) The second purge in step 3 is a backstop, for a process that served the
 old page and then received no further requests.
 
 A server action that revalidates responds after step 2; step 3 runs on a timer.
@@ -394,12 +392,12 @@ shutdown.
 `revalidations.json` holds one entry per revalidated tag. At each deploy, the
 first process of the new build removes the entries older than the previous
 build: by then only `fetch()` and `unstable_cache` entries can be older than
-those revalidations (the route cache is cleared on a deploy, and `use cache`
-entries belong to their build), so it first deletes the fetch entries the tags
+those revalidations (route and `use cache` entries from an earlier build are
+not served), so it first deletes the fetch entries the tags
 mapping lists under those tags. The object therefore holds roughly the
 revalidations made since the previous deploy. Each build records when its
 prerenders were written (`builtAt` in `build-meta.json`, less a minute's
-margin), so the first deploy after upgrading prunes nothing; pruning starts at
+margin), so the first deploy after upgrading does not prune anything; pruning starts at
 the one after. A fetch entry missing from the tags mapping (one whose mapping
 update was lost) is not deleted and is served again once its revalidation is
 pruned.
@@ -477,32 +475,67 @@ On each new build, the handler automatically:
 
 This matches Next.js's expected behavior where route cache is invalidated on each deploy but data cache persists.
 
-The GCS handler deletes `route-cache/` one listed page (1,000 objects) at a time, with at most
-`CACHE_INVALIDATION_DELETE_CONCURRENCY` deletes in flight, so memory stays flat however large the
-cache is. Requests wait for the whole check (the delete, a full CDN purge, and removing the
-previous build's keys from the tags map); the new build ID is written to `build-meta.json` last. A process that stops part-way keeps what it deleted, and
-the next one to start deletes the rest. Each run logs a warning such as
-`Route cache invalidation: deleted <deleted>/<listed> objects in <ms>ms`.
+On the GCS handler, a new build makes requests wait only for a full CDN purge and two small
+writes: the clean-up job (`route-cache-cleanup.json`, next to `build-meta.json`), then the new
+build ID in `build-meta.json`. Deleting the earlier builds' entries runs in the background, so the
+first request after a deploy is answered in normal time however large `route-cache/` is. That is
+safe because each route entry is stamped with the build that wrote it, and an entry from any other
+build is a cache miss (the build's prerender is used if there is one, otherwise the page is
+rendered again). Entries written before 0.13.4 carry no build and miss once. Fetch and image
+entries are not tied to a build and are kept across deploys.
 
-The GCS handler also stamps each route entry with the build that wrote it, and a route entry from
-any other build is a cache miss (the build's prerender is used if there is one, otherwise the page is rendered again).
-Entries a failed delete leaves behind, or that an instance of another revision writes during a
-rollout, are therefore never served: they only take up storage until a later deploy deletes them.
-Fetch and image entries are not tied to a build and are kept across deploys. Entries written
-before 0.13.4 carry no build and miss once.
+The background delete lists `route-cache/` 1,000 objects at a time with at most
+`CACHE_INVALIDATION_DELETE_CONCURRENCY` deletes in flight, so memory stays flat. It skips entries
+written by the running build, including ones cached since the deploy, and each delete is
+conditional on the object being the version listed, so an entry rewritten in between is kept.
+
+Only one instance at a time deletes. The job object is also a lock, taken with a conditional write
+and renewed every 15 s (also between batches of deletes, so a slow page doesn't outlast it) with
+the last object name reached and the counts so far. If the holder stops, the lock lapses after
+60 s and the next instance to check resumes from that name. Instances check when they start and
+at most once a minute on route-cache reads. A newer deploy replaces the job, and an instance still
+working on the old one stops at its next renewal (within about 15 s), or before it deletes from the
+next page it lists.
+Another instance of the same build noting a failed CDN purge on the job does not stop the holder.
+On Cloud Run with request-based billing an instance gets almost no CPU between requests, so the
+delete only progresses while requests arrive, and a paused holder loses its lock the same way.
+
+When the delete finishes, the job lists `route-cache/` again and removes from the tags map
+(`cache/tags/tags.json`) the route keys whose entries are not the running build's; fetch keys stay.
+Each key is decided as the listing reaches its entry, the decided keys are saved in
+`route-cache-cleanup-removals.json` next to the job, then removed in one write. The new build is
+serving meanwhile, and a page it caches after its key was decided would lose the key, so once the
+removals are stored the job lists `route-cache/` again and adds back, with the tags the entry holds
+now, the keys of pages cached since, by this build or by a newer one that replaced the job. A run
+that stops before the add-back is stored leaves the saved removals, and the next run stores them
+again and adds back again. Then the job deletes the saved removals and itself, and logs a warning:
+`Route cache clean-up for build <id> finished: deleted <n> objects of earlier builds (<listed> listed, <kept> of this build kept, <changed> rewritten during the delete kept), <failed> failed, in <ms>ms over <runs> run(s)`.
+With `CACHE_BUILD_INVALIDATION=off` it logs `… finished: nothing deleted (CACHE_BUILD_INVALIDATION=off), tags map pruned, in <ms>ms over <runs> run(s)` instead.
+The counts cover every run that worked on the job; a run killed without releasing the lock counts
+only up to its last renewal.
+
+While it runs, the job logs its progress as a warning at most once every 5 minutes:
+`Route cache clean-up for build <id>: deleted <n> objects of earlier builds so far (<listed> listed, <kept> of this build kept), up to <object>, in run <run>`,
+then `… pruning the tags map, in run <run>` once the delete is done.
+
+A failed full CDN purge is logged as an error and retried by later runs of the job, which stays
+until the purge succeeds or 5 runs have tried, when it gives up with an error. The first retry
+waits 1 minute after the failed purge, and after each failed retry the next waits 1, 2, 4, then 8
+minutes, so the fifth comes about 16 minutes after the failed purge; a retry also waits for an
+instance to check the job, at most once a minute on a route-cache read.
 
 A listing that fails with throttling, a timeout, a server error or a network error is retried
 twice (after 1 s, then 2 s); deletes that fail that way are retried once per page. What still
-fails is logged with the failure counts by status (`503 x8, 403 x2`), the first error, and what to
-change: delete permission on the bucket (logged as an error, since every deploy fails the same way
-until it is fixed), or a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling.
-
-The previous build's route keys are also removed from the tag-to-keys mapping
-(`cache/tags/tags.json`); fetch keys stay.
+fails is logged with the failure counts by status (`503 x8, 403 x2`) and what to change: delete
+permission on the bucket (an error, since every deploy fails the same way until it is fixed), or
+a lower `CACHE_INVALIDATION_DELETE_CONCURRENCY` for throttling. A listing that still fails stops
+the run, which releases the lock with its progress for a later instance. Entries left behind by a
+failed delete, or written by another revision during a rollout, are not served and are deleted at
+a later deploy.
 
 If the build ID can't be read (no `.next/BUILD_ID` or build manifest in the working directory),
-the process gets a generation of its own, so the check is skipped with a warning instead of wiping
-the cache and purging the CDN on every cold start. Such a process can't tell builds apart: a deploy
+the process gets a generation of its own, so the check is skipped with a warning instead of deleting
+the route cache and purging the CDN on every cold start. Such a process can't tell builds apart: a deploy
 neither deletes the route cache nor purges the CDN, and it serves route entries from any build.
 Start the server from the directory that contains `.next`.
 
@@ -539,10 +572,8 @@ When debug logging is enabled, you'll see output like:
 [GcsCacheHandler] HIT: /api/posts (route)
 [GcsCacheHandler] SET: /api/users (fetch)
 [EdgeCacheClear] Cleared 3 paths in 45ms
-[GcsCacheHandler] Revalidated 5 entries for tags: posts, blog
+[GcsCacheHandler] Revalidated tags posts, blog; 5 cache keys affected
 ```
-
-This helps diagnose cache behavior, verify cache hits/misses, and troubleshoot invalidation issues.
 
 ## Publishing
 

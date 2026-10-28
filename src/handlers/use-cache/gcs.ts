@@ -153,7 +153,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
     // Initialize asynchronously but track the promise
     this.initPromise = this.initialize().catch(() => {});
 
-    log.info('Initialized GCS use-cache handler');
+    log.info('Created GCS use-cache handler');
   }
 
   private async initialize(): Promise<void> {
@@ -510,10 +510,10 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       // CRITICAL: Await the pending entry
       const entry = await pendingEntry;
 
-      // Known Next.js bug: cacheTag() values not propagated to cacheHandlers.set()
-      // See: https://github.com/vercel/next.js/issues/78864
+      // An empty tags list is normal for a function without cacheTag(), and is also what
+      // Next.js sends when it drops the tags (https://github.com/vercel/next.js/issues/78864).
       if ((entry.tags?.length ?? 0) === 0) {
-        log.warn(`SET ${cacheKey}: empty tags array (known Next.js bug)`);
+        log.debug(`SET ${cacheKey}: no tags (none declared, or not passed on by Next.js)`);
       }
 
       const serialized = await serializeUseCacheEntry(entry);

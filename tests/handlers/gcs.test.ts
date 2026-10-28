@@ -47,9 +47,44 @@ import {
   clearSharedCache,
   resetGcsSharedState,
   flushGcsTagsMapping,
+  waitForRouteCacheCleanupsForTests,
 } from '../../src/handlers/gcs.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { DEFAULT_TAGS_FLUSH_INTERVAL_MS } from '../../src/utils/tags-buffer.js';
+
+/**
+ * A clean-up job object that keeps what is written to it (the shared mockFile
+ * returns build meta for every key), so a new build's job can be read back,
+ * and no tags map.
+ */
+function statefulCleanupJob() {
+  let data: string | null = null;
+  let generation = 0;
+  const notFound = () => Object.assign(new Error('Not Found'), { code: 404 });
+  const file = {
+    ...mockFile,
+    getMetadata: vi.fn(async () => {
+      if (data === null) throw notFound();
+      return [{ generation: String(generation) }];
+    }),
+    download: vi.fn(async () => {
+      if (data === null) throw notFound();
+      return [Buffer.from(data)];
+    }),
+    save: vi.fn(async (written: string) => {
+      data = written;
+      generation++;
+    }),
+    delete: vi.fn(async () => {
+      data = null;
+    }),
+  };
+  // No tags map, so the clean-up's prune does not find any keys to remove.
+  const noTagsMap = { ...mockFile, getMetadata: vi.fn(async () => Promise.reject(notFound())) };
+  mockBucket.file.mockImplementation(((key: string) =>
+    key.endsWith('route-cache-cleanup.json') ? file : key.endsWith('tags/tags.json') ? noTagsMap : mockFile) as any);
+  return file;
+}
 
 /** save() calls that wrote the tags mapping (tag -> keys), not an entry, build meta or revalidations. */
 function tagsMappingSaves() {
@@ -523,11 +558,14 @@ describe('GcsCacheHandler environment prefix', () => {
 
     const buildMeta = { buildId: 'old-build', timestamp: 1 };
     mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(buildMeta))]);
+    statefulCleanupJob();
 
     new GcsCacheHandler({} as any);
     await new Promise((r) => setTimeout(r, 50));
+    await waitForRouteCacheCleanupsForTests();
 
     // Build invalidation should list files only under the env prefix
+    expect(mockBucket.file).toHaveBeenCalledWith('environments/pr-42/route-cache-cleanup.json');
     expect(mockBucket.getFiles).toHaveBeenCalledWith(
       expect.objectContaining({ prefix: 'environments/pr-42/route-cache/', autoPaginate: false })
     );
@@ -990,6 +1028,51 @@ describe('GcsCacheHandler tags mapping writes', () => {
     expect(tagsOptions.retryOptions.retryableErrorFn({ code: 412 })).toBe(false);
   });
 
+  it('points both storage clients at CACHE_GCS_API_ENDPOINT when it is set', async () => {
+    storageConstructorOptions.length = 0;
+    process.env.CACHE_GCS_API_ENDPOINT = 'http://localhost:4443';
+    try {
+      const handler = new GcsCacheHandler({} as any);
+      await setWithTags(handler, 'key1', ['posts']);
+    } finally {
+      delete process.env.CACHE_GCS_API_ENDPOINT;
+    }
+
+    expect(storageConstructorOptions).toHaveLength(2);
+    for (const options of storageConstructorOptions) {
+      expect(options).toMatchObject({ apiEndpoint: 'http://localhost:4443' });
+    }
+    // Requests to it carry no credentials: warned once, not once per client.
+    const warned = vi.mocked(console.warn).mock.calls.map(([m]) => String(m));
+    expect(warned.filter((m) => m.includes('CACHE_GCS_API_ENDPOINT'))).toEqual([
+      '[GcsJsonObject] CACHE_GCS_API_ENDPOINT is set: GCS requests go to http://localhost:4443 without ' +
+        'credentials. Set it only to test against a GCS emulator.',
+    ]);
+  });
+
+  it('ignores CACHE_GCS_API_ENDPOINT on Cloud Run, with an error', async () => {
+    storageConstructorOptions.length = 0;
+    process.env.CACHE_GCS_API_ENDPOINT = 'http://localhost:4443';
+    process.env.K_SERVICE = 'site-env';
+    try {
+      const handler = new GcsCacheHandler({} as any);
+      await setWithTags(handler, 'key1', ['posts']);
+    } finally {
+      delete process.env.CACHE_GCS_API_ENDPOINT;
+      delete process.env.K_SERVICE;
+    }
+
+    expect(storageConstructorOptions).toHaveLength(2);
+    for (const options of storageConstructorOptions) {
+      expect(options).not.toHaveProperty('apiEndpoint');
+    }
+    const errors = vi.mocked(console.error).mock.calls.map(([m]) => String(m));
+    expect(errors.filter((m) => m.includes('CACHE_GCS_API_ENDPOINT'))).toEqual([
+      '[GcsJsonObject] CACHE_GCS_API_ENDPOINT is ignored on Cloud Run (K_SERVICE is set): it is for tests ' +
+        'against a GCS emulator, and requests to it would carry no credentials. Using GCS. Unset it.',
+    ]);
+  });
+
   it('replaces an unparseable mapping instead of failing forever', async () => {
     mockFile.getMetadata.mockResolvedValue([{ generation: '5' }]);
     mockFile.download.mockResolvedValue([Buffer.from('{not json')]);
@@ -1049,12 +1132,18 @@ describe('GcsCacheHandler build invalidation on a cold start', () => {
   });
 
   it('runs the check once even when several handlers are constructed concurrently', async () => {
+    const job = statefulCleanupJob();
     new GcsCacheHandler({} as any);
     new GcsCacheHandler({} as any);
     new GcsCacheHandler({} as any);
     await new Promise((r) => setTimeout(r, 50));
+    await waitForRouteCacheCleanupsForTests();
 
-    const routeCacheWipes = mockBucket.getFiles.mock.calls.filter(([args]) => args.prefix === 'route-cache/');
-    expect(routeCacheWipes).toHaveLength(1);
+    // One job recorded, and one clean-up: a listing to delete, then one to prune the tags map.
+    const created = job.save.mock.calls.filter(([data]) => JSON.parse(data as string).totals?.runs === 0);
+    expect(created).toHaveLength(1);
+    const routeCacheListings = mockBucket.getFiles.mock.calls.filter(([args]) => args.prefix === 'route-cache/');
+    expect(routeCacheListings).toHaveLength(2);
+    expect(job.delete).toHaveBeenCalledTimes(1);
   });
 });

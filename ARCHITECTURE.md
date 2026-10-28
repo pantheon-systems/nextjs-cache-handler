@@ -24,7 +24,7 @@ flowchart LR
   end
   inst1 -.-> proc
 
-  subgraph gcs["GCS bucket (prefix: '' for live, environments/ENV/ otherwise)"]
+  subgraph gcs["GCS bucket (prefix: '' for live or when PANTHEON_ENVIRONMENT is unset, environments/ENV/ otherwise)"]
     route["route-cache/KEY.json<br/>pages, route handlers<br/>stamped with their generation"]
     fetchc["fetch-cache/KEY.json<br/>fetch, unstable_cache"]
     image["image-cache/KEY.json"]
@@ -57,7 +57,9 @@ flowchart LR
   ahead of this instance's clock is recorded as now: Next.js 15 expires every entry older than
   the timestamp, with no check that it has passed. A time older than the one recorded leaves the
   recorded one in place, so entries it expired stay expired.
-- `get()` returns a miss for an entry carrying a tag revalidated after the entry was written. For
+- `get()` returns a miss for an entry carrying a tag that expired after the entry was written (on
+  Next.js 16 a soft `revalidateTag(tag, profile)` only marks it stale, and the entry is served
+  while it regenerates). For
   pages, route handlers and Pages Router entries the tags come from the entry. For `fetch` and
   `unstable_cache` entries on Next.js 15 they are the fetch's tags plus the requesting route's
   implicit tags, from `ctx`. Next.js 16 checks fetch entries itself, but Next.js 15 leaves that
@@ -70,11 +72,11 @@ flowchart LR
   default). A memory hit skips the GCS round trip but goes through the same tag and revalidate
   expiry checks.
 - Build-time prerendered pages are not in GCS. They are served from `.next/server` when GCS
-  misses (`base.ts:450`), and their tags are indexed per process from the build output
+  misses (`getBuildPrerender` in `base.ts`), and their tags are indexed per process from the build output
   (`loadBuildPrerenderTags`), never written to `tags.json`.
 - The CDN caches whatever `Cache-Control` Next sends (for a static page, `s-maxage=31536000`); the
   handler never changes that header. Before its `s-maxage` runs out, only a purge makes the CDN
-  drop an entry. Nothing ties a CDN entry to the GCS entry it came from.
+  drop an entry. A CDN entry is not linked to the GCS entry it came from.
 - `KEY` in an object name is the cache key itself when it has only `[a-zA-Z0-9-]` (fetch and image
   keys) and at most 200 characters. Any other key is sanitized to those characters, cut to fit,
   and suffixed with `_` and a hash of the full key (`src/utils/object-names.ts`), so keys that
@@ -98,7 +100,7 @@ sequenceDiagram
   else CDN miss
     CDN->>B: GET /blog/x
     B->>B: ensureInitialized() (build check once per process, see 5)
-    B->>G: re-read revalidations.json if older than 1 s (wait ≤ 2 s, shared deadline)
+    B->>G: once a second, read revalidations.json's metadata, and download it only if its generation changed (wait ≤ 2 s, shared deadline)
     B->>B: apply revalidations to tagsManifest
     B->>G: read route-cache/KEY.json
     alt GCS hit, tags not expired
@@ -156,18 +158,20 @@ sequenceDiagram
   B->>P: PURGE paths in servedAt newer than the revalidation (started inside the request that read it, not awaited)
   P->>CDN: purge (drops the old copy B put back)
 
-  Note over A: DelayedPurges: due one refresh interval + up to 1 s after the first purge (2 s by default), fired ≤ 1 s later so purges due close together go as one
+  Note over A: DelayedPurges: due one refresh interval + up to 1 s after the first purge (2 s by default). The timer fires 1 s after the earliest due one and sends every purge due by then, so purges due close together go as one
   A->>P: SECOND PURGE (backstop): same keys and paths, merged with other second purges in the window
   P->>CDN: purge
 ```
 
 When an instance learns of a revalidation made elsewhere (`SharedRevalidations.setOnLearned` →
 `purgeServedAfterRevalidation`), it purges only the paths it served from its cache since that
-revalidation, allowing 1 s of clock skew. An instance that served none of them sends nothing, and a
+revalidation, allowing 1 s of clock skew. An instance that served none of them does not send a purge, and a
 `revalidatePath('/', 'layout')` does not make every instance purge the whole site.
 
-Unlike the second purge, this one needs no timer. It starts inside the request whose cache read
-refreshed `revalidations.json`, so it has CPU, and that read does not wait for it to finish.
+Unlike the second purge, this one needs no timer. It usually starts inside the request whose cache
+read refreshed `revalidations.json`, so it has CPU, and that read does not wait for it to finish.
+It can also start from this instance's own `revalidations.json` write, or from a `tags.json` flush
+that runs on the buffer's timer.
 Revalidations that were already stored when an instance's first read of the object finishes are
 skipped. That read usually completes before the instance serves anything, but not always: `get()`
 stops waiting after `REFRESH_WAIT_MS` (2 s) and serves with what it has, and the read keeps going.
@@ -179,11 +183,11 @@ What each step depends on:
 
 | Step | Code | If it fails or is late |
 |---|---|---|
-| Store revalidation | `shared-revalidations.ts`, `base.ts:627` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`gcs.ts:711`). Other instances keep serving the old page until it lands. |
-| Read tags map | `gcs.ts:357` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
-| First purge | `gcs.ts:761` (`purgeTags`), `edge-cache-clear.ts:114` | One request per path, no retry. Inside the request, so it has CPU. |
-| Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `gcs.ts:716` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
-| Second purge | `gcs.ts:697-712`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
+| Store revalidation | `shared-revalidations.ts`, `revalidateTag` in `base.ts` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`whenStored` in `onRevalidateComplete`, `gcs.ts`). Other instances keep serving the old page until the store succeeds. |
+| Read tags map | `readTagsMapping` in `gcs.ts` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
+| First purge | `purgeTags` in `gcs.ts`, `clearPaths` and `clearKeys` in `edge-cache-clear.ts` | One request per path, no retry. Inside the request, so it has CPU. |
+| Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `purgeServedAfterRevalidation` in `gcs.ts` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
+| Second purge | `onRevalidateComplete` in `gcs.ts`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
 
 Pages Router entries carry no tags (Next writes `x-next-cache-tags` only for App Router
 pages and route handlers), so no tag finds them and these purges include no data routes or
@@ -192,7 +196,7 @@ purge (section 4).
 
 `use cache` entries are invalidated separately: Next calls the `use cache` handler's `updateTags`
 (Next.js 16) or `expireTags` (Next.js 15, which calls `updateTags`), which writes
-`use-cache/_tags.json` timestamps (`use-cache/gcs.ts:603`). It ignores `durations`, so a soft
+`use-cache/_tags.json` timestamps (`updateTags` in `use-cache/gcs.ts`). It ignores `durations`, so a soft
 `revalidateTag(tag, profile)` expires `use cache` entries at once. That handler sends no
 CDN purges for tags; the route handler's purge above covers the pages.
 
@@ -212,14 +216,14 @@ Other instances' `use cache` reads see the invalidation two ways:
 ```mermaid
 flowchart TB
   subgraph triggers["Triggers"]
-    t1["revalidateTag / revalidatePath<br/>onRevalidateComplete, gcs.ts:677"]
-    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts:787"]
-    t3["tags.json flush finds keys whose tag<br/>was revalidated before they landed<br/>purgeMissedRevalidations, gcs.ts:163"]
-    t4["New generation on first request<br/>route handler: base.ts:264 → gcs.ts:495"]
-    t5["New generation on first request,<br/>or getUseCacheStats()<br/>use cache handler: use-cache/gcs.ts:176"]
-    t6["clearSharedCache(), if it deleted entries<br/>gcs.ts:1003"]
-    t8["Another instance's revalidation is read<br/>purgeServedAfterRevalidation, gcs.ts:716"]
-    t7["Public API: clearEdgeCachePaths()<br/>clearEdgeCache(), index.ts"]
+    t1["revalidateTag / revalidatePath<br/>onRevalidateComplete, gcs.ts"]
+    t2["ISR regeneration stores a route<br/>onRouteCacheSet, gcs.ts"]
+    t3["tags.json flush finds keys whose tag<br/>was revalidated before they were written to tags.json<br/>purgeMissedRevalidations, gcs.ts"]
+    t4["New generation, before the first cache read or write<br/>route handler: checkBuildInvalidation, base.ts → invalidateRouteCache, gcs.ts"]
+    t5["New generation, checked when the handler is constructed (requests wait for it),<br/>or getUseCacheStats()<br/>use cache handler: checkBuildInvalidation, use-cache/gcs.ts"]
+    t6["clearSharedCache(), if it deleted entries<br/>gcs.ts"]
+    t8["Another instance's revalidation is read<br/>purgeServedAfterRevalidation, gcs.ts"]
+    t7["Public API: clearEdgeCachePaths(),<br/>clearEdgeCache(), index.ts"]
   end
 
   t1 -- "first purge, awaited" --> keysPaths["clearKeys(tags) + clearPaths(paths)<br/>or nukeCache()"]
@@ -228,10 +232,12 @@ flowchart TB
   t3 -- "re-purge, timer" --> dp
   dp --> keysPaths
   t2 -- "background" --> paths1
-  t4 -- "awaited before serving, sent even if the route-cache wipe fails" --> nuke["nukeCache()"]
+  t4 -- "awaited before serving; retried by the background clean-up (up to 5 runs, about 1, 2, 4, 8 and 16 min after the failure) if it fails" --> nuke["nukeCache()"]
   t5 -- "awaited before serving" --> nuke
   t6 -- "background" --> nuke
   t7 --> keysPaths
+  t7 -- "clearEdgeCache()" --> nuke
+  keysPaths -- "nukeCache() (full purges)" --> one
   t8 -- "background, only paths this process served" --> paths1
 
   keysPaths --> fan["One DELETE per path / key,<br/>all at once (Promise.all),<br/>5 s timeout each, no retry"]
@@ -249,7 +255,7 @@ Request shapes (`edge-cache-clear.ts`):
 | Key (tag) | `DELETE /rest/v0alpha1/cache/keys/<seg>` | `encodeURIComponent` twice |
 | Full | `DELETE /rest/v0alpha1/cache` | – |
 
-Path requests per ISR regeneration (`onRouteCacheSet`, `gcs.ts:787`), one `DELETE` each:
+Path requests per ISR regeneration (`onRouteCacheSet` in `gcs.ts`), one `DELETE` each:
 
 | Entry | Paths purged | Requests |
 |---|---|---|
@@ -265,10 +271,10 @@ as `/what?`) and with the trailing slash Next serves. `clearEdgeCachePaths()` ap
 same trailing-slash rule to the paths a caller passes and also drops any query string or
 fragment, since the CDN keys a page by its path alone.
 
-What gets grouped today: paths are deduplicated per revalidation (`gcs.ts:747`) and per
+What gets grouped today: paths are deduplicated per revalidation (`purgeTarget` in `gcs.ts`) and per
 `clearPaths` call, and second purges due within 1 s of each other are merged per target
-(`delayed-purges.ts`). Nothing else is merged across calls. Nothing limits requests in
-flight or per second either; per-tenant limits are left to the platform.
+(`delayed-purges.ts`). Other purges are not merged across calls, and requests in flight or per
+second are not limited either; per-tenant limits are left to the platform.
 
 ## 5. Deploys (new generation)
 
@@ -282,38 +288,49 @@ sequenceDiagram
 
   N->>N: generation = BUILD_ID[:deploymentId]<br/>(fallback-NOW if neither .next/BUILD_ID nor a build ID in .next/build-manifest.json is readable from the working directory)
   alt generation is fallback-*
-    N->>N: warn and skip the check (nothing read, deleted, purged or written)
+    N->>N: warn and skip the check (it does not read, delete, purge or write anything)
   end
   N->>G: read build-meta.json
   alt generation differs (or the stored metadata is not valid JSON)
-    N->>G: delete route-cache/* one listed page (1,000) at a time, at most CACHE_INVALIDATION_DELETE_CONCURRENCY (50) in flight; skipped with CACHE_BUILD_INVALIDATION=off. Transient failures are retried (listing twice, deletes once); what still fails is logged with the fix, not thrown. Objects left behind are never served (route entries are stamped with their generation; another generation's is a miss)
-    N->>P: full purge (awaited, before serving), even if deletes failed
+    N->>P: full purge (awaited, before serving)
     P->>CDN: purge everything
-    N->>G: remove route keys (starting with /) from tags.json through the tags buffer (conditional write, merged with other instances); fetch keys stay. Skipped if build-meta.json, read again first, already records this generation (or cannot be read): another instance finished its check, so it may be serving this build, whose keys share their paths with the previous build's
+    N->>G: create route-cache-cleanup.json for this generation (conditional write, left alone if it is already this generation's, replaced if another's), noting a failed purge as purgePending, first retried 1 min later (on an existing job too, with a fresh count of retries). A job for this generation created before the replaced build was recorded was left by an earlier deploy of the same build (a rollback to a version that ignores the job, then a redeploy), and is replaced
     N->>G: prune revalidations.json to those since the previous build was built, deleting fetch-cache entries under the pruned tags first (background, skipped if the previous build-meta.json has no builtAt)
     N->>G: write build-meta.json
   else build-meta.json missing
     N->>G: write build-meta.json (no wipe, no purge)
   else build-meta.json cannot be read
-    N->>N: nothing written, the next handler runs the check again
+    N->>N: build-meta.json is not written, and the next handler runs the check again
   end
-  Note over N,G: The use cache handler checks use-cache/_build-meta.json the same way and sends its own full purge, so a deploy sends two full purges per starting process. It deletes no entries (each records its generation, and one from another generation is deleted when read), rewrites _build-meta.json on every start, and retries the check on its next read or write when the file cannot be read.
+  Note over N: Requests are served from here on. The rest runs in the background, after a new generation and on every start whose generation is current (and again at most once a minute on route-cache reads)
+  opt route-cache-cleanup.json exists for this generation, and its lock is free or expired
+    N->>G: take the lock (conditional write: owner, expiresAt = now + 60 s), read it back
+    N->>P: full purge again if purgePending and purgeRetryAt has passed (1 min after the failed purge, then 1, 2, 4 and 8 min after each failed retry, and a job with only the purge left is not locked until then). Give up with an error after 5 runs that tried. An instance without OUTBOUND_PROXY_ENDPOINT drops it with a warning
+    N->>G: delete route-cache/* one listed page (1,000) at a time from the recorded cursor, at most CACHE_INVALIDATION_DELETE_CONCURRENCY (50) in flight, skipping objects stamped with this generation. Each delete has ifGenerationMatch on the listed version. Skipped with CACHE_BUILD_INVALIDATION=off
+    N->>G: after each page is listed (before its deletes) and after each page is done, stop if the job's GCS generation changed or the job is gone (taken over, finished, or replaced by a newer deploy), unless it is still this generation's job (another instance noted a failed purge on it: kept, and the job stays owed for a later run). A newer deploy replaces the job before any of its instances serves, so a listed page holding its entries is not deleted from. Every 15 s, also checked after each batch of deletes, renew the lock and record the cursor and totals, and at most every 5 min, log the progress
+    N->>G: unless route-cache-cleanup-removals.json already holds this job's removals (same generation and job createdAt, saved by an earlier run that stopped part-way), read tags.json's route keys (starting with /), list route-cache/ again, and as each page arrives decide to remove the keys whose object is not this generation's. Fetch keys stay. Save the decisions, with each object's GCS generation at the time, to route-cache-cleanup-removals.json, written only over the version read at the start of the prune. If another run of this job saved its decisions first, use those, whose removals may already be stored
+    N->>G: queue the removals through the tags buffer and flush. They count as stored when no tags.json write failed during the flush and no updates were dropped (removals whose write fails are unqueued, so a later write does not store them). Once stored, list route-cache/ again and add back, with the tags each entry holds, the removed keys whose object is now this generation's or has a different GCS generation than at the decision (cached after its key was decided, by this build or by a newer one that replaced the job), and flush. A run that loses the job after its removals are stored still adds back before stopping, since its removals may have been written to tags.json after the new holder's add-back. A run that stops before the add-back is stored leaves the saved removals for the next run. Once the job is marked pruned, route-cache-cleanup-removals.json is deleted if it still holds this job's removals, at the GCS generation read
+    N->>G: delete route-cache-cleanup.json (ifGenerationMatch) and log the totals, or, if the purge is still owed, release the lock and leave the job for a later run
+  end
+  Note over N,G: The use cache handler checks use-cache/_build-meta.json when it is constructed and sends its own full purge, so a process that starts before both metadata files record the new build sends two full purges (_build-meta.json is rewritten right after its purge, so its window is shorter). Unlike the route handler it has no fallback-* skip, so a process whose build ID can't be read purges the whole CDN on every start and on every getUseCacheStats() call. It deletes no entries (each records its generation, and one from another generation is deleted when read), rewrites _build-meta.json on every start, and retries the check on its next read or write when the file cannot be read.
 ```
 
 The check runs once per process, and any difference counts as a new generation, not only a newer
-one. Every process that starts before `build-meta.json` holds its generation wipes and purges.
-Several wiping at once is wasted work but safe: memory is bounded by the page size and the
-concurrency limit, and an object another process already deleted (404) counts as deleted. A
-process that dies part-way keeps what it deleted, and since `build-meta.json` is written last, the
-next process to start sees the new build again and deletes only what is left.
+one. Every process that starts before `build-meta.json` holds its generation purges and creates
+the job (the second finds it already there). Only the one holding the job's lock deletes. A
+process that dies after the purge but before `build-meta.json` is written leaves the new build
+undetected, so the next process purges again; one that dies after leaves the job, which a later
+instance resumes once the lock expires.
 While two revisions serve at once (a rollout, a traffic split, a rollback), a cold start on either
-one wipes `route-cache/`, purges the CDN and writes its own generation back. Neither revision
+one purges the CDN, replaces the job with its own generation's and writes its own generation back;
+the instance working on the other generation's job stops before it deletes from the next page it lists. Neither revision
 serves the other's route entries (each is stamped with its generation), so the two overwrite each
 other's entries instead and miss more often until one revision is left. Old-revision instances can
-still serve old pages that the CDN caches after the new revision's purge.
+still serve old pages that the CDN caches after the new revision's purge. A revision older than
+0.14.0 ignores the job and deletes all of `route-cache/` before serving, as before.
 
 A process that falls back to `fallback-<Date.now()>` has a generation no other process shares,
-so each such cold start would wipe `route-cache/` and fully purge the CDN. The check is skipped
+so each such cold start would fully purge the CDN and start a clean-up of `route-cache/`. The check is skipped
 for such a generation instead, with a warning, and `build-meta.json` is left as it is. Such a
 process can't detect a deploy, and it serves route entries whatever generation they carry (its own
 is unique, so it would otherwise never hit).
@@ -322,20 +339,25 @@ is unique, so it would otherwise never hit).
 
 | Gap | Effect | Where it is tracked |
 |---|---|---|
-| Second and background purges run on timers | Late under request-based CPU; lost on shutdown without `flushSharedTagsMapping()`. Even with it, a second purge whose revalidation is stored only during the flush, and a `tags.json`-flush purge (`purgeMissedRevalidations`) that is already due, are started but not awaited. The purge each instance sends when it learns of a revalidation covers most of this | README "Revalidations across processes" |
+| Second and background purges run on timers | Late under request-based CPU; lost on shutdown without `flushSharedTagsMapping()`. Even with it, a second purge whose revalidation is stored only during the flush is sent only if the purge flush has not yet taken its batch; otherwise it stays on the unref'd timer and is lost. A `tags.json`-flush purge (`purgeMissedRevalidations`) that is already due is started but not awaited. The purge each instance sends when it learns of a revalidation covers most of this | README "Revalidations across processes" |
 | Revalidation first seen on an instance's first read of `revalidations.json` | That instance sends no purge for pages it served before, or while, its first read was in flight (`get()` serves after 2 s without waiting for the read to finish). Only the second purge covers them | – |
-| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path in `base.ts:474`, not on the prerender return at `base.ts:453`. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
+| Build-prerender hits are not recorded in `servedAt` | `onServed` runs only on the GCS-hit path of `get()` in `base.ts`, not when it returns a build prerender. An instance that serves an old prerendered page before it learns of the revalidation skips that page in its own purge, and only the timer-based second purge covers it | – |
 | `use cache` tag reload is background | A tag revalidated on another instance can be missed by this instance's `use cache` reads for up to about one refresh interval plus the reload's GCS round trip (see below) | README `CACHE_TAGS_REFRESH_INTERVAL_MS` |
 | GCS stall longer than the second-purge delay | An instance still serving without the revalidation can re-cache the old page after the last purge | – |
-| Route-cache wipe fails part-way | Deletes or a listing that still fail after their retries are logged (counts by status, the fix) and the purge still runs. The objects left over are never served, since their generation stamp differs, but take up storage until a later deploy deletes them; with a permission problem every deploy fails the same way | – |
-| Route keys removed from `tags.json` race other instances | A new-build instance that already finished its wipe can set a key that a slower instance, still wiping, then removes. Only CDN purges on revalidation use the map, and the key is added back the next time that entry is set. The same window lets the slower instance delete the new entry itself (section 5) | – |
-| Requests wait for the route-cache wipe | A process's first cache read or write waits for the whole delete. That time grows with the number of objects in `route-cache/`; `CACHE_INVALIDATION_DELETE_CONCURRENCY` shortens it | – |
-| `build-meta.json` write fails | The check is retried by the next handler, so each request wipes `route-cache/` and purges the CDN again until a write succeeds | – |
-| Two revisions serving at once | Cold starts on either revision wipe and fully purge in turn, and the CDN can cache old instances' pages after the new revision's purge. Each revision misses on the other's route entries rather than serving them (section 5) | – |
-| GCS read and write failures | A failed read is a silent miss, so the page re-renders. A failed write is logged, but `set()` still records the tags and sends the ISR purge for an entry that was not stored | – |
+| Route-cache delete fails part-way | Deletes that still fail after their retry are counted and logged when the job finishes (counts by status, the fix); the next deploy deletes them. A listing that still fails releases the lock with the cursor, and a later instance resumes. Objects left over are never served, since their generation stamp differs, but take up storage meanwhile; with a permission problem every deploy fails the same way | – |
+| Route keys added back after the prune | An entry that can't be read when its key is added back is logged as a warning, and a later run does not retry it. Until that page is cached again, revalidating its tags does not purge it from the CDN. An add-back that is not stored stops the run, and the next run retries it from the saved removals | – |
+| Route keys missing during the prune | The prune runs while the new build serves. A key whose page the new build cached after its removal was decided is out of `tags.json` from when the removals are stored until the add-back listing of `route-cache/` reaches it and is flushed, which with a large bucket or throttled CPU can take minutes. Revalidating its tags meanwhile purges the tags as CDN keys but not that page's path | – |
+| Prune holder replaced mid-prune | A holder that stalls past the 60 s lock while writing its removals can store them after the new holder added keys back. It adds back itself before stopping; if that listing fails or the process stops first, those pages lose their keys until cached again | – |
+| Background delete under request-based CPU | Cloud Run throttles CPU between requests, so the delete only moves forward while requests arrive. On a site that scales to zero the job waits for the next request; old objects take up storage meanwhile, but are not served | – |
+| Clean-up totals after a crash | A run that stops without releasing the lock (process killed) loses the counts since its last renewal, about 15 s of work, so the final totals undercount deletes | – |
+| A failed prune write also unqueues requests' removals | When a `tags.json` write carrying the prune's removals fails, the prune unqueues its removals. A request's own removal of the same key, queued in the same process, is unqueued with them, so that key stays in `tags.json` pointing at a deleted entry. Revalidating its tags then sends one extra purge for that path | – |
+| Clean-up lists `route-cache/` three times | The delete, the prune's decisions and the add-back each list every object. The deletes take most of the run time, but under throttled CPU each listing adds to how long the lock must be held | – |
+| `build-meta.json` write fails | The check is retried by the next handler, so each request purges the CDN again (the job already exists, so the delete is not started again) until a write succeeds. The clean-up then starts only from route-cache reads, at most once a minute | – |
+| Two revisions serving at once | Cold starts on either revision replace the clean-up job and fully purge in turn, so each deletes the other's entries and the CDN can cache old instances' pages after the new revision's purge (section 5) | – |
+| GCS read and write failures | A failed read is a silent miss, so the page is served from its build prerender if it has one, and re-rendered otherwise. A failed write is logged, but `set()` still records the tags and sends the ISR purge for an entry that was not stored | – |
 | Pending `tags.json` additions dropped | After 10 minutes of failed flushes, or at shutdown without `flushSharedTagsMapping()`, the keys are dropped and later revalidations of their tags don't purge those pages | README "How the mapping is written to GCS" |
 | `tags.json` loses route keys only at a deploy | Within one build, every URL cached adds keys (including junk URLs and case variants), so the object grows until the next deploy, and every revalidation downloads all of it | – |
-| Build ID unreadable (`fallback-*`) | The process skips the build check, so a deploy neither wipes nor purges for it, and it serves route entries from any generation. Logged as a warning on every start | – |
+| Build ID unreadable (`fallback-*`) | The route handler skips the build check (warning on every start): a deploy neither deletes nor purges for it, and it serves route entries from any generation. The `use cache` handler has no such skip: it purges the whole CDN and rewrites `_build-meta.json` on every start and `getUseCacheStats()` call, and other processes delete its entries when they read them | – |
 | `revalidations.json`, `use-cache/_tags.json` keep growing | `revalidations.json` is pruned only at a deploy, and never when the previous build recorded no `builtAt`. `_tags.json` and each process's tag timestamps are never pruned. Old-generation `use cache` objects are deleted only when read | README "How long revalidations are kept" (revalidations.json only) |
 | `use cache` tag write fails | `updateTags()` still resolves. The retry runs on an unref'd timer that `flushSharedTagsMapping()` does not flush, so it can be late or lost | – |
 | Some full-purge failures leave no trace | `nukeCache()` does not log, and the full purge for `revalidatePath('/', 'layout')` and second full purges ignore its result | – |

@@ -98,6 +98,7 @@ export class TagsBuffer {
   /** When the oldest currently-pending update was queued. */
   private oldestPendingSince = 0;
   private droppedUpdatesTotal = 0;
+  private failedFlushesTotal = 0;
 
   constructor(config: TagsBufferConfig) {
     this.flushIntervalMs = config.flushIntervalMs ?? DEFAULT_TAGS_FLUSH_INTERVAL_MS;
@@ -167,9 +168,37 @@ export class TagsBuffer {
     return this.pendingCount > 0;
   }
 
+  /** Unqueue removals of these keys not yet written. */
+  cancelDeletes(cacheKeys: string[]): void {
+    for (const cacheKey of cacheKeys) {
+      this.pending.deletes.delete(cacheKey);
+    }
+    if (!this.hasPending) {
+      this.oldestPendingSince = 0;
+    }
+  }
+
+  /** Whether a removal of `cacheKey` is queued and not yet written. */
+  isDeletePending(cacheKey: string): boolean {
+    return this.pending.deletes.has(cacheKey);
+  }
+
+  /** Whether an addition for `cacheKey` is queued and not yet written. */
+  isAddPending(cacheKey: string): boolean {
+    return this.pending.adds.has(cacheKey);
+  }
+
   /** Total updates dropped after exceeding maxPendingAgeMs (see onFlushFailure). */
   get droppedUpdates(): number {
     return this.droppedUpdatesTotal;
+  }
+
+  /**
+   * Total flushes whose read or write failed. A flush() call during which this
+   * count does not change wrote everything queued when the call started.
+   */
+  get failedFlushes(): number {
+    return this.failedFlushesTotal;
   }
 
   private markPending(): void {
@@ -313,7 +342,7 @@ export class TagsBuffer {
     this.nextFlushTime = now + this.nextInterval();
 
     if (this.consecutiveFailures > 0) {
-      this.log.warn(`Tags mapping write recovered after ${this.consecutiveFailures} failed attempt(s)`);
+      this.log.warn(`Tags mapping flush recovered after ${this.consecutiveFailures} failed attempt(s)`);
       this.consecutiveFailures = 0;
     }
 
@@ -323,6 +352,7 @@ export class TagsBuffer {
   }
 
   private onFlushFailure(error: unknown): void {
+    this.failedFlushesTotal++;
     this.consecutiveFailures++;
     const code = getErrorStatusCode(error);
     const reason = code === 429 ? 'rate limited (429)' : code ? `HTTP ${code}` : 'error';
@@ -330,14 +360,16 @@ export class TagsBuffer {
     const pendingForMs = Date.now() - this.oldestPendingSince;
     if (pendingForMs > this.maxPendingAgeMs) {
       const dropped = this.pendingCount;
+      const failures = this.consecutiveFailures;
       this.pending = emptyBatch();
       this.droppedUpdatesTotal += dropped;
       this.consecutiveFailures = 0;
       this.oldestPendingSince = 0;
       this.nextFlushTime = Date.now() + this.nextInterval();
       this.log.error(
-        `Dropping ${dropped} pending tag update(s): writes have failed for ${Math.round(pendingForMs / 1000)}s ` +
-          `(last: ${reason}). Revalidating tags may not purge the CDN for the affected pages.`,
+        `Dropping ${dropped} pending tag update(s): the oldest was queued ` +
+          `${Math.round(pendingForMs / 1000)}s ago and the flush failed again (${reason}, ` +
+          `${failures} failed attempt(s)). Revalidating tags may not purge the CDN for the affected pages.`,
         error
       );
       return;
@@ -348,14 +380,15 @@ export class TagsBuffer {
 
     if (this.consecutiveFailures === 1) {
       this.log.warn(
-        `Tags mapping write failed (${reason}); ${this.pendingCount} update(s) pending, retrying in ${delay}ms. ` +
+        `Tags mapping flush (read or write) failed (${reason}); ${this.pendingCount} update(s) pending, ` +
+          `retrying in ${delay}ms. ` +
           `Repeated 429s mean more instances are writing than the flush interval absorbs ` +
           `(raise CACHE_TAGS_FLUSH_INTERVAL_MS).`,
         error
       );
     } else {
       this.log.debug(
-        `Tags mapping write failed again (${reason}, attempt ${this.consecutiveFailures}), retrying in ${delay}ms`
+        `Tags mapping flush failed again (${reason}, attempt ${this.consecutiveFailures}), retrying in ${delay}ms`
       );
     }
   }

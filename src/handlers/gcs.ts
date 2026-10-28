@@ -46,12 +46,18 @@ import { isBuildPhase } from '../utils/build-detection.js';
 import { toObjectName } from '../utils/object-names.js';
 import { DelayedPurges, type DelayedPurge } from '../utils/delayed-purges.js';
 import {
+  MAX_PURGE_RUNS,
+  RouteCacheCleanup,
+  createCleanupJob,
+  type CleanupTagsMap,
+} from '../utils/route-cache-cleanup.js';
+import {
   DEFAULT_DELETE_CONCURRENCY,
-  ListPrefixError,
   deletePrefix,
   describeFailures,
   errorLabel,
   errorMessage,
+  isDenied,
   listPrefixPages,
   mapInBatches,
   resolveBuildInvalidationMode,
@@ -110,6 +116,9 @@ const FETCH_DELETE_BATCH_SIZE = 50;
 // Re-purges once every instance has applied a revalidation, per process.
 const delayedPurges = new DelayedPurges();
 
+// One clean-up runner per (bucket, job object) per process, like the tag buffers.
+const routeCacheCleanups = new Map<string, RouteCacheCleanup>();
+
 /**
  * Whether a route entry stamped with `generation` belongs to the running build.
  * A process that can't read its build ID serves any entry, as before stamping:
@@ -120,18 +129,24 @@ function isCurrentGeneration(generation: unknown): boolean {
   return isFallbackGeneration(current) || generation === current;
 }
 
+/** The generation a route object was written by, from the custom metadata listings return. */
+function routeObjectGeneration(file: File): unknown {
+  return (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation;
+}
+
 /**
  * What an operator can do about failed deletes or listings, from their error
  * labels (see errorLabel): grant delete permission, or ease throttling.
  */
 function deleteFailureHints(bucketName: string, labels: string[]): string[] {
   const hints: string[] = [];
-  if (labels.some((label) => label === '401' || label === '403')) {
+  if (isDenied(labels)) {
     hints.push(
       `Permission denied: the service account needs storage.objects.delete and storage.objects.list on gs://${bucketName}.`
     );
   }
-  if (labels.some((label) => label !== '401' && label !== '403' && !/^4\d\d$/.test(label))) {
+  // 429 is throttling; other 4xx are not, and a lower concurrency does not help them.
+  if (labels.some((label) => label === '429' || !/^4\d\d$/.test(label))) {
     hints.push(
       `GCS throttled or was unavailable after retries; a lower CACHE_INVALIDATION_DELETE_CONCURRENCY ` +
         `(now ${resolveDeleteConcurrency()}) reduces throttling.`
@@ -264,6 +279,14 @@ export async function flushGcsTagsMapping(options: FlushTagsMappingOptions = {})
 }
 
 /**
+ * Wait for the route cache clean-ups running in this process.
+ * @internal Test hook.
+ */
+export async function waitForRouteCacheCleanupsForTests(): Promise<void> {
+  await Promise.all([...routeCacheCleanups.values()].map((cleanup) => cleanup.current));
+}
+
+/**
  * Drop the process-wide tag buffers and storage clients.
  * @internal Test hook.
  */
@@ -273,6 +296,7 @@ export function resetGcsSharedState(): void {
   }
   sharedTagsBuffers.clear();
   delayedPurges.reset();
+  routeCacheCleanups.clear();
   servedAt.clear();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
@@ -290,6 +314,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
   private readonly routeCachePrefix: string;
   private readonly imageCachePrefix: string;
   private readonly buildMetaKey: string;
+  private readonly cleanupJobKey: string;
+  private readonly cleanupRemovalsKey: string;
+  private readonly cleanup: RouteCacheCleanup;
   private readonly tagsPrefix: string;
   private readonly tagsMapKey: string;
   private readonly edgeCacheClearer: EdgeCacheClear | null;
@@ -316,6 +343,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.routeCachePrefix = `${envPrefix}route-cache/`;
     this.imageCachePrefix = `${envPrefix}image-cache/`;
     this.buildMetaKey = `${envPrefix}build-meta.json`;
+    // Outside route-cache/, so the clean-up's own listing never includes it.
+    this.cleanupJobKey = `${envPrefix}route-cache-cleanup.json`;
+    this.cleanupRemovalsKey = `${envPrefix}route-cache-cleanup-removals.json`;
     this.tagsPrefix = `${envPrefix}cache/tags/`;
     this.tagsMapKey = `${this.tagsPrefix}tags.json`;
 
@@ -335,9 +365,35 @@ export class GcsCacheHandler extends BaseCacheHandler {
       revalidations.setOnLearned((tags) => this.purgeServedAfterRevalidation(tags));
     }
 
+    this.cleanup = this.getSharedCleanup();
+
     // Initialize asynchronously (constructors can't be async) -- stored via
     // setInitPromise() so get()/set() can await it before touching the store.
     this.setInitPromise(this.initialize().catch(() => {}));
+  }
+
+  /** The process's clean-up runner; the first handler's clearer and tags buffer do the work. */
+  private getSharedCleanup(): RouteCacheCleanup {
+    const key = `${this.bucketName}/${this.cleanupJobKey}`;
+    let cleanup = routeCacheCleanups.get(key);
+    if (!cleanup) {
+      const { edgeCacheClearer } = this;
+      cleanup = new RouteCacheCleanup({
+        bucket: this.bucket,
+        jobBucket: this.tagsBucket,
+        jobKey: this.cleanupJobKey,
+        removalsKey: this.cleanupRemovalsKey,
+        prefix: this.routeCachePrefix,
+        generationOf: routeObjectGeneration,
+        concurrency: () => resolveDeleteConcurrency(),
+        purge: edgeCacheClearer ? async () => (await edgeCacheClearer.nukeCache()).success : undefined,
+        tagsMap: this.cleanupTagsMap(),
+        failureHints: (labels) => deleteFailureHints(this.bucketName, labels),
+        log: this.log,
+      });
+      routeCacheCleanups.set(key, cleanup);
+    }
+    return cleanup;
   }
 
   // ============================================================================
@@ -410,6 +466,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected async readCacheEntry(cacheKey: string, cacheType: CacheEntryType): Promise<CacheHandlerValue | null> {
+    // Picks up a clean-up whose instance stopped, at most once per lock
+    // lifetime per process; not awaited. One read, a 404 when there is none.
+    if (cacheType === 'route' && !isBuildPhase() && !isFallbackGeneration(getProcessGeneration())) {
+      void this.cleanup.resume(getProcessGeneration());
+    }
     try {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
       const file = this.bucket.file(gcsKey);
@@ -492,151 +553,130 @@ export class GcsCacheHandler extends BaseCacheHandler {
     });
   }
 
-  protected async invalidateRouteCache(): Promise<void> {
+  /**
+   * Purge the CDN and record that the previous builds' route entries are to be deleted. Requests do
+   * not wait for the delete, which runs in the background (onBuildCurrent): those entries are already
+   * misses (see readCacheEntry). Never throws.
+   */
+  protected async invalidateRouteCache(previous: BuildMeta): Promise<void> {
     const location = `gs://${this.bucketName}/${this.routeCachePrefix}`;
-    if (resolveBuildInvalidationMode() === 'off') {
+    const deleteEntries = resolveBuildInvalidationMode() !== 'off';
+    if (!deleteEntries) {
       this.log.warn(
-        `CACHE_BUILD_INVALIDATION=off: ${location} was not deleted for the new build. Its entries from earlier ` +
+        `CACHE_BUILD_INVALIDATION=off: ${location} is not deleted for the new build. Its entries from earlier ` +
           `builds are not served (they count as cache misses), but stay in storage until a deploy runs without ` +
           `CACHE_BUILD_INVALIDATION=off.`
       );
-    } else {
-      await this.deleteRouteCache(location);
     }
 
-    // Awaited, unlike the background purges elsewhere: this runs
-    // during startup-time build invalidation, which get()/set() now block
-    // on via ensureInitialized() before touching the store. Awaiting here
-    // means the edge purge request has actually been ISSUED (not just
-    // queued) before this process starts serving real traffic that could
-    // otherwise race a still-cached page from the previous build. Bounded
-    // by nukeCache()'s own internal timeout, so this can't hang startup.
-    if (this.edgeCacheClearer) {
-      const result = await this.edgeCacheClearer.nukeCache();
-      if (!result.success) {
-        this.log.error(
-          `Edge cache purge on build invalidation failed: ${result.error}. Pages from the previous build stay ` +
-            `in the CDN until they expire or the site's edge cache is cleared.`
-        );
-      }
-    }
+    // Awaited, so the purge is sent before this process serves a request that
+    // could race a still-cached previous-build page. Bounded by nukeCache()'s
+    // timeout; a failure is recorded on the job and retried in the background.
+    const purge = this.edgeCacheClearer ? await this.edgeCacheClearer.nukeCache() : { success: true };
+    const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
+    const stayInCdn =
+      "pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared.";
 
-    // After the purge, so tags.json traffic can't delay it. Whether or not they
-    // were deleted, the previous build's route entries are no longer served
-    // (see readCacheEntry), so their keys are not needed.
-    await this.removeRouteKeysFromTagsMap();
-  }
-
-  /**
-   * Delete the route cache one page at a time with a bounded number of deletes
-   * in flight. Never throws: failures are logged with how to fix them, and
-   * startup carries on. Objects left behind are never served (see
-   * readCacheEntry), so a failure costs storage, not correctness.
-   */
-  private async deleteRouteCache(location: string): Promise<void> {
-    const leftovers =
-      `The objects left in ${location} are not served (route entries from another build count as cache ` +
-      `misses). Startup continues, and the next deploy deletes them.`;
-    // A permission problem fails every deploy the same way, so the bucket only
-    // grows until someone fixes it; transient failures clean up next deploy.
-    const report = (labels: string[], message: string) => {
-      const denied = labels.some((label) => label === '401' || label === '403');
-      const text = [message, leftovers, ...deleteFailureHints(this.bucketName, labels)].join(' ');
-      if (denied) {
-        this.log.error(text);
-      } else {
-        this.log.warn(text);
-      }
-    };
-
+    // Before the build is recorded, so a process that dies after recording it
+    // still leaves the job for a later instance.
     try {
-      const r = await deletePrefix(this.bucket, this.routeCachePrefix, { concurrency: resolveDeleteConcurrency() });
-      const summary = `Route cache invalidation: deleted ${r.deleted}/${r.listed} objects in ${r.durationMs}ms`;
-      if (r.failed === 0) {
-        // warn, not info: once per deploy, and must be visible without CACHE_DEBUG
-        this.log.warn(summary);
-        return;
-      }
-      report(
-        Object.keys(r.failures),
-        `${summary}; ${r.failed} could not be deleted (${describeFailures(r.failures)}; ` +
-          `first error: ${errorMessage(r.firstError)}).`
-      );
-    } catch (error) {
-      if (error instanceof ListPrefixError) {
-        const p = error.progress ?? { listed: 0, deleted: 0, failed: 0, failures: {} };
-        report(
-          [errorLabel(error.reason), ...Object.keys(p.failures)],
-          `Route cache invalidation stopped: ${error.message}, after deleting ${p.deleted} of the ` +
-            `${p.listed} objects listed so far` +
-            (p.failed ? ` (${p.failed} could not be deleted: ${describeFailures(p.failures)})` : '') +
-            '.'
-        );
-      } else {
-        this.log.error(`Route cache invalidation failed. ${leftovers}`, error);
-      }
-    }
-  }
-
-  /**
-   * Remove the previous build's route keys from the tags map. Nothing else
-   * removes them, so without this the map grows with every URL ever cached,
-   * and each tag revalidation purges the CDN for pages that no longer exist. Fetch keys stay: those entries survive
-   * deploys. Goes through the shared buffer, whose conditional writes merge
-   * with other instances; a key set again after this is kept (deletes apply
-   * before adds). Never throws.
-   *
-   * Skipped when another instance has already recorded this build: it pruned
-   * before recording, and may now be serving and writing this build's keys,
-   * which share their paths with the previous build's. Until the build is
-   * recorded no instance serves it, so no key of this build can be removed,
-   * apart from one written between the check and the flush below.
-   */
-  private async removeRouteKeysFromTagsMap(): Promise<void> {
-    const location = `gs://${this.bucketName}/${this.tagsMapKey}`;
-    let mapping: TagsMapping;
-    try {
-      ({ mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey));
+      await createCleanupJob(this.tagsBucket, this.cleanupJobKey, getProcessGeneration(), {
+        deleteEntries,
+        purgePending: !purge.success,
+        replacedBuildAt: previous.timestamp,
+      });
     } catch (error) {
       this.log.error(
-        `Could not read ${location} to remove the previous build's route keys (${errorLabel(error)}: ` +
-          `${errorMessage(error)}). They stay in it until the next deploy; until then tag revalidations also ` +
-          `purge the CDN for pages that no longer exist.`
+        `Could not record the route cache clean-up in gs://${this.bucketName}/${this.cleanupJobKey} ` +
+          `(${errorLabel(error)}: ${errorMessage(error)}). The previous build's entries in ${location} are not ` +
+          `served, but stay in storage, and their keys in the tags map, until the next deploy.` +
+          (purge.success ? '' : ` ${purgeFailed} It is not retried, so ${stayInCdn}`)
       );
       return;
     }
+    if (!purge.success) {
+      this.log.error(
+        `${purgeFailed} The background clean-up retries it (up to ${MAX_PURGE_RUNS} runs); until then, ` +
+          `pages from the previous build stay in the CDN.`
+      );
+    }
+  }
 
-    // Route keys start with `/`; fetch keys are hashes.
-    const routeKeys = [...new Set(Object.values(mapping).flat())].filter((key) => key.startsWith('/'));
-    if (routeKeys.length === 0) {
-      return;
-    }
-    try {
-      if ((await this.readBuildMeta())?.buildId === getProcessGeneration()) {
-        this.log.info(
-          `Another instance already recorded this build and removed the previous build's route keys from ${location}`
-        );
-        return;
-      }
-    } catch (error) {
-      this.log.warn(
-        `Could not read build metadata to check whether another instance already removed the previous build's ` +
-          `route keys from ${location} (${errorLabel(error)}: ${errorMessage(error)}). They are left in it until ` +
-          `the next deploy, so this build's keys are not removed.`
-      );
-      return;
-    }
-    this.tagsBuffer.deleteKeys(routeKeys);
-    await this.tagsBuffer.flush();
-    if (this.tagsBuffer.hasPending) {
-      // The buffer logged why; it keeps retrying in this process.
-      this.log.warn(
-        `Removing ${routeKeys.length} route keys of the previous build from ${location} failed; it is retried ` +
-          `with the next write of that file, and at the next deploy if this process stops first.`
-      );
-      return;
-    }
-    this.log.warn(`Removed ${routeKeys.length} route keys of the previous build from ${location}`);
+  /** Start, or resume, the pending route cache clean-up in the background. */
+  protected override onBuildCurrent(): void {
+    void this.cleanup.resume(getProcessGeneration(), { force: true });
+  }
+
+  /**
+   * The tags map as the route cache clean-up prunes it: route keys (starting with `/`) by their object's
+   * name. Fetch keys are left out, as fetch entries survive deploys. Removals go through the shared
+   * buffer, whose conditional writes merge with other instances' writes.
+   */
+  private cleanupTagsMap(): CleanupTagsMap {
+    const { tagsBuffer } = this;
+    // The buffer is shared with every request in the process, which may queue
+    // the same keys again, so a prune judges its updates by whether the
+    // flushes failed or dropped updates, not by what is queued afterwards.
+    let removing = new Set<string>();
+    let droppedBefore = 0;
+    return {
+      routeKeysByObject: async () => {
+        const { mapping } = await readTagsSnapshot(this.tagsBucket, this.tagsMapKey);
+        const byObject = new Map<string, string[]>();
+        for (const key of new Set(Object.values(mapping).flat())) {
+          if (typeof key === 'string' && key.startsWith('/')) {
+            const name = this.getCacheKey(key, 'route');
+            byObject.set(name, [...(byObject.get(name) ?? []), key]);
+          }
+        }
+        return byObject;
+      },
+      remove: async (keys) => {
+        removing = new Set(keys);
+        droppedBefore = tagsBuffer.droppedUpdates;
+        tagsBuffer.deleteKeys(keys);
+        await tagsBuffer.flushIfDue();
+      },
+      flush: async () => {
+        const failedBefore = tagsBuffer.failedFlushes;
+        await tagsBuffer.flush();
+        // A failed write leaves them queued (the buffer logged why); a drop
+        // since they were queued may have discarded them.
+        const stored = tagsBuffer.failedFlushes === failedBefore && tagsBuffer.droppedUpdates === droppedBefore;
+        if (!stored) {
+          // Left queued, a later write could store them after another instance
+          // took the job over and added keys back; the next run removes them
+          // again from the saved removals. Additions stay queued.
+          tagsBuffer.cancelDeletes([...removing]);
+        }
+        return stored;
+      },
+      restore: async (keysByObject) => {
+        let queued = 0;
+        const results = await mapInBatches([...keysByObject], resolveDeleteConcurrency(), async ([name, keys]) => {
+          const [data] = await this.bucket.file(name).download();
+          const { tags } = JSON.parse(data.toString()) as { tags?: unknown };
+          const strings = Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : [];
+          for (const key of keys) {
+            tagsBuffer.addTags(key, strings);
+            if (strings.length > 0) {
+              queued++;
+            }
+          }
+        });
+        const failed = results.filter((result) => result.status === 'rejected');
+        if (failed.length > 0) {
+          this.log.warn(
+            `Could not read ${failed.length} route entries to add their keys back to ` +
+              `gs://${this.bucketName}/${this.tagsMapKey} (first: ${errorMessage(
+                (failed[0] as PromiseRejectedResult).reason
+              )}); tag revalidations do not purge the CDN for those pages until they are cached again`
+          );
+        }
+        return queued;
+      },
+      location: `gs://${this.bucketName}/${this.tagsMapKey}`,
+    };
   }
 
   // ============================================================================
@@ -957,7 +997,7 @@ export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
 
   const byGeneration: Record<string, number> = {};
   const routeObjects = await countObjects(bucket, `${envPrefix}route-cache/`, (file) => {
-    const generation = (file.metadata?.metadata as Record<string, unknown> | undefined)?.generation;
+    const generation = routeObjectGeneration(file);
     const key = typeof generation === 'string' ? generation : 'unstamped';
     byGeneration[key] = (byGeneration[key] ?? 0) + 1;
   });
@@ -1042,14 +1082,14 @@ export async function clearSharedCache(): Promise<number> {
 
   try {
     // Clear fetch cache (data cache - always clearable)
-    clearedCount += await clearGcsFetchCache(bucket, bucketName, fetchCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, fetchCachePrefix, 'fetch');
 
     // Clear route cache (skip static routes)
     const routeResult = await clearGcsRouteCache(bucket, bucketName, routeCachePrefix, staticRoutes);
     clearedCount += routeResult.cleared;
 
     // Clear image cache (content-derived, no build/static-route scoping needed)
-    clearedCount += await clearGcsFetchCache(bucket, bucketName, imageCachePrefix);
+    clearedCount += await clearGcsFetchCache(bucket, bucketName, imageCachePrefix, 'image');
 
     // Clear tags mapping
     await clearGcsTagsMapping(bucket, tagsFilePath);
@@ -1071,7 +1111,12 @@ export async function clearSharedCache(): Promise<number> {
   }
 }
 
-async function clearGcsFetchCache(bucket: Bucket, bucketName: string, prefix: string): Promise<number> {
+async function clearGcsFetchCache(
+  bucket: Bucket,
+  bucketName: string,
+  prefix: string,
+  cacheType: 'fetch' | 'image'
+): Promise<number> {
   try {
     const r = await deletePrefix(bucket, prefix, {
       concurrency: resolveDeleteConcurrency(),
@@ -1079,10 +1124,10 @@ async function clearGcsFetchCache(bucket: Bucket, bucketName: string, prefix: st
     });
     logClearFailures(bucketName, prefix, r);
 
-    gcsLog.debug(`Cleared ${r.deleted} fetch cache entries`);
+    gcsLog.debug(`Cleared ${r.deleted} ${cacheType} cache entries`);
     return r.deleted;
   } catch (error) {
-    gcsLog.warn('Error clearing fetch cache:', error);
+    gcsLog.warn(`Error clearing ${cacheType} cache:`, error);
     return 0;
   }
 }

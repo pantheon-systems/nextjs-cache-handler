@@ -32,7 +32,7 @@ export function getSharedStorage(bucketName: string, purpose: StoragePurpose): S
   const key = `${purpose}:${bucketName}`;
   let storage = storageClients.get(key);
   if (!storage) {
-    storage = purpose === 'tags' ? createTagsStorage() : new Storage();
+    storage = purpose === 'tags' ? createTagsStorage() : new Storage(endpointOptions());
     storageClients.set(key, storage);
   }
   return storage;
@@ -41,15 +41,47 @@ export function getSharedStorage(bucketName: string, purpose: StoragePurpose): S
 /** Retries transient errors but not 429: the caller's paced backoff handles those, and the flush must not block on library retries. */
 function createTagsStorage(): Storage {
   return new Storage({
+    ...endpointOptions(),
     retryOptions: {
       retryableErrorFn: (err: ApiError) => RETRYABLE_ERR_FN_DEFAULT(err) && getErrorStatusCode(err) !== 429,
     },
   });
 }
 
+let endpointLogged = false;
+
+/**
+ * CACHE_GCS_API_ENDPOINT points the clients at a GCS emulator, for tests (STORAGE_EMULATOR_HOST can't:
+ * the library builds API and upload URLs from it differently). The library sends requests to a custom
+ * endpoint without credentials, so the setting is ignored on Cloud Run (K_SERVICE is set). Logged once.
+ */
+function endpointOptions(): { apiEndpoint?: string } {
+  const apiEndpoint = process.env.CACHE_GCS_API_ENDPOINT?.trim();
+  if (!apiEndpoint) {
+    return {};
+  }
+  const onCloudRun = Boolean(process.env.K_SERVICE);
+  if (!endpointLogged) {
+    endpointLogged = true;
+    if (onCloudRun) {
+      log.error(
+        'CACHE_GCS_API_ENDPOINT is ignored on Cloud Run (K_SERVICE is set): it is for tests against a GCS ' +
+          'emulator, and requests to it would carry no credentials. Using GCS. Unset it.'
+      );
+    } else {
+      log.warn(
+        `CACHE_GCS_API_ENDPOINT is set: GCS requests go to ${apiEndpoint} without credentials. Set it only ` +
+          `to test against a GCS emulator.`
+      );
+    }
+  }
+  return onCloudRun ? {} : { apiEndpoint };
+}
+
 /** @internal Test hook. */
 export function resetSharedStorageForTests(): void {
   storageClients.clear();
+  endpointLogged = false;
 }
 
 export function getErrorStatusCode(error: unknown): number | undefined {
@@ -113,7 +145,8 @@ export async function readJsonObject<T>(bucket: Bucket, key: string): Promise<Js
       return { value: JSON.parse(data.toString()) as T, generation };
     } catch (error) {
       log.warn(
-        `Object ${key} (generation ${generation}) is not valid JSON; it will be replaced on the next write`,
+        `Object ${key} (generation ${generation}) is not valid JSON; reading it as empty, so its contents ` +
+          `are lost`,
         error
       );
       return { value: null, generation };

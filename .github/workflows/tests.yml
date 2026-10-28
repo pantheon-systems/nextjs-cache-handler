@@ -95,3 +95,21 @@ jobs:
       - name: Run integration tests
         working-directory: ${{ inputs.app }}
         run: npm run test:integration
+
+      # The GCS handler against an emulator, in real `next start` processes:
+      # example/integration/gcs-deploy.test.ts. A step, not a service container,
+      # because the emulator needs `-scheme http` on its command line.
+      - name: Start the GCS emulator
+        run: |
+          docker run -d --name gcs -p 4443:4443 \
+            fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef \
+            -scheme http -port 4443
+          for _ in $(seq 30); do curl -sf http://localhost:4443/storage/v1/b >/dev/null && exit 0; sleep 1; done
+          docker logs gcs
+          exit 1
+
+      - name: Run GCS integration tests
+        working-directory: ${{ inputs.app }}
+        env:
+          CACHE_GCS_API_ENDPOINT: http://localhost:4443
+        run: npm run test:integration -- gcs-deploy

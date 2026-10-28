@@ -24,7 +24,13 @@ vi.mock('../../src/utils/build-detection.js', async (importOriginal) => ({
 
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 import { hasStaleTags, nextMajor } from '../helpers/next-version.js';
-import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
+import {
+  GcsCacheHandler,
+  resetGcsSharedState,
+  flushGcsTagsMapping,
+  waitForRouteCacheCleanupsForTests,
+} from '../../src/handlers/gcs.js';
+import { toObjectName } from '../../src/utils/object-names.js';
 import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
 import { resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
@@ -508,8 +514,9 @@ describe('GcsCacheHandler across instances', () => {
     it("removes the previous build's route keys from tags.json, keeping fetch keys", async () => {
       await deploy();
 
-      // The route key is gone; fetch keys stay (a1b2c3 leaves later, with the revalidation pruning).
-      expect(bucket.json(TAGS_MAP)).toEqual({ old: ['a1b2c3'], recent: ['d4e5f6'] });
+      // The route key is gone and d4e5f6 stays; a1b2c3 leaves with the revalidation
+      // pruning, which also runs in the background.
+      expect(bucket.json(TAGS_MAP)).toEqual({ recent: ['d4e5f6'] });
     });
 
     it('keeps a route key the new build sets after the removal', async () => {
@@ -564,6 +571,277 @@ describe('GcsCacheHandler across instances', () => {
       await deploy();
 
       expect(bucket.json(REVALIDATIONS)).toHaveProperty('older');
+    });
+  });
+
+  describe('deploy hand-over: deleting the route cache in the background', () => {
+    const shared = '/route-cache/APP_PAGE/shared';
+    const old = '/route-cache/APP_PAGE/old';
+    const objectOf = (key: string) => `route-cache/${toObjectName(key)}.json`;
+
+    beforeEach(() => {
+      resetBuildInvalidationCheck();
+      bucket.putJson('build-meta.json', { buildId: 'previous-build', timestamp: 1 });
+      for (const key of [shared, old]) {
+        bucket.putJson(
+          objectOf(key),
+          { value: page(['posts']), lastModified: 1, tags: ['posts'] },
+          {
+            generation: 'previous-build',
+          }
+        );
+      }
+      bucket.putJson(TAGS_MAP, { posts: [shared, old] });
+    });
+
+    afterEach(() => resetBuildInvalidationCheck());
+
+    it('keeps a page, and its tags map key, that the new build caches while the delete waits', async () => {
+      // The clean-up's first listing waits until released.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      const getFiles = bucket.getFiles.bind(bucket);
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        await released;
+        return getFiles(query);
+      });
+
+      // The first request is answered while the delete has not started.
+      expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).toBeNull();
+      expect(bucket.json('build-meta.json')).toMatchObject({ buildId: 'test-build' });
+
+      // A new-build instance caches `shared` again, before the delete reaches it.
+      await newHandler().set(shared, page(['posts']) as any, { tags: ['posts'] } as any);
+      await flushGcsTagsMapping();
+
+      release();
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.has(objectOf(old))).toBe(false);
+      expect(bucket.objects.get(objectOf(shared))?.custom).toEqual({ generation: 'test-build' });
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(await newHandler().get(shared, { kind: 'APP_PAGE' } as any)).not.toBeNull();
+    });
+
+    it('keeps a tags map key whose page another instance caches after the prune lists it', async () => {
+      // The delete pass lists once; the prune's listing is the second. Right after it, another new-build
+      // instance caches `shared`. Its key is already in tags.json (from the previous build), so that
+      // instance's flush does not change tags.json and does not write it.
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.get(objectOf(shared))?.custom).toEqual({ generation: 'test-build' });
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+    });
+
+    it('adds such a key back under the tags the new build gave the page', async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          // The other instance caches `shared` under a new tag, and its flush adds the key there.
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['news']), lastModified: 2, tags: ['news'] },
+            { generation: 'test-build' }
+          );
+          bucket.putJson(TAGS_MAP, { posts: [shared, old], news: [shared] });
+        }
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({ news: [shared] });
+    });
+
+    it('adds such a key back on a later instance when the add-back is not stored before the instance stops', async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        listings++;
+        if (listings === 2) {
+          // Another new-build instance caches `shared` right after the prune listed it; its key is
+          // already in tags.json, so its flush does not write tags.json.
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        if (listings === 3) {
+          // The removals are stored; the write adding `shared` back fails.
+          bucket.failWrites.set(TAGS_MAP, { code: 503, times: 1 });
+        }
+        return result;
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({});
+      expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+      expect(bucket.objects.has('route-cache-cleanup-removals.json')).toBe(true);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('adding back 1 route keys'))).toBe(true);
+
+      // The instance stops with the add-back still queued; a later one finishes the prune.
+      resetGcsSharedState();
+      resetBuildInvalidationCheck();
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(bucket.objects.has('route-cache-cleanup-removals.json')).toBe(false);
+    });
+
+    it("counts the prune as stored when other requests' updates arrive during its write", async () => {
+      // Each tags.json write queues another request's update, so the buffer is never empty after a flush.
+      const real = bucket.file.bind(bucket);
+      let queued = 0;
+      vi.spyOn(bucket, 'file').mockImplementation((name, options) => {
+        const file = real(name, options);
+        if (name !== TAGS_MAP) return file;
+        return {
+          ...file,
+          save: async (data: string, saveOptions?: any) => {
+            await file.save(data, saveOptions);
+            if (++queued <= 2) {
+              await newHandler().set(
+                `/route-cache/APP_PAGE/other-${queued}`,
+                page(['nav']) as any,
+                {
+                  tags: ['nav'],
+                } as any
+              );
+            }
+          },
+        };
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(shared, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect((bucket.json(TAGS_MAP) as Record<string, string[]>).posts ?? []).toEqual([]);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
+    });
+
+    it('counts the add-back as stored when a request caches the same page during its write', async () => {
+      // Right after the prune lists `shared`, another new-build instance caches it (its key is already
+      // in tags.json, so its flush does not write tags.json). The add-back's listing is the third;
+      // during the write that adds the key back, a request on this instance caches `shared` again,
+      // queueing the same key.
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        if (++listings === 2) {
+          bucket.putJson(
+            objectOf(shared),
+            { value: page(['posts']), lastModified: 2, tags: ['posts'] },
+            { generation: 'test-build' }
+          );
+        }
+        return result;
+      });
+      const real = bucket.file.bind(bucket);
+      let recached = false;
+      vi.spyOn(bucket, 'file').mockImplementation((name, options) => {
+        const file = real(name, options);
+        if (name !== TAGS_MAP) return file;
+        return {
+          ...file,
+          save: async (data: string, saveOptions?: any) => {
+            await file.save(data, saveOptions);
+            if (listings >= 3 && !recached) {
+              recached = true;
+              await newHandler().set(shared, page(['posts']) as any, { tags: ['posts'] } as any);
+            }
+          },
+        };
+      });
+      const warn = vi.spyOn(console, 'warn');
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+
+      expect(recached).toBe(true);
+      expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(false);
+      expect(bucket.objects.has('route-cache-cleanup.json')).toBe(false);
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared] });
+    });
+
+    it("unqueues the prune's removals when their write fails, so a later write can't store them", async () => {
+      const getFiles = bucket.getFiles.bind(bucket);
+      let listings = 0;
+      vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+        const result = await getFiles(query);
+        // The prune's deciding listing is the second; the removals' write then fails.
+        if (++listings === 2) bucket.failWrites.set(TAGS_MAP, { code: 503, times: 1 });
+        return result;
+      });
+
+      await newHandler().get(old, { kind: 'APP_PAGE' } as any);
+      await waitForRouteCacheCleanupsForTests();
+      expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+
+      // Writes work again; another instance may have taken the job over by now. The prune's updates are not stored.
+      await flushGcsTagsMapping();
+      expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared, old] });
+    });
+
+    it('does not count the prune as stored when the buffer drops its removals', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const getFiles = bucket.getFiles.bind(bucket);
+        vi.spyOn(bucket, 'getFiles').mockImplementation(async (query) => {
+          await released;
+          return getFiles(query);
+        });
+        await newHandler().get(shared, { kind: 'APP_PAGE' } as any);
+
+        // tags.json writes keep failing, and a fetch entry's update has been waiting longer than the buffer
+        // keeps one. A fetch key, so the prune's removals all queue together and are dropped together.
+        bucket.failWrites.set(TAGS_MAP, { code: 503, times: 100 });
+        const fetched = { kind: 'FETCH', data: { headers: {}, body: '', status: 200, url: '' }, revalidate: 60 };
+        await newHandler().set('a1b2c3', fetched as any, { tags: ['nav'], fetchCache: true } as any);
+        vi.setSystemTime(Date.now() + 11 * 60_000);
+        const warn = vi.spyOn(console, 'warn');
+
+        release();
+        await waitForRouteCacheCleanupsForTests();
+
+        expect(bucket.json(TAGS_MAP)).toEqual({ posts: [shared, old] });
+        expect(bucket.json('route-cache-cleanup.json')).toMatchObject({ deleted: true });
+        expect((bucket.json('route-cache-cleanup.json') as { pruned?: boolean }).pruned).toBeUndefined();
+        expect(warn.mock.calls.some(([m]) => String(m).includes('is not stored yet'))).toBe(true);
+        expect(warn.mock.calls.some(([m]) => String(m).includes('Removed'))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
