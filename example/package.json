@@ -32,6 +32,6 @@
     "jest": "^30.5.2",
     "tailwindcss": "^4",
     "ts-jest": "^29.4.15",
-    "typescript": "^5"
+    "typescript": "^7"
   }
 }
