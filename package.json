@@ -63,7 +63,7 @@
     "source-map-js": "^1.2.2"
   },
   "devDependencies": {
-    "@types/node": "^22",
+    "@types/node": "^26",
     "@vitest/coverage-v8": "^5.0.5",
     "next": "^16.4.3",
     "prettier": "^3.0.0",
