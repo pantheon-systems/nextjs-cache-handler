@@ -1,10 +1,11 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import {
   TagsBuffer,
   resolveTagsFlushIntervalMs,
   DEFAULT_TAGS_FLUSH_INTERVAL_MS,
   MIN_TAGS_FLUSH_INTERVAL_MS,
   type TagsMapping,
+  type TagsBufferConfig,
 } from '../../src/utils/tags-buffer.js';
 
 function snapshot(mapping: TagsMapping = {}, generation: string | number = '1') {
@@ -16,8 +17,8 @@ function httpError(code: number, message = `HTTP ${code}`) {
 }
 
 describe('TagsBuffer', () => {
-  let mockRead: ReturnType<typeof vi.fn>;
-  let mockWrite: ReturnType<typeof vi.fn>;
+  let mockRead: Mock<TagsBufferConfig['readTagsMapping']>;
+  let mockWrite: Mock<TagsBufferConfig['writeTagsMapping']>;
   let buffer: TagsBuffer;
 
   beforeEach(() => {

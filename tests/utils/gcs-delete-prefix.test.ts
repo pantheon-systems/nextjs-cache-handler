@@ -148,7 +148,9 @@ describe('deletePrefix', () => {
     const progress: DeletePrefixProgress[] = [];
     await deletePrefix({ getFiles: objects.getFiles } as any, PREFIX, {
       pageSize: 1000,
-      onPage: (p) => progress.push(p),
+      onPage: (p) => {
+        progress.push(p);
+      },
     });
 
     const counts = { skipped: 0, changed: 0, failed: 0, failures: {} };

@@ -634,7 +634,7 @@ describe('RouteCacheCleanup', () => {
     t.objects.getFiles.mockImplementation(async (query) => {
       const [files, ...rest] = await getFiles(query);
       // Each delete takes a second (throttling), so the page takes 100 s at concurrency 10.
-      const slow = files.map((file: any) => ({
+      const slow = (files as any[]).map((file: any) => ({
         ...file,
         delete: async (options?: unknown) => {
           t.advance(1000);

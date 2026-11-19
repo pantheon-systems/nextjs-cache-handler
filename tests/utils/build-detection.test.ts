@@ -127,7 +127,7 @@ describe('build-detection', () => {
       vi.mocked(fs.readFileSync).mockImplementation(((p: unknown) => {
         const v = files[path.basename(String(p))];
         return typeof v === 'function' ? v() : v;
-      }) as typeof fs.readFileSync);
+      }) as unknown as typeof fs.readFileSync);
     }
     const manifest = (deploymentId: unknown) => JSON.stringify({ deploymentId });
 
