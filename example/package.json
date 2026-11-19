@@ -23,6 +23,8 @@
     "minimatch": "11.0.1"
   },
   "devDependencies": {
+    "@swc/core": "^1.16.22",
+    "@swc/jest": "^0.2.39",
     "@tailwindcss/postcss": "^4",
     "@types/jest": "^30.0.0",
     "@types/node": "^26",
@@ -32,7 +34,6 @@
     "eslint-config-next": "16.4.6",
     "jest": "^30.5.2",
     "tailwindcss": "^4",
-    "ts-jest": "^29.4.15",
     "typescript": "^7"
   }
 }
