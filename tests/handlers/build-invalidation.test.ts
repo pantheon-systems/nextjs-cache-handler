@@ -173,7 +173,7 @@ describe('GcsCacheHandler build invalidation', () => {
     let error: ReturnType<typeof vi.spyOn>;
     /** Messages logged to `spy`, with durations replaced by N. */
     const logged = (spy: ReturnType<typeof vi.spyOn>) =>
-      spy.mock.calls.map(([message]) => String(message).replace(/in \d+ms/, 'in Nms'));
+      spy.mock.calls.map(([message]: unknown[]) => String(message).replace(/in \d+ms/, 'in Nms'));
     const finished = (deleted: number, listed: number, kept = 0, failed = 0, runs = 1) =>
       `[GcsCacheHandler] Route cache clean-up for build build-B finished: deleted ${deleted} objects of earlier ` +
       `builds (${listed} listed, ${kept} of this build kept, 0 rewritten during the delete kept), ${failed} failed, ` +

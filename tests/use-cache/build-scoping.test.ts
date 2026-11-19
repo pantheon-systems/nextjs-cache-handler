@@ -25,7 +25,7 @@ const mockFile = {
   delete: vi.fn(),
 };
 const mockBucket = {
-  file: vi.fn(() => mockFile),
+  file: vi.fn((_key: string) => mockFile),
   getFiles: vi.fn(),
 };
 vi.mock('@google-cloud/storage', () => ({

@@ -23,8 +23,8 @@ describe('BaseCacheHandler build-prerender fallback', () => {
 
   // Minimal CacheFs the built-in FileSystemCache expects from the context.
   const cacheFs = {
-    readFile: (p: string, enc?: BufferEncoding) => fs.promises.readFile(p, enc),
-    readFileSync: (p: string, enc?: BufferEncoding) => fs.readFileSync(p, enc),
+    readFile: (p: string, enc?: BufferEncoding) => fs.promises.readFile(p, enc ?? null),
+    readFileSync: (p: string, enc?: BufferEncoding) => (enc ? fs.readFileSync(p, enc) : fs.readFileSync(p)),
     writeFile: (p: string, data: string | Buffer) => fs.promises.writeFile(p, data),
     mkdir: (p: string) => fs.promises.mkdir(p, { recursive: true }).then(() => undefined),
     stat: (p: string) => fs.promises.stat(p),
