@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.14.2
+## 0.14.1
 
 ### Fixed
 
 - A `revalidateTag()` for a tag on thousands of pages no longer leaves the server unable to answer requests. The handler sent one CDN purge request per page, all started together: on a site where one tag covered about 40,000 cached URLs, the process logged `connect EMFILE` during each revalidation and stopped answering, and visitors got 502s until it finished. Purge requests now go through a queue, one per server process and purge target (a bundled copy of this package has its own).
+- Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
 
 ### Added
 
@@ -32,21 +33,13 @@
 - `<n> delayed CDN purge(s) had no answer by the shutdown deadline; any not yet sent are lost if the process exits now`
 - `Failed to clear the whole edge cache: HTTP <status>` and `Error clearing the whole edge cache:`. A failed full purge was not logged when its caller did not read the result.
 
-*Changed:*
-
-- `Failed to clear path <path>: HTTP <status>`, `Error clearing path <path>:` and the same for keys are logged once per request sent, not once per caller that shared it.
-## 0.14.1
-
-### Fixed
-
-- Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
-
-#### Logs
-
 *Added:*
 
 - `Build prerender <key> has a normalized mtime (<time>); dating it <time>` (debug).
 
+*Changed:*
+
+- `Failed to clear path <path>: HTTP <status>`, `Error clearing path <path>:` and the same for keys are logged once per request sent, not once per caller that shared it.
 ## 0.14.0
 
 ### Added
