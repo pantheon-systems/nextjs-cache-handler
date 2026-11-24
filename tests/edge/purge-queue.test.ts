@@ -538,7 +538,7 @@ describe('PurgeQueue', () => {
         void queue.enqueue('path', '/refused', overloaded(503));
         await vi.advanceTimersByTimeAsync(LATENCY_MS);
         const waiting = ['/a', '/b'].map((path) => queue.enqueue('path', path, send));
-        // Requested while /b is in flight, and again between two requests: long after the pause both times.
+        // Requested while /b is in flight, long after the pause.
         await vi.advanceTimersByTimeAsync(1000 + slowTimeout + 1);
         waiting.push(queue.enqueue('path', '/c', send), queue.enqueue('path', '/d', send));
         await vi.advanceTimersByTimeAsync(3 * slowTimeout);
@@ -724,6 +724,74 @@ describe('PurgeQueue', () => {
 
         expect(await fullPurge).toMatchObject({ ok: false, status: 503 });
         expect(full).toHaveBeenCalledTimes(1);
+      });
+
+      describe('for a caller that asks for its first answer', () => {
+        it('gives the refusal as the first answer, and still sends the purge again', async () => {
+          const queue = new PurgeQueue(1);
+          const full = refusedThenFine(1);
+
+          const { firstAnswer, settled } = queue.enqueueFullPurge(full);
+          await vi.advanceTimersByTimeAsync(LATENCY_MS);
+          expect(await firstAnswer).toMatchObject({ ok: false, status: 503 });
+          expect(full).toHaveBeenCalledTimes(1);
+
+          await vi.advanceTimersByTimeAsync(1000 + LATENCY_MS);
+          expect((await settled).ok).toBe(true);
+          expect(full).toHaveBeenCalledTimes(2);
+        });
+
+        it('gives the one answer both ways when the purge is not refused', async () => {
+          const queue = new PurgeQueue(1);
+
+          const { firstAnswer, settled } = queue.enqueueFullPurge(answers(OK));
+          await vi.advanceTimersByTimeAsync(LATENCY_MS);
+
+          expect(await firstAnswer).toBe(await settled);
+        });
+
+        it('gives the answer to the first request sent after it asked, not to one already in flight', async () => {
+          const queue = new PurgeQueue(1);
+          const full = refusedThenFine(2);
+
+          void queue.enqueue('all', '', full);
+          // Asked while the first request is in flight: the second is the one that covers it.
+          let answer: PurgeOutcome | undefined;
+          void queue.enqueueFullPurge(vi.fn()).firstAnswer.then((outcome) => {
+            answer = outcome;
+          });
+          await vi.advanceTimersByTimeAsync(LATENCY_MS);
+          expect(full).toHaveBeenCalledTimes(1);
+          expect(answer).toBeUndefined();
+
+          // The second is refused too. That is its first answer, though a third attempt follows.
+          await vi.advanceTimersByTimeAsync(1000 + LATENCY_MS);
+          expect(full).toHaveBeenCalledTimes(2);
+          expect(answer).toMatchObject({ ok: false, status: 503 });
+          queue.stop();
+        });
+
+        it('answers when the queue is stopped before the purge is sent', async () => {
+          const queue = new PurgeQueue(1);
+          void queue.enqueue('key', 'held', heldRequest().send);
+
+          const { firstAnswer } = queue.enqueueFullPurge(vi.fn());
+          queue.stop();
+
+          expect(await firstAnswer).toMatchObject({ ok: false, error: 'purge queue stopped' });
+        });
+      });
+
+      it('gives a full purge requested while it was in flight the final result, not that of the next attempt', async () => {
+        const queue = new PurgeQueue(1);
+        const full = refusedThenFine(2);
+
+        void queue.enqueue('all', '', full);
+        const repeat = queue.enqueue('all', '', vi.fn());
+        await vi.advanceTimersByTimeAsync(3 * LATENCY_MS + 1000 + 2000);
+
+        expect((await repeat).ok).toBe(true);
+        expect(full).toHaveBeenCalledTimes(3);
       });
 
       it('is not sent again for an error that is not a refusal', async () => {

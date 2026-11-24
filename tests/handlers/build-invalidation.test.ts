@@ -522,6 +522,30 @@ describe('GcsCacheHandler build invalidation', () => {
       }
     });
 
+    it('serves on the first refusal without waiting for the purge to be sent again', async () => {
+      setPurgeBackoffBaseForTests(1000);
+      refuseFullPurge();
+      // Only the timers: the handler's storage reads still need the real event loop.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      try {
+        let served = false;
+        void new GcsCacheHandler({} as any).get('k').then(() => {
+          served = true;
+        });
+        // Far short of the second pause the queue takes before it sends the purge again.
+        await vi.waitFor(() => expect(served).toBe(true));
+        expect(fullPurges()).toHaveLength(1);
+        expect(JSON.parse(store[jobKey])).toMatchObject({ purgePending: true });
+
+        await vi.advanceTimersByTimeAsync(1000 + 2000);
+        await vi.waitFor(() => expect(fullPurges()).toHaveLength(FULL_PURGE_ATTEMPTS));
+      } finally {
+        vi.useRealTimers();
+        setPurgeBackoffBaseForTests(0);
+        vi.mocked(fetch).mockReset();
+      }
+    });
+
     it('retries a failed CDN purge in the background, once the retry delay has passed', async () => {
       vi.useFakeTimers({ toFake: ['Date'] });
       try {
@@ -531,19 +555,41 @@ describe('GcsCacheHandler build invalidation', () => {
 
         expect(logged(error)).toEqual([
           expect.stringMatching(
-            /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. The background clean-up retries it \(up to 5 runs\); until then, pages from the previous build stay in the CDN\.$/
+            /^\[GcsCacheHandler\] Edge cache purge on build invalidation failed: .+\. It is sent again in the background \(the clean-up makes up to 5 runs\); until one succeeds, pages from the previous build stay in the CDN\.$/
           ),
         ]);
-        expect(fullPurges()).toHaveLength(FULL_PURGE_ATTEMPTS);
+        // The queue's own attempts go on in the background after the first refusal.
+        await vi.waitFor(() => expect(fullPurges()).toHaveLength(FULL_PURGE_ATTEMPTS));
         expect(JSON.parse(store[jobKey])).toMatchObject({ purgePending: true, pruned: true });
+
+        // The clean-up's purge is refused once too, and is sent again like any full purge.
+        vi.mocked(fetch).mockImplementationOnce(async () => new Response('Bad Gateway', { status: 502 }));
+        vi.setSystemTime(Date.now() + PURGE_RETRY_DELAY_MS);
+        await serve();
+
+        expect(fullPurges()).toHaveLength(FULL_PURGE_ATTEMPTS + 2);
+        expect(logged(warn)).toContain(
+          '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
+        );
+        expect(store[jobKey]).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not purge again from the clean-up when the queue got the refused purge through', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.mocked(fetch).mockImplementationOnce(async () => new Response('Bad Gateway', { status: 502 }));
+
+        await serve();
+        await vi.waitFor(() => expect(fullPurges()).toHaveLength(2));
+        expect(JSON.parse(store[jobKey])).toMatchObject({ purgePending: true });
 
         vi.setSystemTime(Date.now() + PURGE_RETRY_DELAY_MS);
         await serve();
 
-        expect(fullPurges()).toHaveLength(FULL_PURGE_ATTEMPTS + 1);
-        expect(logged(warn)).toContain(
-          '[GcsCacheHandler] CDN purge for build build-B, which failed when the build was recorded, has now been sent'
-        );
+        expect(fullPurges()).toHaveLength(2);
         expect(store[jobKey]).toBeUndefined();
       } finally {
         vi.useRealTimers();

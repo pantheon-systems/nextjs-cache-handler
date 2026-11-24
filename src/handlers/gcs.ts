@@ -126,6 +126,10 @@ const delayedPurges = new DelayedPurges();
 // One clean-up runner per (bucket, job object) per process, like the tag buffers.
 const routeCacheCleanups = new Map<string, RouteCacheCleanup>();
 
+// A new build's full purge whose first answer was a failure, by the same key: how the queue's
+// own retry of it ends. The clean-up reads it so that it does not purge again after a success.
+const newBuildPurges = new Map<string, Promise<{ success: boolean }>>();
+
 /**
  * Whether a route entry stamped with `generation` belongs to the running build.
  * A process that can't read its build ID serves any entry, as before stamping:
@@ -305,6 +309,7 @@ export function resetGcsSharedState(): void {
   delayedPurges.reset();
   resetPurgeQueuesForTests();
   routeCacheCleanups.clear();
+  newBuildPurges.clear();
   servedAt.clear();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
@@ -397,7 +402,15 @@ export class GcsCacheHandler extends BaseCacheHandler {
         // Limited, because the clean-up holds a lock while it waits and the queue may be paused or
         // sending this purge again. No answer in time counts as a failure, so a later run sends it.
         purge: edgeCacheClearer
-          ? async () => (await settledWithin(edgeCacheClearer.nukeCache(), PURGE_WAIT_MS))?.success ?? false
+          ? async () => {
+              // Recorded as failed on its first answer, but the queue may have got it through since.
+              const sentSince = newBuildPurges.get(key);
+              newBuildPurges.delete(key);
+              if (sentSince && (await settledWithin(sentSince, PURGE_WAIT_MS))?.success) {
+                return true;
+              }
+              return (await settledWithin(edgeCacheClearer.nukeCache(), PURGE_WAIT_MS))?.success ?? false;
+            }
           : undefined,
         tagsMap: this.cleanupTagsMap(),
         failureHints: (labels) => deleteFailureHints(this.bucketName, labels),
@@ -582,11 +595,17 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
 
     // Awaited, so the purge is sent before this process serves a request that
-    // could race a still-cached previous-build page. Bounded by PURGE_WAIT_MS;
-    // a failure, or no answer by then, is recorded on the job and retried in the background.
-    const purge = this.edgeCacheClearer
-      ? ((await settledWithin(this.edgeCacheClearer.nukeCache(), PURGE_WAIT_MS)) ?? PURGE_NOT_CONFIRMED)
+    // could race a still-cached previous-build page. Bounded by PURGE_WAIT_MS,
+    // and only for the first answer: a refused purge is sent again by the queue,
+    // but the request is not held for that. A failure, or no answer by then, is
+    // recorded on the job and retried in the background as well.
+    const sent = this.edgeCacheClearer?.nukeCacheWithFirstAnswer();
+    const purge = sent
+      ? ((await settledWithin(sent.firstAnswer, PURGE_WAIT_MS)) ?? PURGE_NOT_CONFIRMED)
       : { success: true };
+    if (sent && !purge.success) {
+      newBuildPurges.set(`${this.bucketName}/${this.cleanupJobKey}`, sent.settled);
+    }
     const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
     const stayInCdn =
       "pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared.";
@@ -610,8 +629,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
     if (!purge.success) {
       this.log.error(
-        `${purgeFailed} The background clean-up retries it (up to ${MAX_PURGE_RUNS} runs); until then, ` +
-          `pages from the previous build stay in the CDN.`
+        `${purgeFailed} It is sent again in the background (the clean-up makes up to ${MAX_PURGE_RUNS} runs); ` +
+          `until one succeeds, pages from the previous build stay in the CDN.`
       );
     }
   }

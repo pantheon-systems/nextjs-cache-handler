@@ -344,7 +344,7 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
 
       it('revalidateTag waits through a pause shorter than its limit, so the purge is sent while the request is served', async () => {
         tagsMapping = { posts: ['/blog/a'] };
-        await refusedRevalidation(5);
+        await refusedRevalidation(8);
 
         let returned = false;
         const revalidation = newHandler()
@@ -357,7 +357,7 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
         expect(returned).toBe(false);
         expect(fetch).not.toHaveBeenCalled();
 
-        await vi.advanceTimersByTimeAsync(3000);
+        await vi.advanceTimersByTimeAsync(6000);
         await revalidation;
         expect(sentPurges()).toEqual({ paths: ['/blog/a'], keys: ['posts'], nukes: 0 });
       });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EdgeCacheClear, createEdgeCacheClearer, settledWithin } from '../../src/edge/edge-cache-clear.js';
-import { resetPurgeQueuesForTests } from '../../src/edge/purge-queue.js';
+import { resetPurgeQueuesForTests, setPurgeBackoffBaseForTests } from '../../src/edge/purge-queue.js';
 import { clearEdgeCachePaths, clearEdgeCache } from '../../src/index.js';
 import { resetSiteUrlConfigForTests } from '../../src/utils/site-urls.js';
 import * as fs from 'fs';
@@ -42,6 +42,10 @@ describe('EdgeCacheClear', () => {
   });
 
   describe('nukeCache', () => {
+    // No pause before a refused full purge is sent again, so these do not wait real seconds.
+    beforeEach(() => setPurgeBackoffBaseForTests(0));
+    afterEach(() => setPurgeBackoffBaseForTests(1000));
+
     it('should make DELETE request to base cache URL', async () => {
       vi.mocked(fetch).mockResolvedValue({
         ok: true,
@@ -71,6 +75,28 @@ describe('EdgeCacheClear', () => {
       expect(result.success).toBe(false);
       expect(result.statusCode).toBe(500);
       expect(result.error).toContain('500');
+    });
+
+    it('reports the final result of a full purge that was refused and sent again', async () => {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 }))
+        .mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const result = await new EdgeCacheClear().nukeCache();
+
+      expect(result.success).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('nukeCacheWithFirstAnswer gives the refusal first and the final result when settled', async () => {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 }))
+        .mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      const { firstAnswer, settled } = new EdgeCacheClear().nukeCacheWithFirstAnswer();
+
+      expect(await firstAnswer).toMatchObject({ success: false, statusCode: 502 });
+      expect(await settled).toMatchObject({ success: true, statusCode: 200 });
     });
 
     it('should return failure on network error', async () => {

@@ -81,9 +81,29 @@ interface Job {
   running: boolean;
   attempts: number;
   promise: Promise<PurgeOutcome>;
+  /** Settles `promise`, and `nextAnswer` if it is still open. */
   resolve: (outcome: PurgeOutcome) => void;
+  /**
+   * The answer to the next request sent for this purge. The same as `promise`
+   * except for a full purge that is refused and sent again: then this settles
+   * with the refusal, and is replaced for the next attempt.
+   */
+  nextAnswer: Deferred;
   /** Requested again while this one was in flight: sent once, after it. */
   followUp?: Job;
+}
+
+interface Deferred {
+  promise: Promise<PurgeOutcome>;
+  resolve: (outcome: PurgeOutcome) => void;
+}
+
+function deferred(): Deferred {
+  let resolve!: (outcome: PurgeOutcome) => void;
+  const promise = new Promise<PurgeOutcome>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 const jobId = (kind: PurgeKind, value: string): string => `${kind}:${value}`;
@@ -131,10 +151,26 @@ export class PurgeQueue {
 
   /** Resolves with the outcome of the request that covered this purge. Never rejects. */
   enqueue(kind: PurgeKind, value: string, send: Send): Promise<PurgeOutcome> {
+    return this.jobFor(kind, value, send).promise;
+  }
+
+  /**
+   * A full purge, for a caller that must not wait through its retries.
+   * `firstAnswer` is the answer to the first request sent for it after this
+   * call; `settled` is what enqueue() returns. They differ only when that
+   * request is refused and the full purge is sent again.
+   */
+  enqueueFullPurge(send: Send): { firstAnswer: Promise<PurgeOutcome>; settled: Promise<PurgeOutcome> } {
+    const job = this.jobFor('all', '', send);
+    return { firstAnswer: job.nextAnswer.promise, settled: job.promise };
+  }
+
+  /** The purge that covers this request: one already queued, or a new one. */
+  private jobFor(kind: PurgeKind, value: string, send: Send): Job {
     this.forgetOldRefusal();
     const fullPurge = this.nextFullPurge();
     if (kind === 'path' && fullPurge) {
-      return fullPurge.promise;
+      return fullPurge;
     }
 
     const id = jobId(kind, value);
@@ -143,10 +179,10 @@ export class PurgeQueue {
       const job = this.createJob(id, kind, send);
       this.add(job);
       this.pump();
-      return job.promise;
+      return job;
     }
     if (!existing.running) {
-      return existing.promise;
+      return existing;
     }
     if (!existing.followUp) {
       existing.followUp = this.createJob(id, kind, send);
@@ -154,7 +190,7 @@ export class PurgeQueue {
         this.absorbWaitingPaths(existing.followUp);
       }
     }
-    return existing.followUp.promise;
+    return existing.followUp;
   }
 
   /**
@@ -197,11 +233,21 @@ export class PurgeQueue {
   }
 
   private createJob(id: string, kind: PurgeKind, send: Send): Job {
-    let resolve!: (outcome: PurgeOutcome) => void;
-    const promise = new Promise<PurgeOutcome>((r) => {
-      resolve = r;
-    });
-    return { id, kind, send, running: false, attempts: 0, promise, resolve };
+    const settled = deferred();
+    const job: Job = {
+      id,
+      kind,
+      send,
+      running: false,
+      attempts: 0,
+      promise: settled.promise,
+      resolve: (outcome) => {
+        job.nextAnswer.resolve(outcome);
+        settled.resolve(outcome);
+      },
+      nextAnswer: deferred(),
+    };
+    return job;
   }
 
   /** The full purge that has not started yet, if there is one: it covers any path purge requested before it starts. */
@@ -317,6 +363,8 @@ export class PurgeQueue {
       // Giving up on what is waiting and keeping this one going would contradict each other.
       !gaveUp;
     if (sendAgain) {
+      job.nextAnswer.resolve(outcome);
+      job.nextAnswer = deferred();
       this.sendFullPurgeAgain(job);
     } else {
       job.resolve(outcome);
@@ -337,6 +385,7 @@ export class PurgeQueue {
     this.pausedUntil = Math.max(this.pausedUntil, Date.now() + backoffBaseMs);
     // The next attempt starts after any full purge requested meanwhile, so it serves as that one too.
     if (job.followUp) {
+      void job.nextAnswer.promise.then(job.followUp.nextAnswer.resolve);
       void job.promise.then(job.followUp.resolve);
       job.followUp = undefined;
     }

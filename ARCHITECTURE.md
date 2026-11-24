@@ -284,9 +284,9 @@ request, so the queue belongs to the purge target, not to a clearer:
   meanwhile shares the next attempt. If the last attempt is refused too, or it fails any other way, the
   paths it stood for are not purged and nothing sends them again. Path and key purges are never retried.
   This applies to every full purge, so a new build's purge and each run of the background clean-up's
-  purge can be up to three requests. A new build whose purge is refused therefore holds its first
-  request through those pauses (about 3 s with the default 1 s and 2 s), where it used to return after
-  the one refusal; the 10 s limit below still applies.
+  purge can be up to three requests. A new build does not hold its first request for them: it waits
+  only for the answer to the first request (`nukeCacheWithFirstAnswer()`), as it did before the queue, and
+  the queue sends the purge again in the background.
 - **Giving up.** When the pauses of refusals in a row add up to `GIVE_UP_AFTER_PAUSED_MS` (two minutes;
   the eighth refusal with the default doubling, fewer when `Retry-After` asks for longer pauses), the
   purges still waiting are failed with one warning, and a full purge refused at that point is not sent
@@ -314,8 +314,10 @@ request, so the queue belongs to the purge target, not to a clearer:
   the purge stays queued. The public `clearEdgeCachePaths()` and `clearEdgeCache()` wait for the real
   result, at most until the queue gives up.
 - **A purge that outlasts its caller's wait counts as failed for that caller.** A new build whose full
-  purge is answered after the 10 s records it as pending, and the background clean-up sends another
-  about a minute later. The cost is one extra full purge.
+  purge is answered after the 10 s, or refused on its first request, records it as pending for the
+  background clean-up, which runs about a minute later. If the queue got that purge through in the
+  meantime, in the same process, the clean-up counts it as sent and does not purge again. When the
+  clean-up runs in another instance it cannot know, and sends one more full purge.
 - **Logging.** A failed request is logged where it is sent, once, not by each caller that shared it.
 
 A site whose tags cover most of its pages, such as a menu rendered on every page, gets a full purge on

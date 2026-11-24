@@ -146,13 +146,30 @@ export class EdgeCacheClear {
    * Clear the entire edge cache (nuclear option).
    */
   async nukeCache(): Promise<CacheClearResult> {
-    const startTime = Date.now();
+    return this.fullPurgeResult(this.enqueueFullPurge().settled);
+  }
+
+  /**
+   * A full purge for a caller that must not wait through its retries: a new
+   * build, which holds its first request on the purge. `firstAnswer` is the
+   * answer to the first request sent for it; `settled` is what nukeCache()
+   * returns. They differ only when that request is refused and sent again.
+   */
+  nukeCacheWithFirstAnswer(): { firstAnswer: Promise<CacheClearResult>; settled: Promise<CacheClearResult> } {
+    const { firstAnswer, settled } = this.enqueueFullPurge();
+    return { firstAnswer: this.fullPurgeResult(firstAnswer), settled: this.fullPurgeResult(settled) };
+  }
+
+  private enqueueFullPurge(): { firstAnswer: Promise<PurgeOutcome>; settled: Promise<PurgeOutcome> } {
     // The request logs its own failure: several callers start a full purge without reading the result.
-    const outcome = await purgeQueueFor(this.baseUrl).enqueue(
-      'all',
-      '',
+    return purgeQueueFor(this.baseUrl).enqueueFullPurge(
       this.request('the whole edge cache', this.baseUrl, FULL_PURGE_TIMEOUT_MS)
     );
+  }
+
+  private async fullPurgeResult(answer: Promise<PurgeOutcome>): Promise<CacheClearResult> {
+    const startTime = Date.now();
+    const outcome = await answer;
     const duration = Date.now() - startTime;
 
     if (outcome.ok) {

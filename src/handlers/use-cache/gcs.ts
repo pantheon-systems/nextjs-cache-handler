@@ -209,8 +209,11 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       // so the purge is requested, and waited on for at most PURGE_WAIT_MS,
       // before this process starts serving real traffic. Behind other purges
       // or a pause it may still be waiting to be sent when that wait ends.
+      // Only the first answer is waited for: the queue sends a refused purge again.
       if (this.edgeCacheClearer) {
-        const result = (await settledWithin(this.edgeCacheClearer.nukeCache(), PURGE_WAIT_MS)) ?? PURGE_NOT_CONFIRMED;
+        const result =
+          (await settledWithin(this.edgeCacheClearer.nukeCacheWithFirstAnswer().firstAnswer, PURGE_WAIT_MS)) ??
+          PURGE_NOT_CONFIRMED;
         if (!result.success) {
           log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
         }

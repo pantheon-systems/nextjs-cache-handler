@@ -345,6 +345,33 @@ describe('use-cache build scoping', () => {
         }
       });
 
+      it('serves on the first refusal without waiting for the purge to be sent again', async () => {
+        const handlerA = new UseCacheGcsHandler();
+        await handlerA.get('sitemap', []);
+        vi.mocked(fetch).mockClear();
+        vi.mocked(fetch).mockImplementation(async () => new Response('Bad Gateway', { status: 502 }));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        try {
+          mockBuildId = 'build-B';
+          let served = false;
+          void new UseCacheGcsHandler().get('sitemap', []).then(() => {
+            served = true;
+          });
+          // Far short of the second pause the queue takes before it sends the purge again.
+          await vi.waitFor(() => expect(served).toBe(true));
+          expect(fetch).toHaveBeenCalledTimes(1);
+
+          await vi.advanceTimersByTimeAsync(1000 + 2000);
+          await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+        } finally {
+          vi.useRealTimers();
+          warn.mockRestore();
+          resetPurgeQueuesForTests();
+          vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+        }
+      });
+
       it('does not clear the edge cache when the build id is unchanged', async () => {
         const handlerA = new UseCacheGcsHandler();
         await handlerA.get('sitemap', []);
