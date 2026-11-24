@@ -111,6 +111,8 @@ interface CacheHandlerConfig {
 | `CACHE_TAGS_FLUSH_INTERVAL_MS` | How often each server process writes the tag-to-keys mapping to GCS (default `5000`, minimum `1000`). See [Tag-Based Invalidation](#tag-based-invalidation). | Optional |
 | `CACHE_USE_CACHE_MEMORY_MB` | Memory each server process keeps for `'use cache'` entries it has read or written, evicting the least recently used (default `32`, `0` disables; the `memoryMb` option of `createUseCacheHandler` takes precedence). A hit from memory resolves without a GCS round trip, which keeps it in the static part of a cached navigation; tag and revalidate expiry apply as for GCS hits. | Optional |
 | `CACHE_INVALIDATION_DELETE_CONCURRENCY` | Deletes in flight at once when a new build deletes the earlier builds' entries in `route-cache/` (in the background), and when `clearSharedCache()` runs (default `50`, clamped to `1`–`200`). Raising it shortens the background delete; lowering it eases GCS throttling. See [Build Invalidation](#build-invalidation). | Optional |
+| `CACHE_PURGE_CONCURRENCY` | CDN purge requests in flight at once per server process (default `10`, clamped to `1`–`200`). The rest wait their turn. See [Edge Cache Clearing](#edge-cache-clearing). | Optional |
+| `CACHE_PURGE_MAX_PATHS` | Most path purges outstanding per server process (default `200`, minimum `1`): the paths a purge adds plus those still waiting to be sent. A purge that would take the total over it clears the site's whole CDN cache with one request instead. See [Edge Cache Clearing](#edge-cache-clearing). | Optional |
 | `CACHE_BUILD_INVALIDATION` | `off` stops a new build from deleting `route-cache/` (it still records the build, purges the CDN and removes earlier builds' keys from the tags map), for when the delete itself is the problem. Entries from earlier builds are still never served; they only take up storage until a deploy runs without `off`. Any other value, or unset, deletes as usual. | Optional |
 | `CACHE_GCS_API_ENDPOINT` | Base URL of a GCS emulator for the GCS handlers to use instead of GCS, such as `http://localhost:4443` for [fake-gcs-server](https://github.com/fsouza/fake-gcs-server); the integration tests use it. `STORAGE_EMULATOR_HOST` does not work for this: the storage library builds API and upload URLs from it differently, so no value serves both. Requests to it are sent without credentials, so it is ignored, with an error, on Cloud Run (when `K_SERVICE` is set). | Optional (testing only) |
 | `CACHE_TAGS_REFRESH_INTERVAL_MS` | How often each server process reads revalidations made by other processes (default `1000`, minimum `100`). `revalidateTag()` schedules a second CDN purge for one interval plus up to 1 s (the interval again, capped at 1 s) after the first, 2 s by default. The `use cache` handler also reloads tag timestamps at most once per interval, in the background. See [Revalidations across processes](#revalidations-across-processes). | Optional |
@@ -381,7 +383,8 @@ per process. A process that gets no CPU between requests (Cloud Run with
 request-based CPU allocation) sends an overdue second purge at its next
 request; one that stops before then loses it unless the app calls
 `flushSharedTagsMapping()` at shutdown, which sends it (waiting until it is due,
-within its deadline). A route handler responds first; Next.js finishes the
+within its deadline) and waits for the answer until the deadline, logging a
+warning for purges still unanswered then. A route handler responds first; Next.js finishes the
 revalidation after the response. If the revalidation could not be stored within
 5 s, it is retried on later cache reads and the second purge is scheduled once
 it is stored; `flushSharedTagsMapping()` also stores such revalidations at
@@ -463,7 +466,22 @@ When deployed on Pantheon, the cache handlers automatically clear the CDN edge c
 - A new build, when a starting process detects it (clears the whole CDN)
 - Another instance's revalidation, once this process reads it (clears the paths this process served from cache since)
 
-Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). `revalidateTag()` and `revalidatePath()` wait for the first purge, and a new build's full purge finishes before the process serves its first request; the other purges run in the background. A failed purge never fails the cache operation.
+Edge cache clearing is enabled when the `OUTBOUND_PROXY_ENDPOINT` environment variable is set (automatically configured on Pantheon). `revalidateTag()` and `revalidatePath()` wait for the first purge, and a new build waits for its full purge before the process serves its first request, in both cases for at most 10 s (see below); the other purges run in the background. A failed purge never fails the cache operation.
+
+### Limits on purge requests
+
+One `revalidateTag()` can affect thousands of pages: a tag for a menu that every page renders is on every page. Purging each of those by path used to mean one request per page, all started together, which could leave the server unable to answer visitors until they finished. Purges are now bounded:
+
+- **At most `CACHE_PURGE_CONCURRENCY` purge requests are in flight** (default `10`) per server process. Others wait.
+- **More than `CACHE_PURGE_MAX_PATHS` path purges outstanding become one full purge** (default `200`). The count is the paths a purge adds (paths already waiting are not counted again) plus the path purges still waiting to be sent, so many small purges arriving together are bounded too. The tags are still sent as surrogate keys. The handler logs `One purge added <n> paths, over CACHE_PURGE_MAX_PATHS (<max>): purging the whole edge cache instead`.
+- **Repeats are merged.** A path, key or full purge that is already waiting is not sent twice. One already in flight is sent once more after it, however often it is requested meanwhile.
+- **The handler pauses when the purge service is overloaded.** After a 429 or 5xx it stops sending for the response's `Retry-After`, or for 1 s doubling, in both cases at most 30 s, and logs `Purge service answered HTTP <status>: pausing edge purges for <n> ms`. A path or key purge that was refused is not sent again; a full purge is, up to three times in all, because it can stand for hundreds of paths. Purges waiting, and those requested during the pause, are sent after it: one at a time until the service answers normally, then at the usual limit.
+- **When the pauses of refusals in a row add up to two minutes, the handler gives up on what is waiting.** With the default doubling that is the eighth refusal; a service that asks for longer pauses with `Retry-After` gets there in fewer. It logs `It has refused <n> requests in a row through <n> s of pauses: gave up on <n> edge purges that were waiting`, and the CDN keeps those entries until they expire or are purged again. Purges requested afterwards are queued and given the same two minutes; until the service answers a request normally they go one at a time, a pause apart.
+- **`revalidateTag()`, `revalidatePath()` and a starting process wait at most 10 s for their purge.** A purge that takes longer, because it is waiting its turn, is still sent; the caller just stops waiting for it. When a pause after a refusal has 10 s or more left, `revalidateTag()` and `revalidatePath()` do not wait at all: the purge is queued and sent when the pause ends. A new build whose full purge is refused waits through the retries, about 3 s by default, before serving. `clearEdgeCachePaths()` and `clearEdgeCache()` wait for the real result, which under sustained refusals can take until the handler gives up, two minutes of pauses plus the requests in between.
+
+The trade-off: a full purge clears everything the CDN holds for the site, not only the affected pages, so the next request for each page goes to the origin. If your tags cover most of your pages, most revalidations will be full purges. To purge by path more often, raise `CACHE_PURGE_MAX_PATHS`; each path is one request to a shared service, so raise it with care. Tags that cover fewer pages keep revalidations under the limit.
+
+To get close to the earlier behaviour, set `CACHE_PURGE_MAX_PATHS` very high and `CACHE_PURGE_CONCURRENCY=200`.
 
 ## Build Invalidation
 

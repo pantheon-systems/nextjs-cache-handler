@@ -1,4 +1,4 @@
-import type { EdgeCacheClear } from '../edge/edge-cache-clear.js';
+import { settledWithin, type EdgeCacheClear } from '../edge/edge-cache-clear.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('DelayedPurges');
@@ -50,7 +50,7 @@ export class DelayedPurges {
     return this.pending.length;
   }
 
-  /** Send every purge now, waiting until it is due if that is before `deadline`. For shutdown. */
+  /** Send every purge now, waiting until it is due if that is before `deadline`, and for answers until `deadline`. For shutdown. */
   async flush(deadline: number): Promise<void> {
     if (this.pending.length === 0) {
       return;
@@ -60,7 +60,17 @@ export class DelayedPurges {
     if (wait > 0) {
       await new Promise((resolve) => setTimeout(resolve, wait));
     }
-    await this.send(this.take(() => true));
+    const purges = this.take(() => true);
+    const answered = await settledWithin(
+      this.send(purges).then(() => true),
+      Math.max(0, deadline - Date.now())
+    );
+    if (!answered) {
+      log.warn(
+        `${purges.length} delayed CDN purge(s) had no answer by the shutdown deadline; ` +
+          `any not yet sent are lost if the process exits now`
+      );
+    }
   }
 
   /** @internal Test hook. */

@@ -25,6 +25,8 @@ vi.mock('@google-cloud/storage', () => ({
 }));
 
 import { GcsCacheHandler, resetGcsSharedState, flushGcsTagsMapping } from '../../src/handlers/gcs.js';
+import { PurgeQueue, purgeQueueFor } from '../../src/edge/purge-queue.js';
+import { PURGE_WAIT_MS } from '../../src/edge/edge-cache-clear.js';
 import { resetBuildPrerenderTagsForTests } from '../../src/utils/build-prerender-tags.js';
 import { writeBuildOutput } from '../helpers/build-output.js';
 
@@ -207,5 +209,222 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
     await settle();
 
     expect(sentPurges().paths).toEqual(['/pages-isr/london']);
+  });
+
+  describe('bounded fan-out (CACHE_PURGE_MAX_PATHS, CACHE_PURGE_CONCURRENCY)', () => {
+    let warn: ReturnType<typeof vi.spyOn>;
+    let inFlight: number;
+    let mostInFlight: number;
+
+    /** Every purge request stays open until the next turn of the event loop, so overlap is visible. */
+    const countInFlight = () => {
+      inFlight = 0;
+      mostInFlight = 0;
+      vi.mocked(fetch).mockImplementation(async () => {
+        inFlight++;
+        mostInFlight = Math.max(mostInFlight, inFlight);
+        await new Promise((resolve) => setImmediate(resolve));
+        inFlight--;
+        return { ok: true, status: 200 } as Response;
+      });
+    };
+
+    beforeEach(() => {
+      warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warn.mockRestore();
+      delete process.env.CACHE_PURGE_MAX_PATHS;
+      delete process.env.CACHE_PURGE_CONCURRENCY;
+    });
+
+    it('a tag on 5,000 pages sends its key and one full purge', async () => {
+      tagsMapping = { menu: Array.from({ length: 5000 }, (_, i) => `/page-${i}`) };
+
+      await newHandler().revalidateTag('menu');
+
+      expect(sentPurges()).toEqual({ paths: [], keys: ['menu'], nukes: 1 });
+      expect(warn).toHaveBeenCalledWith(
+        '[EdgeCacheClear] One purge added 5000 paths, over CACHE_PURGE_MAX_PATHS (200): ' +
+          'purging the whole edge cache instead'
+      );
+
+      // The second purge, after every instance has applied the revalidation, is capped the same way.
+      await flushGcsTagsMapping({ timeoutMs: 5000 });
+      expect(sentPurges()).toEqual({ paths: [], keys: ['menu'], nukes: 2 });
+      expect(fetch).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([
+      ['by path', 'posts', { paths: ['/blog/a'], keys: ['posts'], nukes: 0 }],
+      ['for the whole site', '_N_T_/layout', { paths: [], nukes: 1 }],
+    ])(
+      'revalidateTag stops waiting for a purge %s that gets no answer, and the purge stays sent',
+      async (_how, tag, sent) => {
+        tagsMapping = { posts: ['/blog/a'] };
+        vi.mocked(fetch).mockImplementation(() => new Promise<Response>(() => {}));
+        // Only the timers: the handler's file reads still need the real event loop.
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+
+        try {
+          let returned = false;
+          const revalidation = newHandler()
+            .revalidateTag(tag)
+            .then(() => {
+              returned = true;
+            });
+          await vi.waitFor(() => expect(sentPurges()).toMatchObject(sent));
+          expect(returned).toBe(false);
+
+          await vi.advanceTimersByTimeAsync(PURGE_WAIT_MS);
+          await revalidation;
+          expect(returned).toBe(true);
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+    );
+
+    describe('after the purge service has refused a request', () => {
+      const QUEUE = 'http://proxy.example.com:8080/rest/v0alpha1/cache';
+      const refuseFor = (seconds: number) =>
+        vi
+          .mocked(fetch)
+          .mockImplementation(
+            async () => new Response('slow down', { status: 429, headers: { 'retry-after': String(seconds) } })
+          );
+      const answerNormally = () =>
+        vi.mocked(fetch).mockImplementation(async () => ({ ok: true, status: 200 }) as Response);
+
+      beforeEach(() => {
+        // Only the timers: the handler's file reads still need the real event loop.
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      });
+
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      /** Starts the pause: the revalidation that finds out is refused, and returns with that answer. */
+      const refusedRevalidation = async (seconds: number) => {
+        refuseFor(seconds);
+        const revalidation = newHandler().revalidateTag('posts');
+        await vi.waitFor(() => expect(purgeQueueFor(QUEUE).pauseLeftMs).toBeGreaterThan(0));
+        await revalidation;
+        vi.mocked(fetch).mockClear();
+        answerNormally();
+      };
+
+      it.each([
+        ['by path', 'posts', { paths: ['/blog/a'], keys: ['posts'], nukes: 0 }],
+        ['for the whole site', '_N_T_/layout', { paths: [], nukes: 1 }],
+      ])(
+        'revalidateTag does not wait for a purge %s through a pause longer than its limit, and the purge is sent after it',
+        async (_how, tag, sent) => {
+          tagsMapping = { posts: ['/blog/a'] };
+          await refusedRevalidation(30);
+
+          let returned = false;
+          void newHandler()
+            .revalidateTag(tag)
+            .then(() => {
+              returned = true;
+            });
+          // Well inside both the 10 s limit and the pause: it returned without waiting for either.
+          await vi.waitFor(() => expect(returned).toBe(true));
+          expect(purgeQueueFor(QUEUE).pauseLeftMs).toBeGreaterThan(PURGE_WAIT_MS);
+          expect(fetch).not.toHaveBeenCalled();
+
+          // Queued, not skipped.
+          await vi.advanceTimersByTimeAsync(30_000);
+          await vi.waitFor(() => expect(sentPurges()).toMatchObject(sent));
+        }
+      );
+
+      it('revalidateTag waits through a pause shorter than its limit, so the purge is sent while the request is served', async () => {
+        tagsMapping = { posts: ['/blog/a'] };
+        await refusedRevalidation(5);
+
+        let returned = false;
+        const revalidation = newHandler()
+          .revalidateTag('posts')
+          .then(() => {
+            returned = true;
+          });
+        await vi.waitFor(() => expect(purgeQueueFor(QUEUE).waitingPaths).toBe(1));
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(returned).toBe(false);
+        expect(fetch).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(3000);
+        await revalidation;
+        expect(sentPurges()).toEqual({ paths: ['/blog/a'], keys: ['posts'], nukes: 0 });
+      });
+    });
+
+    it('purges by path up to the limit, at most CACHE_PURGE_CONCURRENCY at once', async () => {
+      process.env.CACHE_PURGE_CONCURRENCY = '4';
+      tagsMapping = { posts: Array.from({ length: 200 }, (_, i) => `/post-${i}`) };
+      countInFlight();
+
+      await newHandler().revalidateTag('posts');
+
+      expect(sentPurges().paths).toHaveLength(200);
+      expect(sentPurges().nukes).toBe(0);
+      expect(mostInFlight).toBe(4);
+    });
+
+    it('CACHE_PURGE_MAX_PATHS moves the limit', async () => {
+      process.env.CACHE_PURGE_MAX_PATHS = '2';
+      tagsMapping = { posts: ['/a', '/b', '/c'] };
+
+      await newHandler().revalidateTag('posts');
+
+      expect(sentPurges()).toEqual({ paths: [], keys: ['posts'], nukes: 1 });
+    });
+
+    it('400 revalidations of one tag at once send each path and key once per in-flight window', async () => {
+      tagsMapping = { posts: ['/blog/a', '/blog/b', '/blog/c'] };
+      const open: Array<() => void> = [];
+      vi.mocked(fetch).mockImplementation(
+        () => new Promise<Response>((resolve) => open.push(() => resolve({ ok: true, status: 200 } as Response)))
+      );
+      const callsPerUrl = () => {
+        const counts = new Map<string, number>();
+        for (const [url] of vi.mocked(fetch).mock.calls) {
+          counts.set(String(url), (counts.get(String(url)) ?? 0) + 1);
+        }
+        return [...counts.values()];
+      };
+      const respondToAll = () => open.splice(0).forEach((respond) => respond());
+
+      const enqueue = vi.spyOn(PurgeQueue.prototype, 'enqueue');
+
+      const revalidations = Array.from({ length: 400 }, () => newHandler().revalidateTag('posts'));
+      // Every call has asked for its three paths and its key.
+      await vi.waitFor(() => expect(enqueue).toHaveBeenCalledTimes(400 * 4), { timeout: 10000 });
+
+      // First window: each of the four requests is in flight once, while all 400 calls wait.
+      expect(callsPerUrl()).toEqual([1, 1, 1, 1]);
+
+      // Calls that arrived after those requests started get one more request each, not 399.
+      respondToAll();
+      await vi.waitFor(() => expect(open).toHaveLength(4));
+      expect(callsPerUrl()).toEqual([2, 2, 2, 2]);
+
+      respondToAll();
+      await Promise.all(revalidations);
+      expect(sentPurges()).toEqual({ paths: ['/blog/a', '/blog/b', '/blog/c'], keys: ['posts'], nukes: 0 });
+
+      // The 400 second purges still merge into one batch.
+      const flushed = flushGcsTagsMapping({ timeoutMs: 5000 });
+      await vi.waitFor(() => expect(open).toHaveLength(4), { timeout: 5000 });
+      respondToAll();
+      await flushed;
+      expect(callsPerUrl()).toEqual([3, 3, 3, 3]);
+
+      enqueue.mockRestore();
+    });
   });
 });

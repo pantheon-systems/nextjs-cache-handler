@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { EdgeCacheClear, createEdgeCacheClearer } from '../../src/edge/edge-cache-clear.js';
+import { EdgeCacheClear, createEdgeCacheClearer, settledWithin } from '../../src/edge/edge-cache-clear.js';
+import { resetPurgeQueuesForTests } from '../../src/edge/purge-queue.js';
 import { clearEdgeCachePaths, clearEdgeCache } from '../../src/index.js';
 import { resetSiteUrlConfigForTests } from '../../src/utils/site-urls.js';
 import * as fs from 'fs';
@@ -13,6 +14,7 @@ describe('EdgeCacheClear', () => {
   beforeEach(() => {
     originalEnv = process.env.OUTBOUND_PROXY_ENDPOINT;
     process.env.OUTBOUND_PROXY_ENDPOINT = mockEndpoint;
+    resetPurgeQueuesForTests();
     vi.stubGlobal('fetch', vi.fn());
   });
 
@@ -61,11 +63,7 @@ describe('EdgeCacheClear', () => {
     });
 
     it('should return failure on HTTP error', async () => {
-      vi.mocked(fetch).mockResolvedValue({
-        ok: false,
-        status: 500,
-        text: () => Promise.resolve('Internal Server Error'),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValue(new Response('Internal Server Error', { status: 500 }));
 
       const clearer = new EdgeCacheClear();
       const result = await clearer.nukeCache();
@@ -209,10 +207,230 @@ describe('EdgeCacheClear', () => {
       expect(result.paths).toEqual(['/ok']);
     });
 
+    it('pins what is sent for paths with spaces, query marks and tag-shaped values', async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      await new EdgeCacheClear().clearPaths(['/node/998', '/a b', '/what?', '_N_T_/blog']);
+
+      // Encoded twice, without the leading slash. The outbound proxy escapes the segment once
+      // more before the gateway (`url.PathEscape` in tenant-outbound-proxy's DeleteCachePath),
+      // which is where the third level seen in its logs (%25252F) comes from.
+      const sent = vi.mocked(fetch).mock.calls.map(([url]) => String(url).split('/cache/paths/')[1]);
+      expect(sent).toEqual(['node%252F998', 'a%2520b', 'what%253F', '_N_T_%252Fblog']);
+    });
+
+    describe('over CACHE_PURGE_MAX_PATHS', () => {
+      let warn: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+      });
+
+      afterEach(() => {
+        delete process.env.CACHE_PURGE_MAX_PATHS;
+      });
+
+      const manyPaths = (count: number) => Array.from({ length: count }, (_, i) => `/p/${i}`);
+
+      it('sends one full purge instead of the paths, and says so', async () => {
+        const result = await new EdgeCacheClear().clearPaths(manyPaths(201));
+
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(fetch).toHaveBeenCalledWith(`http://${mockEndpoint}/rest/v0alpha1/cache`, expect.anything());
+        expect(result).toMatchObject({ success: true, paths: [], fullPurge: true });
+        expect(warn).toHaveBeenCalledWith(
+          '[EdgeCacheClear] One purge added 201 paths, over CACHE_PURGE_MAX_PATHS (200): ' +
+            'purging the whole edge cache instead'
+        );
+      });
+
+      it('sends exactly the limit by path', async () => {
+        const result = await new EdgeCacheClear().clearPaths(manyPaths(200));
+
+        expect(fetch).toHaveBeenCalledTimes(200);
+        expect(result.fullPurge).toBeUndefined();
+        expect(warn).not.toHaveBeenCalled();
+      });
+
+      it('counts each path once', async () => {
+        const result = await new EdgeCacheClear().clearPaths([...manyPaths(200), ...manyPaths(200)]);
+
+        expect(fetch).toHaveBeenCalledTimes(200);
+        expect(result.fullPurge).toBeUndefined();
+      });
+
+      it('reports a failed full purge as a failure', async () => {
+        vi.mocked(fetch).mockResolvedValue(new Response('no route', { status: 404 }));
+
+        const result = await new EdgeCacheClear().clearPaths(manyPaths(201));
+
+        expect(result).toMatchObject({ success: false, statusCode: 404, fullPurge: true });
+        expect(warn).toHaveBeenCalledWith('[EdgeCacheClear] Failed to clear the whole edge cache: HTTP 404');
+      });
+
+      it('counts the paths other purges still have waiting', async () => {
+        process.env.CACHE_PURGE_MAX_PATHS = '5';
+        process.env.CACHE_PURGE_CONCURRENCY = '1';
+        const open: Array<() => void> = [];
+        vi.mocked(fetch).mockImplementation(
+          () => new Promise<Response>((resolve) => open.push(() => resolve({ ok: true, status: 200 } as Response)))
+        );
+        const respond = async () => {
+          await vi.waitFor(() => expect(open).toHaveLength(1));
+          open.pop()!();
+        };
+
+        try {
+          // One request in flight and three waiting, then three more: six outstanding is over five.
+          const first = new EdgeCacheClear().clearPaths(['/a', '/b', '/c', '/d']);
+          const second = new EdgeCacheClear().clearPaths(['/e', '/f', '/g']);
+          await respond();
+          await respond();
+
+          expect(await second).toMatchObject({ success: true, paths: [], fullPurge: true });
+          expect((await first).success).toBe(true);
+          // /a, then one full purge in place of the six paths that were waiting.
+          expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url).split('/rest/v0alpha1/')[1])).toEqual([
+            'cache/paths/a',
+            'cache',
+          ]);
+          expect(warn).toHaveBeenCalledWith(
+            '[EdgeCacheClear] One purge added 3 paths, with 3 path purges already waiting, ' +
+              'over CACHE_PURGE_MAX_PATHS (5): purging the whole edge cache instead'
+          );
+        } finally {
+          delete process.env.CACHE_PURGE_CONCURRENCY;
+        }
+      });
+
+      it('does not count paths that are already waiting again', async () => {
+        process.env.CACHE_PURGE_MAX_PATHS = '5';
+        process.env.CACHE_PURGE_CONCURRENCY = '1';
+        const open: Array<() => void> = [];
+        vi.mocked(fetch).mockImplementation(
+          () => new Promise<Response>((resolve) => open.push(() => resolve({ ok: true, status: 200 } as Response)))
+        );
+
+        try {
+          // /a in flight, /b to /e waiting; the repeat adds only /a's follow-up: five outstanding.
+          const first = new EdgeCacheClear().clearPaths(['/a', '/b', '/c', '/d', '/e']);
+          const repeat = new EdgeCacheClear().clearPaths(['/a', '/b', '/c', '/d', '/e']);
+          for (let sent = 0; sent < 6; sent++) {
+            await vi.waitFor(() => expect(open).toHaveLength(1));
+            open.pop()!();
+          }
+
+          expect((await repeat).fullPurge).toBeUndefined();
+          expect((await first).fullPurge).toBeUndefined();
+          expect(warn).not.toHaveBeenCalled();
+        } finally {
+          delete process.env.CACHE_PURGE_CONCURRENCY;
+        }
+      });
+
+      it('does not count paths it will not send', async () => {
+        process.env.CACHE_PURGE_MAX_PATHS = '2';
+
+        const result = await new EdgeCacheClear().clearPaths(['/a', '/b', '/bad\u0000path', '']);
+
+        expect(result).toMatchObject({ success: true, paths: ['/a', '/b'] });
+        expect(result.fullPurge).toBeUndefined();
+        expect(fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('follows CACHE_PURGE_MAX_PATHS', async () => {
+        process.env.CACHE_PURGE_MAX_PATHS = '1000';
+
+        await new EdgeCacheClear().clearPaths(manyPaths(201));
+
+        expect(fetch).toHaveBeenCalledTimes(201);
+      });
+    });
+
+    it('never has more than CACHE_PURGE_CONCURRENCY requests in flight, across clearers', async () => {
+      process.env.CACHE_PURGE_CONCURRENCY = '3';
+      let inFlight = 0;
+      let most = 0;
+      vi.mocked(fetch).mockImplementation(async () => {
+        inFlight++;
+        most = Math.max(most, inFlight);
+        await new Promise((resolve) => setImmediate(resolve));
+        inFlight--;
+        return { ok: true, status: 200 } as Response;
+      });
+
+      try {
+        // A clearer per request, as Next constructs them, all for the same target.
+        await Promise.all([
+          new EdgeCacheClear().clearPaths(['/a', '/b', '/c', '/d']),
+          new EdgeCacheClear().clearKeys(['x', 'y', 'z']),
+          new EdgeCacheClear().clearPaths(['/e', '/f']),
+        ]);
+      } finally {
+        delete process.env.CACHE_PURGE_CONCURRENCY;
+      }
+
+      expect(fetch).toHaveBeenCalledTimes(9);
+      expect(most).toBe(3);
+    });
+
+    it('logs a full purge that fails, since callers may not read the result', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(fetch).mockRejectedValue(new Error('socket hang up'));
+
+      const result = await new EdgeCacheClear().nukeCache();
+
+      expect(result).toMatchObject({ success: false, error: 'socket hang up' });
+      expect(warn).toHaveBeenCalledWith('[EdgeCacheClear] Error clearing the whole edge cache:', expect.any(Error));
+    });
+
+    it('logs a failed request once, however many callers shared it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let respond!: (response: Response) => void;
+      vi.mocked(fetch).mockImplementation(() => new Promise<Response>((resolve) => (respond = resolve)));
+
+      // One request in flight for /a; the repeats share the one sent after it.
+      const first = new EdgeCacheClear().clearPaths(['/a']);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      const repeats = Array.from({ length: 50 }, () => new EdgeCacheClear().clearPaths(['/a']));
+      respond(new Response(null, { status: 404 }));
+      await first;
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      respond(new Response(null, { status: 404 }));
+      const results = await Promise.all(repeats);
+
+      expect(results.every((result) => result.success === false)).toBe(true);
+      expect(warn.mock.calls.map(([line]) => line)).toEqual([
+        '[EdgeCacheClear] Failed to clear path /a: HTTP 404',
+        '[EdgeCacheClear] Failed to clear path /a: HTTP 404',
+      ]);
+    });
+
+    it('a background purge over the limit reports the whole edge cache as cleared', async () => {
+      process.env.CACHE_DEBUG = 'true';
+      process.env.CACHE_PURGE_MAX_PATHS = '1';
+      const debug = vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+
+      try {
+        new EdgeCacheClear().clearPathsInBackground(['/a', '/b'], 'a test');
+        await vi.waitFor(() =>
+          expect(debug).toHaveBeenCalledWith(
+            '[EdgeCacheClear] Background path clear for a test: whole edge cache cleared'
+          )
+        );
+      } finally {
+        delete process.env.CACHE_DEBUG;
+        delete process.env.CACHE_PURGE_MAX_PATHS;
+      }
+    });
+
     it('should handle partial failures', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce({ ok: true, status: 200 } as Response)
-        .mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+        .mockResolvedValueOnce(new Response(null, { status: 404 }));
 
       const clearer = new EdgeCacheClear();
       const result = await clearer.clearPaths(['/path1', '/path2']);
@@ -360,6 +578,42 @@ describe('EdgeCacheClear', () => {
       clearer.clearKeysInBackground([], 'test');
       expect(fetch).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('settledWithin', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('gives the result of work that finishes in time', async () => {
+    const work = new Promise<string>((resolve) => setTimeout(() => resolve('done'), 100));
+
+    const result = settledWithin(work, 1000);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(await result).toBe('done');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stops waiting at the limit and leaves the work running', async () => {
+    let finished = false;
+    const work = new Promise<string>((resolve) => setTimeout(() => resolve('done'), 5000)).then((value) => {
+      finished = true;
+      return value;
+    });
+
+    const result = settledWithin(work, 1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await result).toBeUndefined();
+    expect(finished).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(finished).toBe(true);
   });
 });
 

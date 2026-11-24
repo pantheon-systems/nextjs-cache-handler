@@ -60,3 +60,15 @@ export function createLogger(handlerName: string) {
 }
 
 export type Logger = ReturnType<typeof createLogger>;
+
+/**
+ * A list for a log line: the first few values and how many were left out.
+ * A purge can name tens of thousands of paths, and the line is built even when
+ * debug logging is off.
+ */
+export function summarizeList(values: string[], show: number = 10): string {
+  if (values.length <= show) {
+    return values.join(', ');
+  }
+  return `${values.slice(0, show).join(', ')} and ${values.length - show} more`;
+}
