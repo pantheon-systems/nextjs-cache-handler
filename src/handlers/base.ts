@@ -19,6 +19,19 @@ import { areTagsExpired, getTagRevalidation, nextChecksFetchTags, setTagRevalida
 // Process-wide, in-flight-or-finished build invalidation check (see initialize()).
 let buildInvalidationPromise: Promise<void> | null = null;
 
+// When the running build was first recorded in the shared build metadata, so
+// every instance of a build agrees on it. Set by checkBuildInvalidation.
+let buildRecordedAt: number | null = null;
+const processStartedAt = Date.now();
+
+// A file mtime older than this was normalized, not written by the build.
+// Cloud Native Buildpacks set every mtime in an image to 1980-01-01 for
+// reproducible builds. Next.js takes a build prerender's age from its mtime,
+// so 16.4+ treats each one as past its `expire` (a year by default), re-renders
+// it in the foreground and returns `x-nextjs-cache: REVALIDATED`, discarding
+// the build-time output.
+const NORMALIZED_MTIME_BEFORE = Date.UTC(2000, 0, 1);
+
 // This process's generation, read once: the fallback is a fresh timestamp on
 // every call, and route entries are stamped with it (see GcsCacheHandler).
 let processGeneration: string | null = null;
@@ -71,6 +84,7 @@ function loadFileSystemCacheCtor(): Promise<FileSystemCacheCtor | null> {
 export function resetBuildInvalidationCheck(): void {
   buildInvalidationPromise = null;
   processGeneration = null;
+  buildRecordedAt = null;
 }
 
 export interface BuildMeta {
@@ -259,6 +273,7 @@ export abstract class BaseCacheHandler {
     if (!buildMeta) {
       // First run: nothing to invalidate.
       await this.writeBuildMeta(currentMeta);
+      buildRecordedAt = currentMeta.timestamp;
       return;
     }
 
@@ -274,6 +289,9 @@ export abstract class BaseCacheHandler {
       // Last, so a process that dies part-way leaves the new build undetected
       // and the next start resumes the invalidation.
       await this.writeBuildMeta(currentMeta);
+      buildRecordedAt = currentMeta.timestamp;
+    } else {
+      buildRecordedAt = buildMeta.timestamp;
     }
     this.onBuildCurrent();
   }
@@ -515,11 +533,32 @@ export abstract class BaseCacheHandler {
       }
 
       const entry = await fallback.get(cacheKey, ctx);
-      return entry ?? null;
+      return entry ? this.withBuildLastModified(cacheKey, entry) : null;
     } catch (error) {
       this.log.debug(`Build-prerender fallback failed for ${cacheKey}:`, error);
       return null;
     }
+  }
+
+  /**
+   * Replaces a normalized mtime (see NORMALIZED_MTIME_BEFORE) as a build
+   * prerender's age with the time this build was first recorded, or this
+   * process's start when no build is recorded. Leaves -1, Next's "a tag
+   * expired" signal, unchanged. Not stale-prone: FileSystemCache has already
+   * checked the entry's tags against the 1980 time, which no revalidation
+   * predates.
+   */
+  private withBuildLastModified(cacheKey: string, entry: CacheHandlerValue): CacheHandlerValue {
+    const { lastModified } = entry;
+    if (typeof lastModified !== 'number' || lastModified < 0 || lastModified >= NORMALIZED_MTIME_BEFORE) {
+      return entry;
+    }
+    const builtAt = buildRecordedAt ?? processStartedAt;
+    this.log.debug(
+      `Build prerender ${cacheKey} has a normalized mtime (${new Date(lastModified).toISOString()}); ` +
+        `dating it ${new Date(builtAt).toISOString()}`
+    );
+    return { ...entry, lastModified: builtAt };
   }
 
   private loadBuildPrerenderFallback(): Promise<FileSystemCacheLike | null> {
