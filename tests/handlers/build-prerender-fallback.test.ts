@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { FileCacheHandler } from '../../src/handlers/file.js';
+import { resetBuildInvalidationCheck } from '../../src/handlers/base.js';
 import { tagsManifest } from 'next/dist/server/lib/incremental-cache/tags-manifest.external.js';
 
 /**
@@ -111,6 +112,49 @@ describe('BaseCacheHandler build-prerender fallback', () => {
     // so Next regenerates rather than serving stale content.
     const afterRevalidate = await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any);
     expect(afterRevalidate).toBeNull();
+  });
+
+  // Cloud Native Buildpacks set every mtime in an image to this.
+  const CNB_MTIME = new Date('1980-01-01T00:00:01Z');
+
+  it('dates a build prerender with a normalized mtime to when the build was recorded', async () => {
+    fs.writeFileSync(path.join(tempDir, '.next', 'BUILD_ID'), 'build-cnb');
+    writeBuildPrerender('sitemap.xml', '<loc>sentinel=buildtime</loc>', ['tagA'], CNB_MTIME);
+    const before = Date.now();
+    // A fresh build check, so this build is recorded now rather than earlier in the run.
+    resetBuildInvalidationCheck();
+    handler = new FileCacheHandler({ serverDistDir, fs: cacheFs, revalidatedTags: [] } as any);
+
+    const result = await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any);
+
+    // Next.js 16.4 treats an entry past `expire` (a year by default) as expired
+    // and re-renders it, so a 1980 age must not reach it.
+    expect(result).not.toBeNull();
+    expect(result!.lastModified).toBeGreaterThanOrEqual(before);
+    expect(result!.lastModified).toBeLessThanOrEqual(Date.now());
+    expect(Buffer.from((result?.value as any).body).toString('utf8')).toContain('sentinel=buildtime');
+
+    // Every later read gives the same age: it is the build's, not the request's.
+    const again = await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any);
+    expect(again!.lastModified).toBe(result!.lastModified);
+  });
+
+  it('keeps the mtime of a build prerender that was not normalized', async () => {
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    writeBuildPrerender('sitemap.xml', '<loc>sentinel=buildtime</loc>', ['tagA'], anHourAgo);
+
+    const result = await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any);
+
+    expect(result!.lastModified).toBe(anHourAgo.getTime());
+  });
+
+  it('still suppresses a build prerender with a normalized mtime whose tag was revalidated', async () => {
+    writeBuildPrerender('sitemap.xml', '<loc>sentinel=buildtime</loc>', ['tagA'], CNB_MTIME);
+    expect(await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any)).not.toBeNull();
+
+    await handler.revalidateTag('tagA');
+
+    expect(await handler.get('/sitemap.xml', { kind: 'APP_ROUTE' } as any)).toBeNull();
   });
 
   it('returns null when there is no store entry and no build prerender', async () => {
