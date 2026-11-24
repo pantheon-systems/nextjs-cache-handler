@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.1
+
+### Fixed
+
+- Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
+
+#### Logs
+
+*Added:*
+
+- `Build prerender <key> has a normalized mtime (<time>); dating it <time>` (debug).
+
 ## 0.14.0
 
 ### Added
