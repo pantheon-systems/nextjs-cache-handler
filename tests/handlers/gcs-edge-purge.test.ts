@@ -352,7 +352,7 @@ describe('GcsCacheHandler edge purges on revalidation', () => {
           .then(() => {
             returned = true;
           });
-        await vi.waitFor(() => expect(purgeQueueFor(QUEUE).waitingPaths).toBe(1));
+        await vi.waitFor(() => expect(purgeQueueFor(QUEUE).waitingPathCount).toBe(1));
         await vi.advanceTimersByTimeAsync(2000);
         expect(returned).toBe(false);
         expect(fetch).not.toHaveBeenCalled();

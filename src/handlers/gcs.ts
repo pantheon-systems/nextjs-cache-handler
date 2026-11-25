@@ -126,9 +126,9 @@ const delayedPurges = new DelayedPurges();
 // One clean-up runner per (bucket, job object) per process, like the tag buffers.
 const routeCacheCleanups = new Map<string, RouteCacheCleanup>();
 
-// A new build's full purge whose first answer was a failure, by the same key: how the queue's
-// own retry of it ends. The clean-up reads it so that it does not purge again after a success.
-const newBuildPurges = new Map<string, Promise<{ success: boolean }>>();
+// A new build's full purge that failed on its first answer, by the same key, with the result of
+// the queue's retry. The clean-up reads it so that it does not purge again after the retry succeeded.
+const newBuildPurgeRetries = new Map<string, Promise<{ success: boolean }>>();
 
 /**
  * Whether a route entry stamped with `generation` belongs to the running build.
@@ -309,7 +309,7 @@ export function resetGcsSharedState(): void {
   delayedPurges.reset();
   resetPurgeQueuesForTests();
   routeCacheCleanups.clear();
-  newBuildPurges.clear();
+  newBuildPurgeRetries.clear();
   servedAt.clear();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
@@ -404,9 +404,9 @@ export class GcsCacheHandler extends BaseCacheHandler {
         purge: edgeCacheClearer
           ? async () => {
               // Recorded as failed on its first answer, but the queue may have got it through since.
-              const sentSince = newBuildPurges.get(key);
-              newBuildPurges.delete(key);
-              if (sentSince && (await settledWithin(sentSince, PURGE_WAIT_MS))?.success) {
+              const queueRetry = newBuildPurgeRetries.get(key);
+              newBuildPurgeRetries.delete(key);
+              if (queueRetry && (await settledWithin(queueRetry, PURGE_WAIT_MS))?.success) {
                 return true;
               }
               return (await settledWithin(edgeCacheClearer.nukeCache(), PURGE_WAIT_MS))?.success ?? false;
@@ -604,7 +604,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       ? ((await settledWithin(sent.firstAnswer, PURGE_WAIT_MS)) ?? PURGE_NOT_CONFIRMED)
       : { success: true };
     if (sent && !purge.success) {
-      newBuildPurges.set(`${this.bucketName}/${this.cleanupJobKey}`, sent.settled);
+      newBuildPurgeRetries.set(`${this.bucketName}/${this.cleanupJobKey}`, sent.settled);
     }
     const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
     const stayInCdn =
@@ -865,7 +865,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     const context = `tag revalidation (${phase}): ${tags.join(', ')}`;
     // The caller may be a request waiting on this (the first purge of a revalidation), so the
     // wait is limited. A purge that takes longer still goes out.
-    const waitMs = clearer.waitMs;
+    const waitMs = clearer.revalidationWaitMs;
     if (purgeAll) {
       this.log.debug(`Purging the whole site for ${context}`);
       await settledWithin(Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]), waitMs);

@@ -10,8 +10,8 @@ const FULL_PURGE_TIMEOUT_MS = 10000;
  * How long a request, or a process starting up, waits for a purge it asked for.
  * A purge waits its turn in the queue, and through any pause while the purge
  * service is overloaded, so without this a caller could wait as long as that
- * lasts. The purge is still sent; only the waiting stops. A full purge's own
- * timeout: the longest a caller could wait before purges were queued.
+ * lasts. The purge is still sent; only the waiting stops. Set to a full purge's
+ * timeout, which was the longest a caller could wait before there was a queue.
  */
 export const PURGE_WAIT_MS = FULL_PURGE_TIMEOUT_MS;
 
@@ -91,7 +91,7 @@ export class EdgeCacheClear {
    * a shorter pause it does wait, because on Cloud Run the timer that ends the
    * pause may not run once no request is being served.
    */
-  get waitMs(): number {
+  get revalidationWaitMs(): number {
     return purgeQueueFor(this.baseUrl).pauseLeftMs >= PURGE_WAIT_MS ? 0 : PURGE_WAIT_MS;
   }
 
@@ -161,7 +161,6 @@ export class EdgeCacheClear {
   }
 
   private enqueueFullPurge(): { firstAnswer: Promise<PurgeOutcome>; settled: Promise<PurgeOutcome> } {
-    // The request logs its own failure: several callers start a full purge without reading the result.
     return purgeQueueFor(this.baseUrl).enqueueFullPurge(
       this.request('the whole edge cache', this.baseUrl, FULL_PURGE_TIMEOUT_MS)
     );
@@ -192,6 +191,8 @@ export class EdgeCacheClear {
     const startTime = Date.now();
 
     // Each path once: `a` and `/a` are the same request (clearSinglePath adds the slash).
+    // Values come from the build output and can be malformed at run time, so nothing here
+    // assumes a string: clearSinglePath rejects and logs those.
     const seen = new Set<unknown>();
     const unique = paths.filter((routePath) => {
       const key =
@@ -208,8 +209,8 @@ export class EdgeCacheClear {
     // Paths already queued are not counted again: their purge is shared, not repeated.
     const maxPaths = resolvePurgeMaxPaths();
     const queue = purgeQueueFor(this.baseUrl);
-    const alreadyWaiting = queue.waitingPaths;
-    const added = queue.newPaths(
+    const alreadyWaiting = queue.waitingPathCount;
+    const added = queue.countNewPaths(
       unique.filter((routePath) => isSendable(routePath, MAX_PATH_LENGTH)).map(withLeadingSlash)
     );
     if (added + alreadyWaiting > maxPaths) {

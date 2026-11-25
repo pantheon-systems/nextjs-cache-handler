@@ -70,7 +70,7 @@ export interface PurgeOutcome {
   cause?: unknown;
 }
 
-export type PurgeKind = 'path' | 'key' | 'all';
+export type PurgeKind = 'path' | 'key' | 'full';
 
 type Send = () => Promise<PurgeOutcome>;
 
@@ -80,11 +80,11 @@ interface Job {
   send: Send;
   running: boolean;
   attempts: number;
-  promise: Promise<PurgeOutcome>;
-  /** Settles `promise`, and `nextAnswer` if it is still open. */
+  settled: Promise<PurgeOutcome>;
+  /** Settles `settled`, and `nextAnswer` if it is still open. */
   resolve: (outcome: PurgeOutcome) => void;
   /**
-   * The answer to the next request sent for this purge. The same as `promise`
+   * The answer to the next request sent for this purge. The same as `settled`
    * except for a full purge that is refused and sent again: then this settles
    * with the refusal, and is replaced for the next attempt.
    */
@@ -107,9 +107,9 @@ function deferred(): Deferred {
 }
 
 const jobId = (kind: PurgeKind, value: string): string => `${kind}:${value}`;
-const FULL_PURGE_ID = jobId('all', '');
+const FULL_PURGE_ID = jobId('full', '');
 
-function isOverloaded(outcome: PurgeOutcome): boolean {
+function isRefusal(outcome: PurgeOutcome): boolean {
   return outcome.status === 429 || (outcome.status !== undefined && outcome.status >= 500);
 }
 
@@ -123,7 +123,7 @@ function isOverloaded(outcome: PurgeOutcome): boolean {
  * A purge waits for a free slot, or for a pause to end, for as long as that
  * takes, so callers that must not wait that long put their own limit on the
  * wait (settledWithin in edge-cache-clear.ts). What keeps the queue short is the
- * caller's cap on waiting paths: see `waitingPaths`. Purges are given up on only
+ * caller's cap on waiting paths: see `waitingPathCount`. Purges are given up on only
  * when the purge service has kept refusing through GIVE_UP_AFTER_PAUSED_MS of pauses.
  *
  * A repeat of a purge that has not started yet shares that request. A repeat
@@ -134,7 +134,7 @@ export class PurgeQueue {
   /** Waiting or in flight, by id. */
   private readonly jobs = new Map<string, Job>();
   private waiting: Job[] = [];
-  private waitingPathCount = 0;
+  private pathJobsWaiting = 0;
   private inFlight = 0;
   private pausedUntil = 0;
   /** Refusals in a row; above 0 the queue is recovering and sends one request at a time. */
@@ -151,7 +151,7 @@ export class PurgeQueue {
 
   /** Resolves with the outcome of the request that covered this purge. Never rejects. */
   enqueue(kind: PurgeKind, value: string, send: Send): Promise<PurgeOutcome> {
-    return this.jobFor(kind, value, send).promise;
+    return this.jobFor(kind, value, send).settled;
   }
 
   /**
@@ -161,8 +161,8 @@ export class PurgeQueue {
    * request is refused and the full purge is sent again.
    */
   enqueueFullPurge(send: Send): { firstAnswer: Promise<PurgeOutcome>; settled: Promise<PurgeOutcome> } {
-    const job = this.jobFor('all', '', send);
-    return { firstAnswer: job.nextAnswer.promise, settled: job.promise };
+    const job = this.jobFor('full', '', send);
+    return { firstAnswer: job.nextAnswer.promise, settled: job.settled };
   }
 
   /** The purge that covers this request: one already queued, or a new one. */
@@ -177,16 +177,17 @@ export class PurgeQueue {
     const existing = this.jobs.get(id);
     if (!existing) {
       const job = this.createJob(id, kind, send);
-      this.add(job);
-      this.pump();
+      this.addToWaiting(job);
+      this.startWaiting();
       return job;
     }
     if (!existing.running) {
       return existing;
     }
+    // Not shared: the request in flight may have reached the CDN before the change this one is for.
     if (!existing.followUp) {
       existing.followUp = this.createJob(id, kind, send);
-      if (kind === 'all') {
+      if (kind === 'full') {
         this.absorbWaitingPaths(existing.followUp);
       }
     }
@@ -194,11 +195,11 @@ export class PurgeQueue {
   }
 
   /**
-   * Path purges not yet started. Callers count these against CACHE_PURGE_MAX_PATHS
+   * How many path purges have not started yet. Callers count these against CACHE_PURGE_MAX_PATHS
    * and send a full purge instead of adding to them, which empties the list.
    */
-  get waitingPaths(): number {
-    return this.waitingPathCount;
+  get waitingPathCount(): number {
+    return this.pathJobsWaiting;
   }
 
   /** How long until anything is sent: a purge requested now waits at least this long. 0 when not paused. */
@@ -206,11 +207,13 @@ export class PurgeQueue {
     return Math.max(0, this.pausedUntil - Date.now());
   }
 
-  /** How many of these path purges would add to `waitingPaths`: the rest join a purge already queued. */
-  newPaths(values: string[]): number {
+  /** How many of these path purges would add to `waitingPathCount`: the rest join a purge already queued. */
+  countNewPaths(values: string[]): number {
     if (this.nextFullPurge()) {
       return 0;
     }
+    // New when sending it means one more request: nothing is queued for it, or one is in
+    // flight with no follow-up booked yet.
     return [...new Set(values)].filter((value) => {
       const existing = this.jobs.get(jobId('path', value));
       return !existing || (existing.running && !existing.followUp);
@@ -229,7 +232,7 @@ export class PurgeQueue {
     }
     this.jobs.clear();
     this.waiting = [];
-    this.waitingPathCount = 0;
+    this.pathJobsWaiting = 0;
   }
 
   private createJob(id: string, kind: PurgeKind, send: Send): Job {
@@ -240,7 +243,7 @@ export class PurgeQueue {
       send,
       running: false,
       attempts: 0,
-      promise: settled.promise,
+      settled: settled.promise,
       resolve: (outcome) => {
         job.nextAnswer.resolve(outcome);
         settled.resolve(outcome);
@@ -256,37 +259,37 @@ export class PurgeQueue {
     return fullPurge?.running ? fullPurge.followUp : fullPurge;
   }
 
-  private add(job: Job): void {
-    // Reached only by the follow-up of a path that was in flight: enqueue() joins new paths itself.
+  private addToWaiting(job: Job): void {
+    // Reached only by the follow-up of a path that was in flight: jobFor() joins new paths itself.
     const fullPurge = this.nextFullPurge();
     if (job.kind === 'path' && fullPurge) {
-      void fullPurge.promise.then(job.resolve);
+      void fullPurge.settled.then(job.resolve);
       return;
     }
 
     this.jobs.set(job.id, job);
-    if (job.kind === 'all') {
+    if (job.kind === 'full') {
       this.absorbWaitingPaths(job);
       // Ahead of the keys still waiting: a new build's purge must not wait behind them.
       this.waiting.unshift(job);
       return;
     }
     if (job.kind === 'path') {
-      this.waitingPathCount++;
+      this.pathJobsWaiting++;
     }
     this.waiting.push(job);
   }
 
   private absorbWaitingPaths(fullPurge: Job): void {
-    if (this.waitingPathCount === 0) {
+    if (this.pathJobsWaiting === 0) {
       return;
     }
     const absorbed = this.waiting.filter((job) => job.kind === 'path');
     this.waiting = this.waiting.filter((job) => job.kind !== 'path');
-    this.waitingPathCount = 0;
+    this.pathJobsWaiting = 0;
     for (const job of absorbed) {
       this.jobs.delete(job.id);
-      void fullPurge.promise.then(job.resolve);
+      void fullPurge.settled.then(job.resolve);
     }
     log.debug(`A full purge covers ${absorbed.length} path purges that were waiting`);
   }
@@ -307,25 +310,25 @@ export class PurgeQueue {
     }
   }
 
-  private pump(): void {
+  /** Starts the purges that are waiting, up to the limit. During a pause it starts none and sets the timer that ends it. */
+  private startWaiting(): void {
     const now = Date.now();
     const pauseLeft = this.pausedUntil - now;
     if (pauseLeft > 0) {
       this.resumeIn(pauseLeft);
       return;
     }
-    // After an overloaded response, one request at a time until the service answers one normally.
     const limit = this.backoffLevel > 0 ? 1 : this.concurrency;
     while (this.inFlight < limit && this.waiting.length > 0) {
       const job = this.waiting.shift()!;
       if (job.kind === 'path') {
-        this.waitingPathCount--;
+        this.pathJobsWaiting--;
       }
       void this.run(job);
     }
   }
 
-  /** A timer that fires early, because the pause grew after it was set, sets itself again through pump(). */
+  /** A timer that fires early, because the pause grew after it was set, sets itself again through startWaiting(). */
   private resumeIn(wait: number): void {
     if (this.timer || this.waiting.length === 0) {
       return;
@@ -335,7 +338,7 @@ export class PurgeQueue {
     // up until they are sent or, after GIVE_UP_AFTER_PAUSED_MS of pauses, given up on.
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.pump();
+      this.startWaiting();
     }, wait);
   }
 
@@ -357,8 +360,8 @@ export class PurgeQueue {
     const stillQueued = this.jobs.get(job.id) === job;
     const sendAgain =
       stillQueued &&
-      job.kind === 'all' &&
-      isOverloaded(outcome) &&
+      job.kind === 'full' &&
+      isRefusal(outcome) &&
       job.attempts < FULL_PURGE_ATTEMPTS &&
       // Giving up on what is waiting and keeping this one going would contradict each other.
       !gaveUp;
@@ -371,11 +374,11 @@ export class PurgeQueue {
       if (stillQueued) {
         this.jobs.delete(job.id);
         if (job.followUp) {
-          this.add(job.followUp);
+          this.addToWaiting(job.followUp);
         }
       }
     }
-    this.pump();
+    this.startWaiting();
   }
 
   /** Back to the front of the queue, to be sent after a pause. Path and key purges are not sent again. */
@@ -386,7 +389,7 @@ export class PurgeQueue {
     // The next attempt starts after any full purge requested meanwhile, so it serves as that one too.
     if (job.followUp) {
       void job.nextAnswer.promise.then(job.followUp.nextAnswer.resolve);
-      void job.promise.then(job.followUp.resolve);
+      void job.settled.then(job.followUp.resolve);
       job.followUp = undefined;
     }
     this.absorbWaitingPaths(job);
@@ -404,7 +407,7 @@ export class PurgeQueue {
     // neither starts another pause nor, if it was answered normally, ends the recovery.
     const sentBeforePause = startedAt < this.pausedUntil;
 
-    if (!isOverloaded(outcome)) {
+    if (!isRefusal(outcome)) {
       // A timeout or network error is no answer, so it does not end the recovery either.
       if (!sentBeforePause && outcome.status !== undefined) {
         this.endRecovery();
@@ -465,7 +468,7 @@ export class PurgeQueue {
 
     const givenUp = this.waiting;
     this.waiting = [];
-    this.waitingPathCount = 0;
+    this.pathJobsWaiting = 0;
     const outcome: PurgeOutcome = {
       ok: false,
       error: `not sent: the purge service refused ${refusals} requests in a row`,

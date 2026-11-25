@@ -130,7 +130,7 @@ describe('PurgeQueue', () => {
     const blocker = heldRequest();
 
     void queue.enqueue('path', '/in-flight', blocker.send);
-    expect(queue.waitingPaths).toBe(0);
+    expect(queue.waitingPathCount).toBe(0);
 
     const waiting = [
       queue.enqueue('path', '/a', async () => OK),
@@ -138,11 +138,11 @@ describe('PurgeQueue', () => {
       queue.enqueue('path', '/b', async () => OK),
       queue.enqueue('key', 'posts', async () => OK),
     ];
-    expect(queue.waitingPaths).toBe(2);
+    expect(queue.waitingPathCount).toBe(2);
 
     blocker.finish();
     await Promise.all(waiting);
-    expect(queue.waitingPaths).toBe(0);
+    expect(queue.waitingPathCount).toBe(0);
   });
 
   it('counts as new only the paths that would add a waiting purge', async () => {
@@ -153,10 +153,10 @@ describe('PurgeQueue', () => {
     void queue.enqueue('path', '/in-flight', inFlight.send);
     void queue.enqueue('path', '/waiting', async () => OK);
     void queue.enqueue('path', '/repeated', repeated.send);
-    expect(queue.newPaths(['/waiting', '/new', '/new', '/in-flight'])).toBe(2);
+    expect(queue.countNewPaths(['/waiting', '/new', '/new', '/in-flight'])).toBe(2);
 
-    void queue.enqueue('all', '', async () => OK);
-    expect(queue.newPaths(['/other'])).toBe(0);
+    void queue.enqueue('full', '', async () => OK);
+    expect(queue.countNewPaths(['/other'])).toBe(0);
     inFlight.finish();
     repeated.finish();
   });
@@ -167,10 +167,10 @@ describe('PurgeQueue', () => {
 
     void queue.enqueue('path', '/a', inFlight.send);
     await tick();
-    expect(queue.newPaths(['/a'])).toBe(1);
+    expect(queue.countNewPaths(['/a'])).toBe(1);
 
     void queue.enqueue('path', '/a', async () => OK);
-    expect(queue.newPaths(['/a'])).toBe(0);
+    expect(queue.countNewPaths(['/a'])).toBe(0);
     inFlight.finish();
   });
 
@@ -185,8 +185,8 @@ describe('PurgeQueue', () => {
       void queue.enqueue('path', '/blocker', blocker.send);
       const before = queue.enqueue('path', '/before', path);
       const keyPurge = queue.enqueue('key', 'posts', key);
-      const fullPurge = queue.enqueue('all', '', full);
-      expect(queue.waitingPaths).toBe(0);
+      const fullPurge = queue.enqueue('full', '', full);
+      expect(queue.waitingPathCount).toBe(0);
       const after = queue.enqueue('path', '/after', path);
       blocker.finish();
 
@@ -205,11 +205,11 @@ describe('PurgeQueue', () => {
 
       void queue.enqueue('path', '/blocker', blocker.send);
       const key = queue.enqueue('key', 'posts', async () => (order.push('key'), OK));
-      const full = queue.enqueue('all', '', async () => (order.push('all'), OK));
+      const full = queue.enqueue('full', '', async () => (order.push('full'), OK));
       blocker.finish();
       await Promise.all([key, full]);
 
-      expect(order).toEqual(['all', 'key']);
+      expect(order).toEqual(['full', 'key']);
     });
 
     it('a full purge already in flight does not cover a path purge requested after it started', async () => {
@@ -217,7 +217,7 @@ describe('PurgeQueue', () => {
       const full = heldRequest();
       const path = vi.fn(async () => OK);
 
-      const fullPurge = queue.enqueue('all', '', full.send);
+      const fullPurge = queue.enqueue('full', '', full.send);
       await tick();
       await queue.enqueue('path', '/a', path);
       full.finish();
@@ -232,12 +232,12 @@ describe('PurgeQueue', () => {
       const second = vi.fn(async () => ({ ok: true, status: 202 }));
       const path = vi.fn(async () => OK);
 
-      void queue.enqueue('all', '', first.send);
+      void queue.enqueue('full', '', first.send);
       await tick();
       const waitingPath = queue.enqueue('path', '/before', path);
-      const secondPurge = queue.enqueue('all', '', second);
+      const secondPurge = queue.enqueue('full', '', second);
       const laterPath = queue.enqueue('path', '/after', path);
-      expect(queue.waitingPaths).toBe(0);
+      expect(queue.waitingPathCount).toBe(0);
       first.finish();
 
       expect(await waitingPath).toEqual({ ok: true, status: 202 });
@@ -256,7 +256,7 @@ describe('PurgeQueue', () => {
       void queue.enqueue('path', '/a', inFlight.send);
       await tick();
       const repeated = queue.enqueue('path', '/a', repeat);
-      const fullPurge = queue.enqueue('all', '', full);
+      const fullPurge = queue.enqueue('full', '', full);
       inFlight.finish();
 
       expect(await repeated).toEqual({ ok: true, status: 202 });
@@ -271,7 +271,7 @@ describe('PurgeQueue', () => {
 
       void queue.enqueue('path', '/blocker', blocker.send);
       const covered = queue.enqueue('path', '/a', async () => OK);
-      void queue.enqueue('all', '', async () => ({ ok: false, status: 404, error: 'no such site' }));
+      void queue.enqueue('full', '', async () => ({ ok: false, status: 404, error: 'no such site' }));
       blocker.finish();
 
       expect(await covered).toMatchObject({ ok: false, status: 404 });
@@ -582,7 +582,7 @@ describe('PurgeQueue', () => {
 
         void queue.enqueue('key', 'in-flight', answers(OK));
         const covered = queue.enqueue('path', '/a', path);
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(2 * LATENCY_MS + 1000 + LATENCY_MS);
 
         expect((await fullPurge).ok).toBe(true);
@@ -600,7 +600,7 @@ describe('PurgeQueue', () => {
           return Promise.resolve(OK);
         };
 
-        const fullPurge = queue.enqueue('all', '', () => {
+        const fullPurge = queue.enqueue('full', '', () => {
           sent.push('full');
           return full();
         });
@@ -608,7 +608,7 @@ describe('PurgeQueue', () => {
         await vi.advanceTimersByTimeAsync(LATENCY_MS / 2);
         const key = queue.enqueue('key', 'posts', named('key'));
         const path = queue.enqueue('path', '/late', named('path'));
-        expect(queue.waitingPaths).toBe(1);
+        expect(queue.waitingPathCount).toBe(1);
         await vi.advanceTimersByTimeAsync(LATENCY_MS / 2 + 1000 + LATENCY_MS);
 
         await Promise.all([fullPurge, key, path]);
@@ -621,7 +621,7 @@ describe('PurgeQueue', () => {
 
         void queue.enqueue('key', 'in-flight', answers(OK));
         const covered = queue.enqueue('path', '/a', answers(OK));
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(60_000);
 
         expect(await fullPurge).toMatchObject({ ok: false, status: 503 });
@@ -635,9 +635,9 @@ describe('PurgeQueue', () => {
         const full = refusedThenFine(1);
         const second = answers(OK);
 
-        const first = queue.enqueue('all', '', full);
+        const first = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(LATENCY_MS / 2);
-        const repeat = queue.enqueue('all', '', second);
+        const repeat = queue.enqueue('full', '', second);
         await vi.advanceTimersByTimeAsync(LATENCY_MS + 1000 + LATENCY_MS);
 
         expect((await first).ok).toBe(true);
@@ -652,9 +652,9 @@ describe('PurgeQueue', () => {
         const second = answers(OK);
         const path = answers(OK);
 
-        const first = queue.enqueue('all', '', full);
+        const first = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(LATENCY_MS + 500);
-        const repeat = queue.enqueue('all', '', second);
+        const repeat = queue.enqueue('full', '', second);
         const joined = queue.enqueue('path', '/a', path);
         await vi.advanceTimersByTimeAsync(500 + LATENCY_MS);
 
@@ -682,7 +682,7 @@ describe('PurgeQueue', () => {
         };
 
         void queue.enqueue('path', '/a', overloaded(503));
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(3000 + 1000 + LATENCY_MS);
 
         expect((await fullPurge).ok).toBe(true);
@@ -707,7 +707,7 @@ describe('PurgeQueue', () => {
 
         // The path's refusal asks for 10 s; the full purge's own arrives 3 s into that.
         void queue.enqueue('path', '/a', overloaded(429, 10_000));
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(LATENCY_MS + 10_000 + LATENCY_MS);
 
         expect((await fullPurge).ok).toBe(true);
@@ -718,7 +718,7 @@ describe('PurgeQueue', () => {
         const queue = new PurgeQueue(1);
         const full = overloaded(503);
 
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         queue.stop();
         await vi.advanceTimersByTimeAsync(60_000);
 
@@ -754,7 +754,7 @@ describe('PurgeQueue', () => {
           const queue = new PurgeQueue(1);
           const full = refusedThenFine(2);
 
-          void queue.enqueue('all', '', full);
+          void queue.enqueue('full', '', full);
           // Asked while the first request is in flight: the second is the one that covers it.
           let answer: PurgeOutcome | undefined;
           void queue.enqueueFullPurge(vi.fn()).firstAnswer.then((outcome) => {
@@ -786,8 +786,8 @@ describe('PurgeQueue', () => {
         const queue = new PurgeQueue(1);
         const full = refusedThenFine(2);
 
-        void queue.enqueue('all', '', full);
-        const repeat = queue.enqueue('all', '', vi.fn());
+        void queue.enqueue('full', '', full);
+        const repeat = queue.enqueue('full', '', vi.fn());
         await vi.advanceTimersByTimeAsync(3 * LATENCY_MS + 1000 + 2000);
 
         expect((await repeat).ok).toBe(true);
@@ -798,7 +798,7 @@ describe('PurgeQueue', () => {
         const queue = new PurgeQueue(1);
         const full = answers({ ok: false, status: 404 });
 
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(60_000);
 
         expect(await fullPurge).toMatchObject({ ok: false, status: 404 });
@@ -842,7 +842,7 @@ describe('PurgeQueue', () => {
             'It has refused 8 requests in a row through 121 s of pauses: gave up on 4 edge purges that were waiting. ' +
             'The CDN keeps those entries until they expire or are purged again',
         ]);
-        expect(queue.waitingPaths).toBe(0);
+        expect(queue.waitingPathCount).toBe(0);
         expect(vi.getTimerCount()).toBe(0);
       });
 
@@ -975,7 +975,7 @@ describe('PurgeQueue', () => {
 
         // The full purge is the eighth.
         const full = overloaded(503);
-        const fullPurge = queue.enqueue('all', '', full);
+        const fullPurge = queue.enqueue('full', '', full);
         await vi.advanceTimersByTimeAsync(MAX_BACKOFF_MS + LATENCY_MS);
 
         expect(await fullPurge).toMatchObject({ ok: false, status: 503 });
