@@ -1,4 +1,3 @@
-import type { Bucket } from '@google-cloud/storage';
 import { createLogger } from './logger.js';
 import { setTagRevalidation } from './tags-manifest.js';
 import {
@@ -7,6 +6,7 @@ import {
   isPreconditionFailure,
   readJsonObject,
   writeJsonObject,
+  type BucketRef,
 } from './gcs-json-object.js';
 
 const log = createLogger('SharedRevalidations');
@@ -70,7 +70,7 @@ export class SharedRevalidations {
   private onLearnedListener: ((tags: string[]) => Promise<void>) | null = null;
 
   constructor(
-    private readonly bucket: Bucket,
+    private readonly bucket: BucketRef,
     private readonly key: string,
     config: SharedRevalidationsConfig = {}
   ) {
@@ -285,7 +285,7 @@ export class SharedRevalidations {
     try {
       let generation: string | number;
       try {
-        const [metadata] = await this.bucket.file(this.key).getMetadata();
+        const [metadata] = await (await this.bucket).file(this.key).getMetadata();
         generation = metadata.generation ?? 0;
       } catch (error) {
         if (isNotFound(error)) {
@@ -427,7 +427,7 @@ function isRevalidation(value: unknown): value is SharedRevalidation {
 const stores = new Map<string, SharedRevalidations>();
 
 /** One store per (bucket, object) per process; handlers are constructed per request. */
-export function getSharedRevalidations(bucketName: string, bucket: Bucket, key: string): SharedRevalidations {
+export function getSharedRevalidations(bucketName: string, bucket: BucketRef, key: string): SharedRevalidations {
   const id = `${bucketName}/${key}`;
   let store = stores.get(id);
   if (!store) {

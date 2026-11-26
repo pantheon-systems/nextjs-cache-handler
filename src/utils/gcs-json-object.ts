@@ -1,4 +1,4 @@
-import { Storage, RETRYABLE_ERR_FN_DEFAULT, type ApiError, type Bucket } from '@google-cloud/storage';
+import type { ApiError, Bucket, Storage } from '@google-cloud/storage';
 import { createLogger } from './logger.js';
 
 /**
@@ -25,25 +25,50 @@ export interface JsonObjectSnapshot<T> {
  */
 export type StoragePurpose = 'entries' | 'tags';
 
-const storageClients = new Map<string, Storage>();
+/** A bucket, or the promise of one while `@google-cloud/storage` loads. */
+export type BucketRef = Bucket | Promise<Bucket>;
 
-/** One Storage client per bucket and purpose per process; Next.js builds a handler per request. */
-export function getSharedStorage(bucketName: string, purpose: StoragePurpose): Storage {
+type StorageModule = typeof import('@google-cloud/storage');
+
+let storageModule: Promise<StorageModule> | null = null;
+
+/**
+ * `@google-cloud/storage`, loaded the first time a GCS bucket is needed rather than imported at module
+ * top level. Next.js 16.4 bundles `config.cacheHandler` into Node middleware, so a static import puts
+ * the library in every middleware bundle, and with `experimental.turbopackModuleFragments` its
+ * evaluation there throws (SITE-6759). Behind `import()` it stays out of the static graph.
+ */
+function loadStorageModule(): Promise<StorageModule> {
+  storageModule ??= import('@google-cloud/storage');
+  return storageModule;
+}
+
+const sharedBuckets = new Map<string, Promise<Bucket>>();
+
+/**
+ * One Storage client per bucket and purpose per process; Next.js builds a handler per request. A failed
+ * load is not retried: the process can't recover a missing or broken module.
+ */
+export function getSharedBucket(bucketName: string, purpose: StoragePurpose): Promise<Bucket> {
   const key = `${purpose}:${bucketName}`;
-  let storage = storageClients.get(key);
-  if (!storage) {
-    storage = purpose === 'tags' ? createTagsStorage() : new Storage(endpointOptions());
-    storageClients.set(key, storage);
+  let bucket = sharedBuckets.get(key);
+  if (!bucket) {
+    bucket = loadStorageModule().then((mod) =>
+      (purpose === 'tags' ? createTagsStorage(mod) : new mod.Storage(endpointOptions())).bucket(bucketName)
+    );
+    // Handlers hold this from construction; a failed load surfaces where they await it, not as an unhandled rejection.
+    bucket.catch(() => {});
+    sharedBuckets.set(key, bucket);
   }
-  return storage;
+  return bucket;
 }
 
 /** Retries transient errors but not 429: the caller's paced backoff handles those, and the flush must not block on library retries. */
-function createTagsStorage(): Storage {
-  return new Storage({
+function createTagsStorage(mod: StorageModule): Storage {
+  return new mod.Storage({
     ...endpointOptions(),
     retryOptions: {
-      retryableErrorFn: (err: ApiError) => RETRYABLE_ERR_FN_DEFAULT(err) && getErrorStatusCode(err) !== 429,
+      retryableErrorFn: (err: ApiError) => mod.RETRYABLE_ERR_FN_DEFAULT(err) && getErrorStatusCode(err) !== 429,
     },
   });
 }
@@ -80,7 +105,7 @@ function endpointOptions(): { apiEndpoint?: string } {
 
 /** @internal Test hook. */
 export function resetSharedStorageForTests(): void {
-  storageClients.clear();
+  sharedBuckets.clear();
   endpointLogged = false;
 }
 
@@ -118,7 +143,8 @@ const MAX_READ_ATTEMPTS = 3;
  * Transport errors throw (not mistaken for empty); an unparseable object returns
  * `value: null` with its real generation so a conditional write can replace it.
  */
-export async function readJsonObject<T>(bucket: Bucket, key: string): Promise<JsonObjectSnapshot<T>> {
+export async function readJsonObject<T>(bucketRef: BucketRef, key: string): Promise<JsonObjectSnapshot<T>> {
+  const bucket = await bucketRef;
   for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt++) {
     let generation: string | number;
     try {
@@ -162,12 +188,12 @@ export async function readJsonObject<T>(bucket: Bucket, key: string): Promise<Js
  * receives a 412 otherwise.
  */
 export async function writeJsonObject(
-  bucket: Bucket,
+  bucket: BucketRef,
   key: string,
   value: unknown,
   generation?: string | number
 ): Promise<void> {
-  await bucket.file(key).save(JSON.stringify(value), {
+  await (await bucket).file(key).save(JSON.stringify(value), {
     resumable: false,
     metadata: { contentType: 'application/json' },
     ...(generation !== undefined ? { preconditionOpts: { ifGenerationMatch: generation } } : {}),
