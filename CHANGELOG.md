@@ -1,17 +1,12 @@
 # Changelog
 
-## 0.14.2
-
-### Fixed
-
-- Revalidations recorded against an older build are pruned again when a new build deploys on images that normalize file mtimes (Cloud Native Buildpacks set every mtime to 1980-01-01). The build time kept in `build-meta.json` (`builtAt`) was taken from the prerenders' mtimes, so it was 1980 and no revalidation was ever older than it. When the mtimes are normalized, `builtAt` is now the time the build was first recorded, the same time its build prerenders are dated to (see 0.14.1). A deploy from a build that already recorded a 1980 `builtAt` prunes nothing, as before; builds recorded by this version prune normally.
-
 ## 0.14.1
 
 ### Fixed
 
 - A `revalidateTag()` for a tag on thousands of pages no longer leaves the server unable to answer requests. The handler sent one CDN purge request per page, all started together: on a site where one tag covered about 40,000 cached URLs, the process logged `connect EMFILE` during each revalidation and stopped answering, and visitors got 502s until it finished. Purge requests now go through a queue, one per server process and purge target (a bundled copy of this package has its own).
 - Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
+- Revalidations recorded against an older build are pruned again when a new build deploys on images that normalize file mtimes (Cloud Native Buildpacks set every mtime to 1980-01-01). The build time kept in `build-meta.json` (`builtAt`) was taken from the prerenders' mtimes, so it was 1980 and no revalidation was ever older than it. When the mtimes are normalized, `builtAt` is now the time the build was first recorded, the same time its build prerenders are dated to (see above). A deploy from a build that already recorded a 1980 `builtAt` (0.14.0 or earlier) prunes nothing, as before; builds recorded by this version prune normally.
 
 ### Added
 
