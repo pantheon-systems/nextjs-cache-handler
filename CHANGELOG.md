@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.2
+
+### Fixed
+
+- Node middleware runs again with `experimental.turbopackModuleFragments` on. Next.js 16.4 bundles `config.cacheHandler` into Node middleware, and the GCS handler imported `@google-cloud/storage` at module top level, so the library was evaluated in the middleware bundle, where Turbopack's module fragments threw `ReferenceError: Cannot access '<x>' before initialization` on every request. The library is now loaded with `import()` the first time a GCS bucket is needed, which also keeps it out of every middleware bundle's static graph.
+
 ## 0.14.1
 
 ### Fixed

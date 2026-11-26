@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { Bucket, DeleteFileOptions, File } from '@google-cloud/storage';
+import type { DeleteFileOptions, File } from '@google-cloud/storage';
 import {
   ListPrefixError,
   deletePrefix,
@@ -10,7 +10,13 @@ import {
   listPrefixPages,
   type DeletePrefixProgress,
 } from './gcs-delete-prefix.js';
-import { isNotFound, isPreconditionFailure, readJsonObject, writeJsonObject } from './gcs-json-object.js';
+import {
+  isNotFound,
+  isPreconditionFailure,
+  readJsonObject,
+  writeJsonObject,
+  type BucketRef,
+} from './gcs-json-object.js';
 import type { Logger } from './logger.js';
 
 /**
@@ -100,9 +106,9 @@ export interface CleanupTagsMap {
 
 export interface RouteCacheCleanupConfig {
   /** Lists and deletes route entries. */
-  bucket: Bucket;
+  bucket: BucketRef;
   /** Reads and writes the job object, with preconditions. */
-  jobBucket: Bucket;
+  jobBucket: BucketRef;
   jobKey: string;
   /**
    * Holds a prune's removals from when they are decided until the keys of
@@ -202,7 +208,7 @@ function addRun(base: CleanupTotals, run: Omit<DeletePrefixProgress, 'lastName'>
  * of `keep` (a rollback to a version that ignores the job) and is replaced. Throws on a failed read or write.
  */
 export async function createCleanupJob(
-  jobBucket: Bucket,
+  jobBucket: BucketRef,
   jobKey: string,
   keep: string,
   opts: { deleteEntries: boolean; purgePending: boolean; replacedBuildAt?: number; now?: number }
@@ -283,7 +289,8 @@ export class RouteCacheCleanup {
   }
 
   private async run(keep: string): Promise<void> {
-    const { jobBucket, jobKey, log } = this.config;
+    const { jobKey, log } = this.config;
+    const jobBucket = await this.config.jobBucket;
     const location = `gs://${jobBucket.name}/${jobKey}`;
 
     const acquired = await this.acquire(keep);
@@ -709,7 +716,8 @@ export class RouteCacheCleanup {
 
   /** Take the lock on `keep`'s job, or null when there is none, it is another build's, or it is held. */
   private async acquire(keep: string): Promise<{ job: CleanupJob; generation: string | number } | null> {
-    const { jobBucket, jobKey, log } = this.config;
+    const { jobKey, log } = this.config;
+    const jobBucket = await this.config.jobBucket;
     const { value, generation } = await readJsonObject<CleanupJob>(jobBucket, jobKey);
     if (!value) {
       if (String(generation) !== '0') {

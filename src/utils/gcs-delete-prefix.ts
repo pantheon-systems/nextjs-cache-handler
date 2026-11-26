@@ -1,5 +1,5 @@
-import type { Bucket, DeleteFileOptions, File, GetFilesResponse } from '@google-cloud/storage';
-import { getErrorStatusCode, isNotFound, isPreconditionFailure } from './gcs-json-object.js';
+import type { DeleteFileOptions, File, GetFilesResponse } from '@google-cloud/storage';
+import { getErrorStatusCode, isNotFound, isPreconditionFailure, type BucketRef } from './gcs-json-object.js';
 
 /**
  * Listing and deleting every object under a prefix one page at a time, so
@@ -99,11 +99,12 @@ export class ListPrefixError extends Error {
  * backoff; one that keeps failing, or a permanent one (403), throws ListPrefixError.
  */
 export async function* listPrefixPages(
-  bucket: Bucket,
+  bucketRef: BucketRef,
   prefix: string,
   pageSize = DEFAULT_LIST_PAGE_SIZE,
   startOffset?: string
 ): AsyncGenerator<File[]> {
+  const bucket = await bucketRef;
   let pageToken: string | undefined;
   do {
     const query = {
@@ -208,7 +209,7 @@ export interface DeletePrefixResult {
  * `progress`, when a page can't be listed.
  */
 export async function deletePrefix(
-  bucket: Bucket,
+  bucket: BucketRef,
   prefix: string,
   opts: DeletePrefixOptions = {}
 ): Promise<DeletePrefixResult> {

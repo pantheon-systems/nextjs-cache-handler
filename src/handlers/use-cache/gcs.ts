@@ -16,7 +16,7 @@ import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
 import { EdgeCacheClear, createEdgeCacheClearer } from '../../edge/edge-cache-clear.js';
 import {
-  getSharedStorage,
+  getSharedBucket,
   readJsonObject,
   writeJsonObject,
   isPreconditionFailure,
@@ -97,8 +97,8 @@ const log = createLogger('UseCacheGcsHandler');
  * - Multi-instance deployments requiring shared cache
  */
 export class UseCacheGcsHandler implements UseCacheHandler {
-  private readonly bucket: Bucket;
-  private readonly tagsBucket: Bucket;
+  private readonly bucket: Promise<Bucket>;
+  private readonly tagsBucket: Promise<Bucket>;
   private readonly cachePrefix: string;
   private readonly tagsKey: string;
   // Resolved once per instance, not per call: getCacheGenerationId()'s last-resort
@@ -140,8 +140,8 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     // Two clients on purpose: unconditional entry writes disable retries on
     // their client's shared state, which must not leak into tag writes.
-    this.bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
-    this.tagsBucket = getSharedStorage(bucketName, 'tags').bucket(bucketName);
+    this.bucket = getSharedBucket(bucketName, 'entries');
+    this.tagsBucket = getSharedBucket(bucketName, 'tags');
 
     const envPrefix = getEnvironmentPrefix();
     this.cachePrefix = `${envPrefix}use-cache/`;
@@ -174,7 +174,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
   }
 
   private async checkBuildInvalidation(): Promise<void> {
-    const file = this.bucket.file(this.buildMetaKey);
+    const file = (await this.bucket).file(this.buildMetaKey);
 
     // undefined: none stored. Not valid JSON: an unknown previous generation.
     let previousBuildId: string | undefined;
@@ -234,7 +234,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
   private async loadTagTimestamps(): Promise<void> {
     try {
-      const file = this.bucket.file(this.tagsKey);
+      const file = (await this.bucket).file(this.tagsKey);
       const [exists] = await file.exists();
 
       if (!exists) {
@@ -439,7 +439,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
 
     try {
       const gcsKey = this.getCacheKey(cacheKey);
-      const file = this.bucket.file(gcsKey);
+      const file = (await this.bucket).file(gcsKey);
 
       const [exists] = await file.exists();
       if (!exists) {
@@ -521,7 +521,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       // see the matching check in get().
       const withBuildId = { ...serialized, __buildId: this.buildId };
       const gcsKey = this.getCacheKey(cacheKey);
-      const file = this.bucket.file(gcsKey);
+      const file = (await this.bucket).file(gcsKey);
       const json = JSON.stringify(withBuildId);
 
       // Before the write, so a read racing it is already served from memory.
@@ -631,7 +631,7 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       await this.ensureInitialized();
 
       // List all files in the use-cache prefix
-      const [files] = await this.bucket.getFiles({ prefix: this.cachePrefix });
+      const [files] = await (await this.bucket).getFiles({ prefix: this.cachePrefix });
 
       for (const file of files) {
         // Skip tags file

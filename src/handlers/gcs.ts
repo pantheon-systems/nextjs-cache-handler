@@ -19,11 +19,12 @@ import {
   type TagsMappingSnapshot,
 } from '../utils/tags-buffer.js';
 import {
-  getSharedStorage,
+  getSharedBucket,
   isNotFound,
   readJsonObject,
   writeJsonObject,
   resetSharedStorageForTests,
+  type BucketRef,
 } from '../utils/gcs-json-object.js';
 import { createLogger } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
@@ -74,7 +75,7 @@ const sharedTagsBuffers = new Map<string, TagsBuffer>();
 
 function getSharedTagsBuffer(
   bucketName: string,
-  tagsBucket: Bucket,
+  tagsBucket: BucketRef,
   tagsMapKey: string,
   onFlushed: (added: FlushedKey[]) => Promise<void>
 ): TagsBuffer {
@@ -210,7 +211,7 @@ async function purgeMissedRevalidations(
   }
 }
 
-async function readTagsSnapshot(bucket: Bucket, tagsMapKey: string): Promise<TagsMappingSnapshot> {
+async function readTagsSnapshot(bucket: BucketRef, tagsMapKey: string): Promise<TagsMappingSnapshot> {
   const { value, generation } = await readJsonObject<TagsMapping>(bucket, tagsMapKey);
   return { mapping: value ?? {}, generation };
 }
@@ -308,8 +309,8 @@ export function resetGcsSharedState(): void {
  */
 export class GcsCacheHandler extends BaseCacheHandler {
   private readonly bucketName: string;
-  private readonly bucket: Bucket;
-  private readonly tagsBucket: Bucket;
+  private readonly bucket: Promise<Bucket>;
+  private readonly tagsBucket: Promise<Bucket>;
   private readonly fetchCachePrefix: string;
   private readonly routeCachePrefix: string;
   private readonly imageCachePrefix: string;
@@ -335,8 +336,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
     this.bucketName = bucketName;
     // Two clients on purpose: unconditional entry writes disable retries on
     // their client's shared state, which must not leak into tag-map writes.
-    this.bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
-    this.tagsBucket = getSharedStorage(bucketName, 'tags').bucket(bucketName);
+    this.bucket = getSharedBucket(bucketName, 'entries');
+    this.tagsBucket = getSharedBucket(bucketName, 'tags');
 
     const envPrefix = getEnvironmentPrefix();
     this.fetchCachePrefix = `${envPrefix}fetch-cache/`;
@@ -473,7 +474,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
     try {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
-      const file = this.bucket.file(gcsKey);
+      const file = (await this.bucket).file(gcsKey);
 
       const [exists] = await file.exists();
       if (!exists) {
@@ -504,7 +505,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   ): Promise<void> {
     try {
       const gcsKey = this.getCacheKey(cacheKey, cacheType);
-      const file = this.bucket.file(gcsKey);
+      const file = (await this.bucket).file(gcsKey);
 
       const serializedData = this.serializeForStorage({ [cacheKey]: cacheValue });
       // Route entries carry their build (see readCacheEntry). Fetch and image
@@ -535,7 +536,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   protected async readBuildMeta(): Promise<BuildMeta | null> {
     let data: Buffer;
     try {
-      [data] = await this.bucket.file(this.buildMetaKey).download();
+      [data] = await (await this.bucket).file(this.buildMetaKey).download();
     } catch (error) {
       if (isNotFound(error)) {
         return null;
@@ -546,7 +547,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
   }
 
   protected async writeBuildMeta(meta: BuildMeta): Promise<void> {
-    const file = this.bucket.file(this.buildMetaKey);
+    const file = (await this.bucket).file(this.buildMetaKey);
     await file.save(JSON.stringify(meta), {
       resumable: false,
       metadata: { contentType: 'application/json' },
@@ -654,7 +655,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
       restore: async (keysByObject) => {
         let queued = 0;
         const results = await mapInBatches([...keysByObject], resolveDeleteConcurrency(), async ([name, keys]) => {
-          const [data] = await this.bucket.file(name).download();
+          const [data] = await (await this.bucket).file(name).download();
           const { tags } = JSON.parse(data.toString()) as { tags?: unknown };
           const strings = Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : [];
           for (const key of keys) {
@@ -704,10 +705,11 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // Route keys start with `/`; fetch keys are hashes.
     const fetchKeys = [...new Set(tags.flatMap((tag) => mapping[tag] ?? []))].filter((key) => !key.startsWith('/'));
 
+    const bucket = await this.bucket;
     for (let i = 0; i < fetchKeys.length; i += FETCH_DELETE_BATCH_SIZE) {
       await Promise.all(
         fetchKeys.slice(i, i + FETCH_DELETE_BATCH_SIZE).map((key) =>
-          this.bucket
+          bucket
             .file(this.getCacheKey(key, 'fetch'))
             .delete()
             .catch((error: unknown) => {
@@ -886,8 +888,7 @@ export async function getSharedCacheStats(options: SharedCacheStatsOptions = {})
     return { size: 0, keys: [], entries: [] };
   }
 
-  const storage = getSharedStorage(bucketName, 'entries');
-  const bucket = storage.bucket(bucketName);
+  const bucket = await getSharedBucket(bucketName, 'entries');
 
   const envPrefix = getEnvironmentPrefix();
   const fetchCachePrefix = `${envPrefix}fetch-cache/`;
@@ -992,7 +993,7 @@ export async function getSharedCacheCounts(): Promise<SharedCacheCounts> {
     gcsLog.debug('CACHE_BUCKET environment variable not found');
     return emptySharedCacheCounts();
   }
-  const bucket = getSharedStorage(bucketName, 'entries').bucket(bucketName);
+  const bucket = await getSharedBucket(bucketName, 'entries');
   const envPrefix = getEnvironmentPrefix();
 
   const byGeneration: Record<string, number> = {};
@@ -1068,8 +1069,7 @@ export async function clearSharedCache(): Promise<number> {
     return 0;
   }
 
-  const storage = getSharedStorage(bucketName, 'entries');
-  const bucket = storage.bucket(bucketName);
+  const bucket = await getSharedBucket(bucketName, 'entries');
 
   const envPrefix = getEnvironmentPrefix();
   const fetchCachePrefix = `${envPrefix}fetch-cache/`;
