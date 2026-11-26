@@ -4,14 +4,42 @@
 
 ### Fixed
 
+- A `revalidateTag()` for a tag on thousands of pages no longer leaves the server unable to answer requests. The handler sent one CDN purge request per page, all started together: on a site where one tag covered about 40,000 cached URLs, the process logged `connect EMFILE` during each revalidation and stopped answering, and visitors got 502s until it finished. Purge requests now go through a queue, one per server process and purge target (a bundled copy of this package has its own).
 - Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
 
+### Added
+
+- `CACHE_PURGE_CONCURRENCY` sets how many CDN purge requests are in flight at once per server process (default `10`, clamped to `1`–`200`).
+- `CACHE_PURGE_MAX_PATHS` sets the most path purges outstanding (default `200`): the paths one purge adds plus those still waiting to be sent. Paths that are already waiting are not counted again. A purge that would take the total over it sends the tags as keys and one full purge instead. This clears the site's whole CDN cache, so a site whose tags cover most of its pages now gets a full purge on most revalidations. It applies to every path purge, including `clearEdgeCachePaths()`.
+- `CacheClearResult.fullPurge` is `true` when a path purge was replaced by a full purge.
+
+### Changed
+
+- A path, key or full purge that is already waiting to be sent is not sent twice; one already in flight is sent once more after it, however often it is requested meanwhile. A full purge that has not started covers the path purges waiting with it, and is sent ahead of the key purges waiting with it.
+- After a 429 or 5xx from the purge service the handler pauses purges for the response's `Retry-After`, or 1 s doubling, at most 30 s. A refused path or key purge is not retried; a refused full purge is sent again after the pause, up to three times in all. Purges waiting or requested during the pause are sent after it, one at a time until the service answers normally. When the pauses of refusals in a row add up to two minutes (the eighth refusal with the default doubling) the purges still waiting are given up on and logged.
+- A purge request's timeout (5 s for a path or key, 10 s for a full purge) now runs from when the request starts, not from when it was asked for, so a request that waits its turn is not timed out early.
+- `revalidateTag()` and `revalidatePath()` wait at most 10 s for their first purge, a new build waits at most 10 s for its full purge before serving, and `flushSharedTagsMapping()` waits for the purges it sends until its deadline. A purge that takes longer is still sent. When a pause after a refusal has 10 s or more left, `revalidateTag()` and `revalidatePath()` do not wait at all. A new build whose full purge is refused starts serving after that first answer, as before; the purge is now sent again in the background. The background clean-up after a new build waits at most 10 s for its full purge, as before, and tries again on its next run if there was no answer. Before, the longest wait was one request's timeout (5 s for paths and keys, 10 s for a full purge); a purge that has to wait its turn could otherwise take longer than that.
+- `CacheClearResult.paths` lists cleared paths and keys in the order they were given, not the order the requests finished.
+- Debug lines that list purged paths show the first ten and a count of the rest.
+
 #### Logs
+
+*New warnings:*
+
+- `One purge added <n> paths[, with <n> path purges already waiting], over CACHE_PURGE_MAX_PATHS (<max>): purging the whole edge cache instead`
+- `Purge service answered HTTP <status>: pausing edge purges for <n> ms (<n> waiting, sent after the pause, one at a time until the service answers normally)`
+- `Purge service answered HTTP <status>: pausing edge purges for <n> ms`, alone, when the refusals reach the two minutes with nothing waiting
+- `Purge service answered HTTP <status>: pausing edge purges for <n> ms. It has refused <n> requests in a row through <n> s of pauses: gave up on <n> edge purges that were waiting. The CDN keeps those entries until they expire or are purged again`
+- `<n> delayed CDN purge(s) had no answer by the shutdown deadline; any not yet sent are lost if the process exits now`
+- `Failed to clear the whole edge cache: HTTP <status>` and `Error clearing the whole edge cache:`. A failed full purge was not logged when its caller did not read the result.
 
 *Added:*
 
 - `Build prerender <key> has a normalized mtime (<time>); dating it <time>` (debug).
 
+*Changed:*
+
+- `Failed to clear path <path>: HTTP <status>`, `Error clearing path <path>:` and the same for keys are logged once per request sent, not once per caller that shared it.
 ## 0.14.0
 
 ### Added

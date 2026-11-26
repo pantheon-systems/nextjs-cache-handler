@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { UseCacheEntry } from '../../src/handlers/use-cache/types.js';
+import { PURGE_WAIT_MS } from '../../src/edge/edge-cache-clear.js';
+import { resetPurgeQueuesForTests } from '../../src/edge/purge-queue.js';
 
 // Reproduces the "redeploy the same Multidev environment" scenario behind the
 // use-cache-metadata-route-handler sitemap/manifest.json regression: a route
@@ -315,6 +317,59 @@ describe('use-cache build scoping', () => {
           'http://proxy.example.com:8080/rest/v0alpha1/cache',
           expect.objectContaining({ method: 'DELETE' })
         );
+      });
+
+      it('serves after PURGE_WAIT_MS when the purge service has not answered', async () => {
+        const handlerA = new UseCacheGcsHandler();
+        await handlerA.get('sitemap', []);
+        vi.mocked(fetch).mockClear();
+        vi.mocked(fetch).mockImplementation(() => new Promise<Response>(() => {}));
+        // Only the timers: the handler's storage reads still need the real event loop.
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+          mockBuildId = 'build-B';
+          let served = false;
+          const request = new UseCacheGcsHandler().get('sitemap', []).then(() => {
+            served = true;
+          });
+          await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+          expect(served).toBe(false);
+
+          await vi.advanceTimersByTimeAsync(PURGE_WAIT_MS);
+          await request;
+        } finally {
+          vi.useRealTimers();
+          // The purge that got no answer is still in flight, and would hold back every later one.
+          resetPurgeQueuesForTests();
+          vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+        }
+      });
+
+      it('serves on the first refusal without waiting for the purge to be sent again', async () => {
+        const handlerA = new UseCacheGcsHandler();
+        await handlerA.get('sitemap', []);
+        vi.mocked(fetch).mockClear();
+        vi.mocked(fetch).mockImplementation(async () => new Response('Bad Gateway', { status: 502 }));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        try {
+          mockBuildId = 'build-B';
+          let served = false;
+          void new UseCacheGcsHandler().get('sitemap', []).then(() => {
+            served = true;
+          });
+          // Far short of the second pause the queue takes before it sends the purge again.
+          await vi.waitFor(() => expect(served).toBe(true));
+          expect(fetch).toHaveBeenCalledTimes(1);
+
+          await vi.advanceTimersByTimeAsync(1000 + 2000);
+          await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+        } finally {
+          vi.useRealTimers();
+          warn.mockRestore();
+          resetPurgeQueuesForTests();
+          vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+        }
       });
 
       it('does not clear the edge cache when the build id is unchanged', async () => {
