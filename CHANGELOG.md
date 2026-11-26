@@ -1,16 +1,11 @@
 # Changelog
 
-## 0.14.2
-
-### Fixed
-
-- Node middleware runs again with `experimental.turbopackModuleFragments` on. Next.js 16.4 bundles `config.cacheHandler` into Node middleware, and the GCS handler imported `@google-cloud/storage` at module top level, so the library was evaluated in the middleware bundle, where Turbopack's module fragments threw `ReferenceError: Cannot access '<x>' before initialization` on every request. The library is now loaded with `import()` the first time a GCS bucket is needed, which also keeps it out of every middleware bundle's static graph.
-
 ## 0.14.1
 
 ### Fixed
 
 - Build-time prerenders are served again when the image normalizes file mtimes, as Cloud Native Buildpacks do (every mtime is 1980-01-01). Next.js takes a build prerender's age from its mtime, so from 16.4 it treated each one as past its `expire` and re-rendered it on the first request to each instance (`x-nextjs-cache: REVALIDATED`), discarding build-time values such as `'use cache'` results. A build prerender whose mtime is before 2000 is now dated to when its build was first recorded, or to the process start when no build is recorded.
+- Node middleware runs again with `experimental.turbopackModuleFragments` on. Next.js 16.4 bundles `config.cacheHandler` into Node middleware, and the GCS handler imported `@google-cloud/storage` at module top level, so the library was evaluated in the middleware bundle, where Turbopack's module fragments threw `ReferenceError: Cannot access '<x>' before initialization` on every request. The library is now loaded with `import()` the first time a GCS bucket is needed, which also keeps it out of every middleware bundle's static graph.
 
 #### Logs
 
