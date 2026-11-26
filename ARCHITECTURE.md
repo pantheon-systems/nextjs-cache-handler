@@ -143,7 +143,7 @@ sequenceDiagram
   A->>G: read tags.json, overlay this process's unflushed keys
   A->>A: + build-prerender keys for the tag, + implicit _N_T_ paths
   A->>A: keys → public paths (basePath, trailingSlash, delimiter escapes decoded)
-  A->>P: FIRST PURGE: DELETE /keys/TAG per tag + DELETE /paths/PATH per path, all at once (for revalidatePath('/', 'layout'): the key DELETEs plus one full purge instead of the paths)
+  A->>P: FIRST PURGE: DELETE /keys/TAG per tag + DELETE /paths/PATH per path, through the purge queue (for revalidatePath('/', 'layout'), or for more paths than CACHE_PURGE_MAX_PATHS: the key DELETEs plus one full purge instead of the paths)
   P->>CDN: purge
   A-->>Caller: response (after the revalidations.json store, up to about 5 s, the tags.json read and the first purge, not the second purge)
 
@@ -185,7 +185,7 @@ What each step depends on:
 |---|---|---|
 | Store revalidation | `shared-revalidations.ts`, `revalidateTag` in `base.ts` | Retried on later reads and at `flushSharedTagsMapping()`; the second purge waits for the store (`whenStored` in `onRevalidateComplete`, `gcs.ts`). Other instances keep serving the old page until the store succeeds. |
 | Read tags map | `readTagsMapping` in `gcs.ts` | Logged; the tags, the implicit `_N_T_` paths, this process's own keys and build prerenders are still purged, but keys only other instances flushed are missed. |
-| First purge | `purgeTags` in `gcs.ts`, `clearPaths` and `clearKeys` in `edge-cache-clear.ts` | One request per path, no retry. Inside the request, so it has CPU. |
+| First purge | `purgeTags` in `gcs.ts`, `clearPaths` and `clearKeys` in `edge-cache-clear.ts` | One request per path up to `CACHE_PURGE_MAX_PATHS`, one full purge above it; no retry. Started inside the request, so it has CPU; the request waits for it at most 10 s, and what is still queued then is sent when the instance next has CPU. |
 | Purge by an instance that learned of it | `shared-revalidations.ts` (`notifyLearned`), `purgeServedAfterRevalidation` in `gcs.ts` | Logged, never rejects; one request per path, no retry. Skipped for revalidations found on the instance's first read, and never covers build-prerender hits. |
 | Second purge | `onRevalidateComplete` in `gcs.ts`, `delayed-purges.ts` | On a timer: with request-based CPU it fires at the instance's next request; lost if the process stops first, unless the app calls `flushSharedTagsMapping()` (needs `NEXT_MANUAL_SIG_HANDLE`). |
 
@@ -240,14 +240,113 @@ flowchart TB
   keysPaths -- "nukeCache() (full purges)" --> one
   t8 -- "background, only paths this process served" --> paths1
 
-  keysPaths --> fan["One DELETE per path / key,<br/>all at once (Promise.all),<br/>5 s timeout each, no retry"]
+  keysPaths --> fan["One DELETE per path / key,<br/>5 s timeout each, no retry"]
   paths1 --> fan
-  nuke --> one["One DELETE /cache,<br/>10 s timeout, no retry"]
-  fan --> proxy[OUTBOUND_PROXY_ENDPOINT /rest/v0alpha1/cache]
-  one --> proxy
+  fan -- "more paths than CACHE_PURGE_MAX_PATHS" --> one
+  nuke --> one["One DELETE /cache,<br/>10 s timeout, sent again after 429 / 5xx<br/>(3 times in all)"]
+  fan --> queue["PurgeQueue, one per target:<br/>CACHE_PURGE_CONCURRENCY in flight,<br/>repeats merged, pauses on 429 / 5xx"]
+  one --> queue
+  queue --> proxy[OUTBOUND_PROXY_ENDPOINT /rest/v0alpha1/cache]
 ```
 
-Request shapes (`edge-cache-clear.ts`):
+### The purge queue
+
+Every purge request a process sends goes through one `PurgeQueue` (`src/edge/purge-queue.ts`).
+
+Why it exists: one `revalidateTag()` purges every page that carries the tag, one request per page.
+These used to start all together. On a site where one tag covered about 40,000 pages the process ran
+out of sockets (`connect EMFILE`) and could not answer visitors until the requests finished.
+
+Next constructs a handler, and so a clearer, per request, so the queue belongs to the purge target
+and is shared by the whole process. A limit kept per clearer would be a limit per request.
+
+| Limit | Value | Set by |
+|---|---|---|
+| Requests in flight | 10 | `CACHE_PURGE_CONCURRENCY` (1 to 200) |
+| Path purges waiting before one full purge replaces them | 200 | `CACHE_PURGE_MAX_PATHS` |
+| Pause after a 429 or 5xx | `Retry-After`, or 1 s doubling; at most 30 s | `MAX_BACKOFF_MS` |
+| Times a full purge is sent | 3 | `FULL_PURGE_ATTEMPTS` |
+| Pauses in a row before giving up on what is waiting | 2 minutes in total | `GIVE_UP_AFTER_PAUSED_MS` |
+| Longest a caller waits for its purge | 10 s | `PURGE_WAIT_MS` |
+
+#### Sending
+
+- **Limit.** At most `CACHE_PURGE_CONCURRENCY` requests are in flight; the rest wait. A request's
+  timeout runs from when it starts, not from when it was queued.
+- **Repeats.** A path, key or full purge that is already waiting is not queued again; the callers
+  share the one request. One that is already in flight is sent once more after it finishes, however
+  many times it was asked for meanwhile. It is not joined, because the request in flight may have
+  reached the CDN before the change the repeat is for.
+- **Fan-out cap.** `clearPaths` sends one full purge instead, and logs a warning with the counts,
+  when its distinct paths that are not already queued, plus the path purges already waiting, come to
+  more than `CACHE_PURGE_MAX_PATHS`. A repeat of paths that are waiting adds nothing. Counting the
+  waiting ones is what bounds the queue: the full purge absorbs them. This applies to every caller:
+  first, second and learned-revalidation purges, and `clearEdgeCachePaths()`.
+- **Full purges.** A full purge that has not started covers every path purge waiting with it, and any
+  requested before it starts. That includes a full purge requested while another is in flight, which
+  is sent after it. It goes ahead of everything waiting, so a new build's purge does not wait behind
+  other purges. Key purges are still sent, after it.
+
+A site whose tags cover most of its pages, such as a menu rendered on every page, gets a full purge
+on nearly every revalidation. That clears what the CDN holds for the site, which then refills from
+the origin as pages are requested.
+
+#### When the purge service refuses a request (429 or 5xx)
+
+- **Pause.** The queue stops starting requests for the response's `Retry-After`, or 1 s doubling per
+  refusal in a row, in both cases at most 30 s. Refusals of requests sent before the pause began
+  count as the same burst. Purges waiting, and those requested during the pause, are kept and merged.
+- **Recovery.** After the pause, purges are sent one at a time until the service answers one normally
+  (a timeout does not count), then at the usual limit. Recovery also ends when a purge is requested
+  with nothing waiting or in flight and the pause ended more than 30 s ago: a single refusal would
+  otherwise leave an empty queue in recovery, counting the next refusal as one more in a row however
+  much later it came. Purges left waiting by a late pause timer, or behind requests that time out,
+  still belong to the same recovery and go one at a time.
+- **What is sent again.** A refused path or key purge is not. A refused full purge is, up to
+  `FULL_PURGE_ATTEMPTS` times in all: it is one request standing for every path it absorbed, and
+  because it goes to the front it is the first request after a pause, when a refusal is most likely.
+  It goes back to the front and is sent after a pause (at least the 1 s base, even if its refusal
+  arrived after the pause it belonged to had ended). A full purge requested meanwhile shares the next
+  attempt. If the last attempt is refused too, or it fails any other way, the paths it stood for are
+  not purged and nothing sends them again. So a new build's purge, and each run of the background
+  clean-up's purge, can be up to three requests.
+- **Giving up.** When the pauses of refusals in a row add up to `GIVE_UP_AFTER_PAUSED_MS` (the eighth
+  refusal with the default doubling, fewer when `Retry-After` asks for longer pauses), the purges
+  still waiting are failed with one warning, and a full purge refused at that point is not sent
+  again. Without this a service that never recovers would get one request per pause for as long as
+  purges waited. The sum is of the pauses asked for, not of time that has passed, so a timer that
+  fires late on a throttled instance cannot trigger it. Afterwards the sum starts again: purges
+  requested later are queued and get the same two minutes, while the pauses stay as long as they had
+  become.
+- **The pause timer keeps the process alive.** It is deliberately not unref'd, so a script that
+  awaits a purge does not exit before it is sent. The cost is that a process with purges waiting,
+  `next build` included, stays up until they are sent or given up on.
+
+#### How long callers wait
+
+A purge can wait for a slot or through pauses, and on Cloud Run the timer that ends a pause can fire
+late. So callers that wait on a purge stop waiting after `PURGE_WAIT_MS`, which is a full purge's own
+timeout and was the longest wait before there was a queue. The purge stays queued and is still sent.
+
+| Caller | Waits |
+|---|---|
+| First purge of a revalidation (`purgeTags`) | 10 s. Not at all when a pause has at least 10 s left (`EdgeCacheClear.revalidationWaitMs`): nothing would be sent before it stopped waiting, and a CMS that retries on timeout would add to the load. Through a shorter pause it waits, so the purge goes out while the request is being served and the instance has CPU |
+| Full purge of a new build, before serving (both handlers) | 10 s, and only for the answer to the first request (`nukeCacheWithFirstAnswer()`), as before the queue. A refused purge is sent again in the background |
+| Background clean-up's full purge | 10 s. It holds a lock while it waits |
+| Shutdown flush of second purges | Until the deadline `flushSharedTagsMapping()` was given; warns if they are not all answered by then |
+| Public `clearEdgeCachePaths()`, `clearEdgeCache()` | The real result, at most until the queue gives up |
+
+A purge that outlasts its caller's wait counts as failed for that caller. A new build whose full purge
+is answered after the 10 s, or refused on its first request, records it as pending for the background
+clean-up, which runs about a minute later. If the queue got that purge through in the meantime, in the
+same process, the clean-up counts it as sent and does not purge again. When the clean-up runs in
+another instance it cannot know, and sends one more full purge.
+
+A failed request is logged where it is sent, once, not by each caller that shared it.
+
+### Request shapes
+
+From `edge-cache-clear.ts`:
 
 | Purge | Request | Encoding |
 |---|---|---|
@@ -271,10 +370,10 @@ as `/what?`) and with the trailing slash Next serves. `clearEdgeCachePaths()` ap
 same trailing-slash rule to the paths a caller passes and also drops any query string or
 fragment, since the CDN keys a page by its path alone.
 
-What gets grouped today: paths are deduplicated per revalidation (`purgeTarget` in `gcs.ts`) and per
+What gets grouped: paths are deduplicated per revalidation (`purgeTarget` in `gcs.ts`) and per
 `clearPaths` call, and second purges due within 1 s of each other are merged per target
-(`delayed-purges.ts`). Other purges are not merged across calls, and requests in flight or per
-second are not limited either; per-tenant limits are left to the platform.
+(`delayed-purges.ts`). Across calls, the purge queue merges repeats and limits requests in flight (above).
+Requests per second are not limited; per-tenant limits are left to the platform.
 
 ## 5. Deploys (new generation)
 
@@ -360,8 +459,9 @@ is unique, so it would otherwise never hit).
 | Build ID unreadable (`fallback-*`) | The route handler skips the build check (warning on every start): a deploy neither deletes nor purges for it, and it serves route entries from any generation. The `use cache` handler has no such skip: it purges the whole CDN and rewrites `_build-meta.json` on every start and `getUseCacheStats()` call, and other processes delete its entries when they read them | – |
 | `revalidations.json`, `use-cache/_tags.json` keep growing | `revalidations.json` is pruned only at a deploy, and never when the previous build recorded no `builtAt`. `_tags.json` and each process's tag timestamps are never pruned. Old-generation `use cache` objects are deleted only when read | README "How long revalidations are kept" (revalidations.json only) |
 | `use cache` tag write fails | `updateTags()` still resolves. The retry runs on an unref'd timer that `flushSharedTagsMapping()` does not flush, so it can be late or lost | – |
-| Some full-purge failures leave no trace | `nukeCache()` does not log, and the full purge for `revalidatePath('/', 'layout')` and second full purges ignore its result | – |
-| Learned-revalidation purge limits | Needs `OUTBOUND_PROXY_ENDPOINT` (no `servedAt` otherwise) and forgets paths past the 5000 most recent. For `revalidatePath('/', 'layout')` it can send one `DELETE` per remembered path, all at once | – |
+| A refused path or key purge is not sent again | After a 429 or 5xx, or a timeout, the page stays in the CDN until it expires or is purged again. Only a full purge is sent again (section 4, the purge queue) | – |
+| A purge over `CACHE_PURGE_MAX_PATHS` clears the whole CDN cache | A tag on more than 200 pages purges every page of the site, tagged or not, and the origin serves them until the CDN refills. Raise the limit to purge by path | README "Limits on purge requests" |
+| Learned-revalidation purge limits | Needs `OUTBOUND_PROXY_ENDPOINT` (no `servedAt` otherwise) and forgets paths past the 5000 most recent. For `revalidatePath('/', 'layout')` it sends one `DELETE` per remembered path, or one full purge when there are more than `CACHE_PURGE_MAX_PATHS` | – |
 | `clearSharedCache()` | Purges the CDN only if it deleted entries. It deletes `tags.json` while the static-route entries it keeps stay, so revalidations no longer find them. It leaves `use-cache/` and `revalidations.json` | – |
 
 More on the `use cache` gap. A read on this instance can return outdated data when all of these hold:

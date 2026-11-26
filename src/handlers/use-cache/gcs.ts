@@ -14,7 +14,13 @@ import { resolveTagsRefreshIntervalMs } from '../../utils/shared-revalidations.j
 import { createLogger } from '../../utils/logger.js';
 import { getEnvironmentPrefix } from '../../utils/environment-prefix.js';
 import { getCacheGenerationId, isBuildPhase } from '../../utils/build-detection.js';
-import { EdgeCacheClear, createEdgeCacheClearer } from '../../edge/edge-cache-clear.js';
+import {
+  EdgeCacheClear,
+  PURGE_NOT_CONFIRMED,
+  PURGE_WAIT_MS,
+  createEdgeCacheClearer,
+  settledWithin,
+} from '../../edge/edge-cache-clear.js';
 import {
   getSharedBucket,
   readJsonObject,
@@ -200,11 +206,14 @@ export class UseCacheGcsHandler implements UseCacheHandler {
       // Awaited, not the usual fire-and-forget nukeCacheInBackground used
       // for ordinary tag revalidation elsewhere: get()/set() block on
       // initPromise (via ensureInitialized()) before touching the store,
-      // so this guarantees the purge request has been issued before this
-      // process starts serving real traffic. Bounded by nukeCache()'s own
-      // internal timeout.
+      // so the purge is requested, and waited on for at most PURGE_WAIT_MS,
+      // before this process starts serving real traffic. Behind other purges
+      // or a pause it may still be waiting to be sent when that wait ends.
+      // Only the first answer is waited for: the queue sends a refused purge again.
       if (this.edgeCacheClearer) {
-        const result = await this.edgeCacheClearer.nukeCache();
+        const result =
+          (await settledWithin(this.edgeCacheClearer.nukeCacheWithFirstAnswer().firstAnswer, PURGE_WAIT_MS)) ??
+          PURGE_NOT_CONFIRMED;
         if (!result.success) {
           log.warn(`Edge cache purge on build invalidation failed: ${result.error}`);
         }

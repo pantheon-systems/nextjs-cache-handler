@@ -9,7 +9,14 @@ import type {
   SharedCacheStatsOptions,
 } from '../types.js';
 import { BaseCacheHandler, getProcessGeneration, isFallbackGeneration, type BuildMeta } from './base.js';
-import { EdgeCacheClear, createEdgeCacheClearer } from '../edge/edge-cache-clear.js';
+import {
+  EdgeCacheClear,
+  PURGE_NOT_CONFIRMED,
+  PURGE_WAIT_MS,
+  createEdgeCacheClearer,
+  settledWithin,
+} from '../edge/edge-cache-clear.js';
+import { resetPurgeQueuesForTests } from '../edge/purge-queue.js';
 import { getStaticRoutes } from '../utils/static-routes.js';
 import {
   TagsBuffer,
@@ -26,7 +33,7 @@ import {
   resetSharedStorageForTests,
   type BucketRef,
 } from '../utils/gcs-json-object.js';
-import { createLogger } from '../utils/logger.js';
+import { createLogger, summarizeList } from '../utils/logger.js';
 import { getEnvironmentPrefix } from '../utils/environment-prefix.js';
 import { cacheKeyToPurgePath, implicitTagsToPurgePaths } from '../utils/route-paths.js';
 import {
@@ -120,6 +127,10 @@ const delayedPurges = new DelayedPurges();
 // One clean-up runner per (bucket, job object) per process, like the tag buffers.
 const routeCacheCleanups = new Map<string, RouteCacheCleanup>();
 
+// A new build's full purge that failed on its first answer, by the same key, with the result of
+// the queue's retry. The clean-up reads it so that it does not purge again after the retry succeeded.
+const newBuildPurgeRetries = new Map<string, Promise<{ success: boolean }>>();
+
 /**
  * Whether a route entry stamped with `generation` belongs to the running build.
  * A process that can't read its build ID serves any entry, as before stamping:
@@ -199,8 +210,8 @@ async function purgeMissedRevalidations(
     return;
   }
   const list = [...paths];
-  gcsLog.debug(`Purging edge paths revalidated before their keys were flushed: ${list.join(', ')}`);
-  clearer.clearPathsInBackground(list, `revalidated before flush: ${list.join(', ')}`);
+  gcsLog.debug(`Purging edge paths revalidated before their keys were flushed: ${summarizeList(list)}`);
+  clearer.clearPathsInBackground(list, `revalidated before flush: ${summarizeList(list)}`);
 
   // Purge again once every instance serves the revalidated entry, so one that
   // has not refreshed yet cannot put the old page back in the CDN.
@@ -297,7 +308,9 @@ export function resetGcsSharedState(): void {
   }
   sharedTagsBuffers.clear();
   delayedPurges.reset();
+  resetPurgeQueuesForTests();
   routeCacheCleanups.clear();
+  newBuildPurgeRetries.clear();
   servedAt.clear();
   resetSharedRevalidationsForTests();
   resetSharedStorageForTests();
@@ -387,7 +400,19 @@ export class GcsCacheHandler extends BaseCacheHandler {
         prefix: this.routeCachePrefix,
         generationOf: routeObjectGeneration,
         concurrency: () => resolveDeleteConcurrency(),
-        purge: edgeCacheClearer ? async () => (await edgeCacheClearer.nukeCache()).success : undefined,
+        // Limited, because the clean-up holds a lock while it waits and the queue may be paused or
+        // sending this purge again. No answer in time counts as a failure, so a later run sends it.
+        purge: edgeCacheClearer
+          ? async () => {
+              // Recorded as failed on its first answer, but the queue may have got it through since.
+              const queueRetry = newBuildPurgeRetries.get(key);
+              newBuildPurgeRetries.delete(key);
+              if (queueRetry && (await settledWithin(queueRetry, PURGE_WAIT_MS))?.success) {
+                return true;
+              }
+              return (await settledWithin(edgeCacheClearer.nukeCache(), PURGE_WAIT_MS))?.success ?? false;
+            }
+          : undefined,
         tagsMap: this.cleanupTagsMap(),
         failureHints: (labels) => deleteFailureHints(this.bucketName, labels),
         log: this.log,
@@ -571,9 +596,17 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
 
     // Awaited, so the purge is sent before this process serves a request that
-    // could race a still-cached previous-build page. Bounded by nukeCache()'s
-    // timeout; a failure is recorded on the job and retried in the background.
-    const purge = this.edgeCacheClearer ? await this.edgeCacheClearer.nukeCache() : { success: true };
+    // could race a still-cached previous-build page. Bounded by PURGE_WAIT_MS,
+    // and only for the first answer: a refused purge is sent again by the queue,
+    // but the request is not held for that. A failure, or no answer by then, is
+    // recorded on the job and retried in the background as well.
+    const sent = this.edgeCacheClearer?.nukeCacheWithFirstAnswer();
+    const purge = sent
+      ? ((await settledWithin(sent.firstAnswer, PURGE_WAIT_MS)) ?? PURGE_NOT_CONFIRMED)
+      : { success: true };
+    if (sent && !purge.success) {
+      newBuildPurgeRetries.set(`${this.bucketName}/${this.cleanupJobKey}`, sent.settled);
+    }
     const purgeFailed = `Edge cache purge on build invalidation failed: ${purge.error}.`;
     const stayInCdn =
       "pages from the previous build stay in the CDN until they expire or the site's edge cache is cleared.";
@@ -597,8 +630,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
     }
     if (!purge.success) {
       this.log.error(
-        `${purgeFailed} The background clean-up retries it (up to ${MAX_PURGE_RUNS} runs); until then, ` +
-          `pages from the previous build stay in the CDN.`
+        `${purgeFailed} It is sent again in the background (the clean-up makes up to ${MAX_PURGE_RUNS} runs); ` +
+          `until one succeeds, pages from the previous build stay in the CDN.`
       );
     }
   }
@@ -787,7 +820,7 @@ export class GcsCacheHandler extends BaseCacheHandler {
     if (paths.length === 0) {
       return;
     }
-    this.log.debug(`Purging edge paths served before learning of ${tags.join(', ')}: ${paths.join(', ')}`);
+    this.log.debug(`Purging edge paths served before learning of ${tags.join(', ')}: ${summarizeList(paths)}`);
     await clearer.clearPaths(paths);
   }
 
@@ -832,15 +865,18 @@ export class GcsCacheHandler extends BaseCacheHandler {
     // Keys are sent even when no keys were found: they only match once responses
     // carry the tags as Surrogate-Key, which the tenant router turns into purge keys.
     const context = `tag revalidation (${phase}): ${tags.join(', ')}`;
+    // The caller may be a request waiting on this (the first purge of a revalidation), so the
+    // wait is limited. A purge that takes longer still goes out.
+    const waitMs = clearer.revalidationWaitMs;
     if (purgeAll) {
-      await Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]);
-      this.log.debug(`Purged the whole site for ${context}`);
+      this.log.debug(`Purging the whole site for ${context}`);
+      await settledWithin(Promise.all([clearer.clearKeys(tags), clearer.nukeCache()]), waitMs);
       return;
     }
     if (paths.length > 0) {
-      this.log.debug(`Purging edge paths for ${context}: ${paths.join(', ')}`);
+      this.log.debug(`Purging edge paths for ${context}: ${summarizeList(paths)}`);
     }
-    await Promise.all([clearer.clearKeys(tags), clearer.clearPaths(paths)]);
+    await settledWithin(Promise.all([clearer.clearKeys(tags), clearer.clearPaths(paths)]), waitMs);
   }
 
   /**
@@ -869,8 +905,8 @@ export class GcsCacheHandler extends BaseCacheHandler {
         paths.push(toPublicPath(unprefixed, this.site));
       }
     }
-    this.log.debug(`Purging edge paths for ISR update of ${cacheKey}: ${paths.join(', ')}`);
-    this.edgeCacheClearer.clearPathsInBackground(paths, `ISR route update: ${paths.join(', ')}`);
+    this.log.debug(`Purging edge paths for ISR update of ${cacheKey}: ${summarizeList(paths)}`);
+    this.edgeCacheClearer.clearPathsInBackground(paths, `ISR route update: ${summarizeList(paths)}`);
   }
 }
 

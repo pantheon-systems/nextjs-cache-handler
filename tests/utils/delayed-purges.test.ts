@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { DelayedPurges, MERGE_WINDOW_MS } from '../../src/utils/delayed-purges.js';
-import type { EdgeCacheClear } from '../../src/edge/edge-cache-clear.js';
+import { type EdgeCacheClear } from '../../src/edge/edge-cache-clear.js';
 
 function fakeClearer(target = 'http://proxy/rest/v0alpha1/cache') {
   const ok = { success: true, duration: 0 };
@@ -37,6 +37,26 @@ describe('DelayedPurges', () => {
     await vi.advanceTimersByTimeAsync(1 + MERGE_WINDOW_MS);
     expect(clearer.clearPaths).toHaveBeenCalledWith(['/a']);
     expect(clearer.clearKeys).toHaveBeenCalledWith(['a']);
+  });
+
+  it('flush waits for answers until the deadline, then returns and says what may be lost', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    clearer.clearPaths.mockImplementation(() => new Promise(() => {}));
+    purges.schedule(asClearer(), { paths: ['/a'] }, Date.now(), 'a');
+
+    let returned = false;
+    const flushed = purges.flush(Date.now() + 8000).then(() => {
+      returned = true;
+    });
+    await vi.advanceTimersByTimeAsync(7999);
+    expect(returned).toBe(false);
+    expect(clearer.clearPaths).toHaveBeenCalledWith(['/a']);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await flushed;
+    expect(returned).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('1 delayed CDN purge(s) had no answer'));
+    warn.mockRestore();
   });
 
   it('sends purges due within the merge window as one, each path and key once', async () => {

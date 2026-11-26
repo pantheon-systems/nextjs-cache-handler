@@ -12,7 +12,7 @@ import type {
 import { serializeForStorage, deserializeFromStorage } from '../utils/serialization.js';
 import { getCacheGenerationId, isBuildPhase } from '../utils/build-detection.js';
 import { createLogger, type Logger } from '../utils/logger.js';
-import { loadBuildPrerenderTags, loadBuildTime } from '../utils/build-prerender-tags.js';
+import { loadBuildPrerenderTags, loadBuildTime, NORMALIZED_MTIME_BEFORE } from '../utils/build-prerender-tags.js';
 import type { SharedRevalidationMap } from '../utils/shared-revalidations.js';
 import { areTagsExpired, getTagRevalidation, nextChecksFetchTags, setTagRevalidation } from '../utils/tags-manifest.js';
 
@@ -23,14 +23,6 @@ let buildInvalidationPromise: Promise<void> | null = null;
 // every instance of a build agrees on it. Set by checkBuildInvalidation.
 let buildRecordedAt: number | null = null;
 const processStartedAt = Date.now();
-
-// A file mtime older than this was normalized, not written by the build.
-// Cloud Native Buildpacks set every mtime in an image to 1980-01-01 for
-// reproducible builds. Next.js takes a build prerender's age from its mtime,
-// so 16.4+ treats each one as past its `expire` (a year by default), re-renders
-// it in the foreground and returns `x-nextjs-cache: REVALIDATED`, discarding
-// the build-time output.
-const NORMALIZED_MTIME_BEFORE = Date.UTC(2000, 0, 1);
 
 // This process's generation, read once: the fallback is a fresh timestamp on
 // every call, and route entries are stamped with it (see GcsCacheHandler).
@@ -253,8 +245,9 @@ export abstract class BaseCacheHandler {
       );
       return;
     }
-    const builtAt = (await loadBuildTime(this.context?.serverDistDir)) ?? undefined;
-    const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp: Date.now(), builtAt };
+    const timestamp = Date.now();
+    const builtAt = (await loadBuildTime(this.context?.serverDistDir, timestamp)) ?? undefined;
+    const currentMeta: BuildMeta = { buildId: currentBuildId, timestamp, builtAt };
 
     let buildMeta: BuildMeta | null;
     try {
