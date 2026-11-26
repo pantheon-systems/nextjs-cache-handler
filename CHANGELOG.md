@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.2
+
+### Fixed
+
+- Revalidations recorded against an older build are pruned again when a new build deploys on images that normalize file mtimes (Cloud Native Buildpacks set every mtime to 1980-01-01). The build time kept in `build-meta.json` (`builtAt`) was taken from the prerenders' mtimes, so it was 1980 and no revalidation was ever older than it. When the mtimes are normalized, `builtAt` is now the time the build was first recorded, the same time its build prerenders are dated to (see 0.14.1). A deploy from a build that already recorded a 1980 `builtAt` prunes nothing, as before; builds recorded by this version prune normally.
+
 ## 0.14.1
 
 ### Fixed

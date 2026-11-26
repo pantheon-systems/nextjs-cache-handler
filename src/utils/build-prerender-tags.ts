@@ -19,6 +19,14 @@ const READ_BATCH_SIZE = 64;
 // Next uses as the entry's age; this allows for the gap between them.
 const BUILT_AT_MARGIN_MS = 60_000;
 
+// A file mtime older than this was normalized, not written by the build.
+// Cloud Native Buildpacks set every mtime in an image to 1980-01-01 for
+// reproducible builds. Next.js takes a build prerender's age from its mtime,
+// so 16.4+ treats each one as past its `expire` (a year by default), re-renders
+// it in the foreground and returns `x-nextjs-cache: REVALIDATED`, discarding
+// the build-time output.
+export const NORMALIZED_MTIME_BEFORE = Date.UTC(2000, 0, 1);
+
 interface BuildPrerenderIndex {
   tags: BuildPrerenderTags;
   /** Lower bound on every App Router prerender's age as Next sees it, or null. */
@@ -42,9 +50,16 @@ export async function loadBuildPrerenderTags(serverDistDir: string | undefined):
  * When the build's App Router prerenders were written, as Next measures their
  * age (file mtime), minus a margin; null without prerenders. A revalidation
  * older than this cannot affect them.
+ *
+ * When the mtimes were normalized (see NORMALIZED_MTIME_BEFORE) they say
+ * nothing about the build, and a 1980 time would keep every revalidation from
+ * ever being pruned. `recordedAt`, when the build was first recorded (the time
+ * BaseCacheHandler.getBuildPrerender dates the prerenders to), stands in.
  */
-export async function loadBuildTime(serverDistDir: string | undefined): Promise<number | null> {
-  return (await loadIndex(serverDistDir)).builtAt;
+export async function loadBuildTime(serverDistDir: string | undefined, recordedAt: number): Promise<number | null> {
+  const { builtAt } = await loadIndex(serverDistDir);
+  if (builtAt === null) return null;
+  return builtAt + BUILT_AT_MARGIN_MS < NORMALIZED_MTIME_BEFORE ? recordedAt - BUILT_AT_MARGIN_MS : builtAt;
 }
 
 function loadIndex(contextServerDistDir: string | undefined): Promise<BuildPrerenderIndex> {

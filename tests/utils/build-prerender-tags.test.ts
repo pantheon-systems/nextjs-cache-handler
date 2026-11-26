@@ -66,11 +66,25 @@ describe('loadBuildPrerenderTags', () => {
     const older = new Date('2026-10-01T10:00:00Z');
     fs.utimesSync(path.join(serverDistDir, 'app', 'a.meta'), older, older);
 
-    expect(await loadBuildTime(serverDistDir)).toBe(older.getTime() - 60_000);
+    expect(await loadBuildTime(serverDistDir, Date.now())).toBe(older.getTime() - 60_000);
   });
 
   it('reports no build time without App Router prerenders', async () => {
-    expect(await loadBuildTime(serverDistDir)).toBeNull();
+    expect(await loadBuildTime(serverDistDir, Date.now())).toBeNull();
+  });
+
+  it('uses the recorded build time when the mtimes were normalized to 1980', async () => {
+    writeBuildOutput(serverDistDir, {
+      '/a': { key: 'a', tags: ['t'] },
+      '/b': { key: 'b', tags: ['t'] },
+    });
+    const normalized = new Date('1980-01-01T00:00:00Z');
+    for (const key of ['a', 'b']) {
+      fs.utimesSync(path.join(serverDistDir, 'app', `${key}.meta`), normalized, normalized);
+    }
+    const recordedAt = Date.parse('2026-11-26T12:00:00Z');
+
+    expect(await loadBuildTime(serverDistDir, recordedAt)).toBe(recordedAt - 60_000);
   });
 
   it('falls back to .next/server under the working directory without a serverDistDir', async () => {
@@ -78,7 +92,7 @@ describe('loadBuildPrerenderTags', () => {
     vi.spyOn(process, 'cwd').mockReturnValue(tempDir);
 
     expect(await loadBuildPrerenderTags(undefined)).toEqual({ t: ['/a'] });
-    expect(await loadBuildTime(undefined)).not.toBeNull();
+    expect(await loadBuildTime(undefined, Date.now())).not.toBeNull();
     vi.restoreAllMocks();
   });
 
